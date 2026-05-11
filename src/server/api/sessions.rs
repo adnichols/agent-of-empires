@@ -452,15 +452,15 @@ pub async fn delete_session(
                 );
             }
         }
-        // Drop the per-session replay buffer + seq counter too:
-        // keeping them would leak a few MB per deleted session and
-        // serve no purpose since the session is gone. Forgetting the
-        // counter also means a recreated session with the same id
-        // (rare, but possible) starts cleanly from seq=1.
+        // Drop the per-session seq counter so a recreated session
+        // with the same id (rare, but possible) starts cleanly from
+        // seq=1.
         state.cockpit_supervisor.forget_session(&id);
-        if let Ok(mut guard) = state.cockpit_replay.lock() {
-            guard.remove(&id);
-        }
+        // On-disk history is the durable mirror; without this purge a
+        // recreated session with the same id would inherit the deleted
+        // session's transcript and the seq=1 first publish would
+        // collide with a row already in the store.
+        state.cockpit_event_store.delete_session(&id);
     }
 
     // Run deletion on a blocking thread (may do git/docker/tmux operations)
@@ -662,7 +662,9 @@ pub async fn create_session(
     // so the post-spawn write path (which still needs `state`) keeps
     // its handle.
     #[cfg(feature = "serve")]
-    let cockpit_master_enabled = state.cockpit_master_enabled;
+    let cockpit_master_enabled = state
+        .cockpit_master_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
@@ -779,6 +781,7 @@ pub async fn create_session(
                     instance.cockpit_agent.clone(),
                     instance.cockpit_model.clone(),
                     instance.project_path.clone(),
+                    instance.cockpit_acp_session_id.clone(),
                 ))
             } else {
                 None
@@ -788,25 +791,55 @@ pub async fn create_session(
             drop(instances);
 
             #[cfg(feature = "serve")]
-            if let Some((id, tool, agent_override, model, project_path)) = cockpit_spawn_target {
+            if let Some((id, tool, agent_override, model, project_path, stored_acp_session_id)) =
+                cockpit_spawn_target
+            {
                 let agent = state
                     .cockpit_supervisor
                     .pick_agent_for_tool(&tool, agent_override.as_deref())
                     .await;
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = state.cockpit_supervisor.clone();
+                let state_for_check = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = supervisor
-                        .spawn(id.clone(), &agent, cwd, vec![], vec![], model)
+                        .spawn(crate::cockpit::supervisor::SpawnRequest {
+                            session_id: id.clone(),
+                            agent: agent.clone(),
+                            cwd,
+                            additional_dirs: vec![],
+                            provider_env: vec![],
+                            model,
+                            stored_acp_session_id,
+                        })
                         .await
                     {
+                        // If the session was deleted during the 2-3s
+                        // ACP handshake, the spawn error is for a
+                        // vanished session; demote to debug instead
+                        // of publishing AgentStartupError to a UI
+                        // that no longer exists.
+                        let still_present = state_for_check
+                            .instances
+                            .read()
+                            .await
+                            .iter()
+                            .any(|i| i.id == id);
                         let message = format!("Failed to start cockpit agent {agent:?}: {e}");
-                        tracing::warn!(
-                            target: "cockpit.supervisor",
-                            session = %id,
-                            "auto-spawn after create failed: {message}"
-                        );
-                        supervisor.publish_startup_error(&id, message);
+                        if still_present {
+                            tracing::warn!(
+                                target: "cockpit.supervisor",
+                                session = %id,
+                                "auto-spawn after create failed: {message}"
+                            );
+                            supervisor.publish_startup_error(&id, message);
+                        } else {
+                            tracing::debug!(
+                                target: "cockpit.supervisor",
+                                session = %id,
+                                "auto-spawn after create error after session removed (ignored): {message}"
+                            );
+                        }
                     }
                 });
             }
