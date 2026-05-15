@@ -352,6 +352,7 @@ async fn handle_terminal_event(
                         ApprovalDecisionWire::Allow => "allowed",
                         ApprovalDecisionWire::AllowAlways => "allow-always",
                         ApprovalDecisionWire::Deny => "denied",
+                        ApprovalDecisionWire::Cancelled => "cancelled",
                     };
                     set_toast(
                         state,

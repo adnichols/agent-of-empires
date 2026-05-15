@@ -154,11 +154,12 @@ approval_timeout_secs = 300
 destructive_require_double_confirm = true
 max_concurrent_workers = 5
 max_concurrent_resumes = 4  # cap on parallel cold-start spawns/attaches (#1088)
-replay_events = 0  # 0 = unlimited history; set a positive value to cap per-session rows
+replay_events = 0  # 0 = unlimited history; set a positive value to cap per-session rows (also caps the web client's in-memory activity buffer, #1111)
 replay_bytes = 5_242_880
 node_path = ""
 show_tool_durations = true  # per-tool elapsed-time label in the web UI
 queue_drain_mode = "combined"  # how the composer drains client-side queued prompts: "combined" | "serial" (#1031)
+force_end_turn_threshold_secs = 30  # seconds of streaming silence before the spinner offers a "Force end turn" button (#1100)
 ```
 
 `max_concurrent_resumes` bounds how many cockpit workers the reconciler
@@ -518,6 +519,28 @@ Approvals expire after `approval_timeout_secs` (default 300). The
 agent receives a structured cancellation; you'll typically see a
 follow-up message asking again. Bump the timeout if you're in a
 context where approvals legitimately take longer.
+
+### `/clear` collapsed earlier turns
+
+When you run `/clear` in a cockpit session, the model's context is
+wiped on the adapter side but the visible transcript is preserved.
+The cockpit now appends a "Conversation cleared" divider, drops the
+cached slash-command / mode / plan state (the model has forgotten
+them), and folds every row above the divider behind a disclosure
+banner: `Show N earlier turns (cleared, not in the model's memory)`.
+Click the banner to expand the older transcript for your own
+reference; the model still won't see those turns. See #1101.
+
+### "Force end turn" button under the spinner
+
+If the agent finished a turn but the cockpit's working spinner is
+still rattling (no streaming chunks landed for a while), a small
+"Force end turn" button appears beneath it. Clicking it clears the
+local spinner immediately and asks the daemon to publish a synthetic
+`Stopped` plus a best-effort `session/cancel` to the agent. Pure
+recovery affordance for a missed-event race (#1100); during a healthy
+turn it never shows. Configure the inactivity threshold with
+`cockpit.force_end_turn_threshold_secs` (default 30s).
 
 ### Sharing debug logs
 

@@ -327,6 +327,34 @@ impl CockpitTranscript {
                     text: format!("context reset: {reason}"),
                 });
             }
+            Event::SessionCleared => {
+                // /clear wiped the model's memory. Drop session-scoped
+                // capability caches the agent no longer recognises and
+                // surface a divider so the user sees the boundary. The
+                // web UI folds pre-clear rows behind a disclosure; the
+                // TUI just keeps them inline below the divider for now.
+                // See #1101.
+                self.flush_pending_chunk();
+                self.available_commands.clear();
+                self.current_mode = None;
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Warning,
+                    text: "conversation cleared, the model no longer remembers earlier turns"
+                        .into(),
+                });
+            }
+            Event::ConversationCompacted => {
+                // /compact replaced the model's context with a summary;
+                // the model retains continuity, so this is informational
+                // rather than a context-reset warning, and the primer
+                // banner stays untouched. See #1109.
+                self.flush_pending_chunk();
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Info,
+                    text: "conversation compacted; earlier turns above are summarised in the model's context"
+                        .into(),
+                });
+            }
             Event::AcpSessionAssigned { acp_session_id } => {
                 // Bookkeeping event; not surfaced to the user.
                 let _ = acp_session_id;

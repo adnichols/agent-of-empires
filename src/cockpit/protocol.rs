@@ -76,14 +76,19 @@ pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionWire,
 }
 
-/// PascalCase JSON variants (`Allow`, `AllowAlways`, `Deny`) matching
-/// the web frontend's approval flow.
+/// PascalCase JSON variants (`Allow`, `AllowAlways`, `Deny`,
+/// `Cancelled`) matching the web frontend's approval flow.
+/// `Cancelled` is server-internal (synthesized when the daemon sweeps
+/// orphaned approvals on attach, see #1099); clients never POST it but
+/// it can appear in `Event::ApprovalResolved` payloads broadcast back
+/// over WS, and the wire enum mirrors the internal one for symmetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ApprovalDecisionWire {
     Allow,
     AllowAlways,
     Deny,
+    Cancelled,
 }
 
 impl From<ApprovalDecisionWire> for ApprovalDecision {
@@ -92,6 +97,7 @@ impl From<ApprovalDecisionWire> for ApprovalDecision {
             ApprovalDecisionWire::Allow => ApprovalDecision::Allow,
             ApprovalDecisionWire::AllowAlways => ApprovalDecision::AllowAlways,
             ApprovalDecisionWire::Deny => ApprovalDecision::Deny,
+            ApprovalDecisionWire::Cancelled => ApprovalDecision::Cancelled,
         }
     }
 }
@@ -102,6 +108,7 @@ impl From<ApprovalDecision> for ApprovalDecisionWire {
             ApprovalDecision::Allow => ApprovalDecisionWire::Allow,
             ApprovalDecision::AllowAlways => ApprovalDecisionWire::AllowAlways,
             ApprovalDecision::Deny => ApprovalDecisionWire::Deny,
+            ApprovalDecision::Cancelled => ApprovalDecisionWire::Cancelled,
         }
     }
 }

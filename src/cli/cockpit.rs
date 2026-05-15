@@ -843,6 +843,8 @@ fn event_kind(event: &crate::cockpit::Event) -> &'static str {
         Event::UserPromptSent { .. } => "user_prompt_sent",
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
+        Event::SessionCleared => "session_cleared",
+        Event::ConversationCompacted => "conversation_compacted",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
     }
 }

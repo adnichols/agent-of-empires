@@ -222,6 +222,7 @@ fn transcript_lines<'a>(
                     Some(ApprovalDecision::Allow) => "  → allowed",
                     Some(ApprovalDecision::AllowAlways) => "  → allow-always",
                     Some(ApprovalDecision::Deny) => "  → denied",
+                    Some(ApprovalDecision::Cancelled) => "  → cancelled",
                     None => "  press a / A / d to resolve, Esc to leave",
                 };
                 out.push(Line::from(body));
