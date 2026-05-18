@@ -139,7 +139,7 @@ pub const VIBE: AgentProfile = AgentProfile {
     supports_wakeup_tools: false,
 };
 
-/// Hermes coding agent via `pi-acp`. Defaults until verified.
+/// Pi coding agent via `pi-acp`. Defaults until verified.
 pub const PI: AgentProfile = AgentProfile {
     key: "pi",
     parent_meta_namespaces: &[],
