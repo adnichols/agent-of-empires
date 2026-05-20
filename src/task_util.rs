@@ -49,7 +49,7 @@ where
         match AssertUnwindSafe(fut).catch_unwind().await {
             Ok(()) => {}
             Err(payload) => {
-                let msg = panic_payload_string(&payload);
+                let msg = panic_payload_string(&*payload);
                 tracing::error!(
                     target: "task.panic",
                     task = name,
@@ -64,7 +64,7 @@ where
     })
 }
 
-fn panic_payload_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+fn panic_payload_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return (*s).to_string();
     }
@@ -81,7 +81,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn normal_completion_returns_value() {
+    async fn normal_completion_runs_to_end() {
         let touched = Arc::new(AtomicBool::new(false));
         let t = touched.clone();
         let handle = spawn_supervised("test.normal", PanicPolicy::Log, async move {
