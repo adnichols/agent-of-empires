@@ -13,7 +13,9 @@ use ratatui::{
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
-use super::{FieldValue, SettingsCategory, SettingsFocus, SettingsScope, SettingsView};
+use super::{
+    CategoryRow, FieldValue, SettingsCategory, SettingsFocus, SettingsScope, SettingsView,
+};
 use crate::tui::components::set_input_cursor_position;
 use crate::tui::styles::Theme;
 
@@ -51,6 +53,14 @@ impl SettingsView {
         // Render help overlay on top
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
+        }
+
+        // Render the search overlay last so it sits above every other
+        // surface (help, dialogs, etc.). The input handler already
+        // gates other key dispatch on `search_input.is_some()`, but
+        // painting last makes that gate visible too.
+        if self.search_input.is_some() {
+            self.render_search_overlay(frame, area, theme);
         }
     }
 
@@ -140,30 +150,45 @@ impl SettingsView {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Categories panel: sections render as dimmed, non-selectable
+        // dividers; tabs render with the existing "> "/"  " prefix and
+        // selection highlight. The first tab in each section is
+        // visually indented by the prefix already; sections take the
+        // same horizontal slot so the eye reads the group label as a
+        // heading above the tabs that follow.
         let items: Vec<ListItem> = self
             .categories
             .iter()
             .enumerate()
-            .map(|(i, cat)| {
-                let style = if i == self.selected_category {
-                    if is_focused {
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD)
+            .map(|(i, row)| match row {
+                CategoryRow::Section(label) => {
+                    // Bumped from `theme.dimmed` to `theme.text` so the
+                    // section dividers read as headings rather than as
+                    // faded background. Bold helps them anchor the
+                    // group visually without competing with the accent
+                    // color used for the active tab.
+                    let style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
+                    ListItem::new(*label).style(style)
+                }
+                CategoryRow::Tab(cat) => {
+                    let style = if i == self.selected_category {
+                        if is_focused {
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text)
+                        }
                     } else {
-                        Style::default().fg(theme.text)
-                    }
-                } else {
-                    Style::default().fg(theme.dimmed)
-                };
-
-                let prefix = if i == self.selected_category {
-                    "> "
-                } else {
-                    "  "
-                };
-
-                ListItem::new(format!("{}{}", prefix, cat.label())).style(style)
+                        Style::default().fg(theme.dimmed)
+                    };
+                    let prefix = if i == self.selected_category {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    ListItem::new(format!("{}{}", prefix, cat.label())).style(style)
+                }
             })
             .collect();
 
@@ -201,7 +226,7 @@ impl SettingsView {
         }
 
         // Show SSH warning for Sound category
-        let current_category = self.categories[self.selected_category];
+        let current_category = self.current_category();
         let warning_offset = if current_category == SettingsCategory::Sound && is_ssh_session() {
             let warning = vec![
                 Line::from(vec![
@@ -328,6 +353,10 @@ impl SettingsView {
 
     pub(super) fn field_height(&self, field: &super::SettingField, index: usize) -> u16 {
         match &field.value {
+            FieldValue::SectionHeader => {
+                // heading line + dimmed subtitle. No value row.
+                1 + 1
+            }
             FieldValue::List(items)
                 if self.list_edit_state.is_some() && index == self.selected_field =>
             {
@@ -347,6 +376,38 @@ impl SettingsView {
         is_selected: bool,
         theme: &Theme,
     ) {
+        // Section headers are non-interactive group dividers (e.g.
+        // "Advanced" inside Cockpit). Render as a styled heading with
+        // a dimmed subtitle. They never appear "selected" because the
+        // input handler skips navigation past them. Label uses
+        // `theme.text` (not dimmed) so it matches the categories-panel
+        // section dividers and reads as a heading rather than fading
+        // into the background.
+        if matches!(field.value, FieldValue::SectionHeader) {
+            let heading = Line::from(vec![
+                Span::styled("── ", Style::default().fg(theme.border)),
+                Span::styled(
+                    field.label,
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ──", Style::default().fg(theme.border)),
+            ]);
+            frame.render_widget(Paragraph::new(heading), area);
+            if !field.description.is_empty() {
+                let subtitle_area = Rect {
+                    x: area.x,
+                    y: area.y + 1,
+                    width: area.width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(field.description).style(Style::default().fg(theme.dimmed)),
+                    subtitle_area,
+                );
+            }
+            return;
+        }
+
         let label_style = if is_selected {
             Style::default()
                 .fg(theme.accent)
@@ -424,6 +485,11 @@ impl SettingsView {
             }
             FieldValue::List(items) => {
                 self.render_list_field(frame, value_area, items, index, is_selected, theme);
+            }
+            FieldValue::SectionHeader => {
+                // Already handled by the early return at the top of
+                // render_field; reaching this arm would mean the early
+                // return was bypassed, which is a programmer bug.
             }
         }
     }
@@ -907,6 +973,7 @@ impl SettingsView {
             (
                 "Other",
                 vec![
+                    ("/", "Search settings across all tabs"),
                     ("Ctrl+s", "Save settings"),
                     ("?", "Toggle this help"),
                     ("q", "Close settings"),
@@ -934,5 +1001,128 @@ impl SettingsView {
 
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
+    }
+
+    /// Render the settings-wide search overlay: a query input at the
+    /// top, the matching hits below, each prefixed with their
+    /// category label. Empty query lists every interactive field
+    /// across every visible category so the user can browse the full
+    /// catalog as a flat list.
+    fn render_search_overlay(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let dialog_width = area.width.saturating_sub(8).clamp(40, 80);
+        let dialog_height = area.height.saturating_sub(4).clamp(10, 24);
+
+        let x = area.x + (area.width.saturating_sub(dialog_width)) / 2;
+        let y = area.y + (area.height.saturating_sub(dialog_height)) / 2;
+        let dialog_area = Rect {
+            x,
+            y,
+            width: dialog_width.min(area.width),
+            height: dialog_height.min(area.height),
+        };
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .style(Style::default().bg(theme.background))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .title(" Search settings ")
+            .title_style(
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        // Layout: input line, separator, hit list, footer hint.
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // input
+                Constraint::Length(1), // separator
+                Constraint::Min(3),    // hits
+                Constraint::Length(1), // footer
+            ])
+            .split(inner);
+
+        // Input row: "/ <query>"
+        if let Some(input) = self.search_input.as_ref() {
+            let prompt_span = Span::styled("/ ", Style::default().fg(theme.accent));
+            let cursor_spans = Self::build_cursor_spans(input.value(), input.cursor(), theme);
+            let mut spans = vec![prompt_span];
+            spans.extend(cursor_spans);
+            frame.render_widget(Paragraph::new(Line::from(spans)), layout[0]);
+        }
+
+        // Separator.
+        frame.render_widget(
+            Paragraph::new("─".repeat(layout[1].width as usize))
+                .style(Style::default().fg(theme.border)),
+            layout[1],
+        );
+
+        // Hits.
+        if self.search_hits.is_empty() {
+            let msg = if self
+                .search_input
+                .as_ref()
+                .map(|i| i.value().is_empty())
+                .unwrap_or(true)
+            {
+                "Type to search settings"
+            } else {
+                "No matching settings"
+            };
+            frame.render_widget(
+                Paragraph::new(msg).style(Style::default().fg(theme.dimmed)),
+                layout[2],
+            );
+        } else {
+            let visible = layout[2].height as usize;
+            let scroll_start = self
+                .search_selected
+                .saturating_sub(visible.saturating_sub(1));
+            let mut lines: Vec<Line> = Vec::new();
+            for (i, hit) in self
+                .search_hits
+                .iter()
+                .enumerate()
+                .skip(scroll_start)
+                .take(visible)
+            {
+                let is_selected = i == self.search_selected;
+                let prefix = if is_selected { "> " } else { "  " };
+                let label_style = if is_selected {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, label_style),
+                    Span::styled(
+                        format!("[{}] ", hit.category_label),
+                        Style::default().fg(theme.dimmed),
+                    ),
+                    Span::styled(hit.field_label, label_style),
+                ]));
+            }
+            frame.render_widget(Paragraph::new(lines), layout[2]);
+        }
+
+        // Footer.
+        let footer = Line::from(vec![
+            Span::styled("Enter ", Style::default().fg(theme.waiting)),
+            Span::styled("jump  ", Style::default().fg(theme.dimmed)),
+            Span::styled("↑/↓ ", Style::default().fg(theme.waiting)),
+            Span::styled("select  ", Style::default().fg(theme.dimmed)),
+            Span::styled("Esc ", Style::default().fg(theme.waiting)),
+            Span::styled("close", Style::default().fg(theme.dimmed)),
+        ]);
+        frame.render_widget(Paragraph::new(footer), layout[3]);
     }
 }
