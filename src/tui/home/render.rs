@@ -141,9 +141,18 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
 /// `MAX_PREVIEW_SCROLL`.
-fn clamp_scroll_to_capture(scroll_offset: u16, captured_lines: usize, area_height: u16) -> u16 {
-    let visible = area_height.saturating_sub(1) as usize;
-    let real_max = captured_lines.saturating_sub(visible) as u16;
+///
+/// `visible_height` is the rendered output-body height the caller already
+/// computed (via `preview::output_visible_height`), NOT the raw pane height.
+/// Re-deriving it here with a fixed `- 1` would over-count the max offset by a
+/// row whenever the inner banner is hidden, leaving a phantom offset that
+/// stalls live-follow one row early.
+fn clamp_scroll_to_capture(
+    scroll_offset: u16,
+    captured_lines: usize,
+    visible_height: usize,
+) -> u16 {
+    let real_max = captured_lines.saturating_sub(visible_height) as u16;
     scroll_offset.min(real_max)
 }
 
@@ -1386,7 +1395,7 @@ impl HomeView {
                     self.preview_scroll_offset = clamp_scroll_to_capture(
                         self.preview_scroll_offset,
                         self.preview_cache.captured_lines,
-                        height,
+                        self.preview_visible_rows,
                     );
                 }
             }
@@ -1453,7 +1462,7 @@ impl HomeView {
                     self.preview_scroll_offset = clamp_scroll_to_capture(
                         self.preview_scroll_offset,
                         self.terminal_preview_cache.captured_lines,
-                        height,
+                        self.preview_visible_rows,
                     );
                 }
             }
@@ -1519,7 +1528,7 @@ impl HomeView {
                     self.preview_scroll_offset = clamp_scroll_to_capture(
                         self.preview_scroll_offset,
                         self.container_terminal_preview_cache.captured_lines,
-                        height,
+                        self.preview_visible_rows,
                     );
                 }
             }
@@ -1561,8 +1570,38 @@ impl HomeView {
                     self.preview_scroll_offset = clamp_scroll_to_capture(
                         self.preview_scroll_offset,
                         self.tool_preview_cache.captured_lines,
-                        height,
+                        self.preview_visible_rows,
                     );
+                }
+            }
+        }
+    }
+
+    /// `captured_lines` from whichever preview cache is currently on screen.
+    /// Both the preview's own scroll indicator and the live-send footer need
+    /// the active view's line count; reading `preview_cache` (the Agent cache)
+    /// unconditionally shows a stale or empty `[offset/max]` in Terminal or
+    /// Tool live mode, where a different cache backs the visible output.
+    fn active_captured_lines(&self) -> usize {
+        match &self.view_mode {
+            ViewMode::Agent => self.preview_cache.captured_lines,
+            ViewMode::Tool(_) => self.tool_preview_cache.captured_lines,
+            ViewMode::Terminal => {
+                let mode = self
+                    .selected_session
+                    .as_ref()
+                    .and_then(|id| self.get_instance(id).map(|inst| (id, inst)))
+                    .map(|(id, inst)| {
+                        if inst.is_sandboxed() {
+                            self.get_terminal_mode(id)
+                        } else {
+                            TerminalMode::Host
+                        }
+                    })
+                    .unwrap_or(TerminalMode::Host);
+                match mode {
+                    TerminalMode::Container => self.container_terminal_preview_cache.captured_lines,
+                    TerminalMode::Host => self.terminal_preview_cache.captured_lines,
                 }
             }
         }
@@ -1667,38 +1706,15 @@ impl HomeView {
             // ` Terminal Output ` banner (which usually carries the
             // scroll indicator) is also gone. Surface the indicator
             // here so users still see how far back they've scrolled.
-            // With borders::ALL the inner is area - 2; render_output_cached
-            // / render_terminal_preview then drops one more row before
-            // painting (their compact / info-hidden branches use
-            // height-1 for visible_height), so we match that to keep the
-            // count stable as the user scrolls.
+            // With borders::ALL the inner is area - 2; with the banner
+            // hidden the output paragraph claims that full inner, so the
+            // visible height is `inner_height` (no extra row dropped). This
+            // mirrors `output_visible_height(.., has_banner = false)` in the
+            // preview renderers so the indicator count stays in lockstep.
             let scroll_indicator = if !self.show_preview_info {
                 let inner_height = area.height.saturating_sub(2);
-                let visible_height = inner_height.saturating_sub(1) as usize;
-                let captured_lines = match &self.view_mode {
-                    ViewMode::Agent => self.preview_cache.captured_lines,
-                    ViewMode::Tool(_) => self.tool_preview_cache.captured_lines,
-                    ViewMode::Terminal => {
-                        let mode = self
-                            .selected_session
-                            .as_ref()
-                            .and_then(|id| self.get_instance(id).map(|inst| (id, inst)))
-                            .map(|(id, inst)| {
-                                if inst.is_sandboxed() {
-                                    self.get_terminal_mode(id)
-                                } else {
-                                    TerminalMode::Host
-                                }
-                            })
-                            .unwrap_or(TerminalMode::Host);
-                        match mode {
-                            TerminalMode::Container => {
-                                self.container_terminal_preview_cache.captured_lines
-                            }
-                            TerminalMode::Host => self.terminal_preview_cache.captured_lines,
-                        }
-                    }
-                };
+                let visible_height = inner_height as usize;
+                let captured_lines = self.active_captured_lines();
                 format_scroll_indicator(captured_lines, visible_height, self.preview_scroll_offset)
             } else {
                 None
@@ -1727,6 +1743,11 @@ impl HomeView {
         // Default to `inner`; the Agent branch below refines it if it can
         // resolve the selected instance.
         self.preview_pane_area = inner;
+        // Track the rows the output body actually paints into, shared with the
+        // scroll clamp and the live banner so their math matches the renderer.
+        // Each view branch refines this after it resolves its real pane rect.
+        self.preview_visible_rows =
+            preview::output_visible_height(inner.height, !compact && self.show_preview_info);
         frame.render_widget(block, area);
 
         match self.view_mode {
@@ -1768,6 +1789,10 @@ impl HomeView {
                             .unwrap_or(inner)
                     };
                     self.preview_pane_area = pane_area;
+                    self.preview_visible_rows = preview::output_visible_height(
+                        pane_area.height,
+                        !compact && self.show_preview_info,
+                    );
                     // Refresh the raw `content` cache, then ensure the
                     // parsed `Text<'static>` cache reflects it. Doing
                     // the parse here (under `&mut self.preview_cache`)
@@ -1834,6 +1859,10 @@ impl HomeView {
                             .unwrap_or(inner)
                     };
                     self.preview_pane_area = pane_area;
+                    self.preview_visible_rows = preview::output_visible_height(
+                        pane_area.height,
+                        !compact && self.show_preview_info,
+                    );
 
                     // Refresh the appropriate cache, then warm the
                     // matching `parsed_text` so the render call below
@@ -1912,6 +1941,10 @@ impl HomeView {
                             .unwrap_or(inner)
                     };
                     self.preview_pane_area = pane_area;
+                    self.preview_visible_rows = preview::output_visible_height(
+                        pane_area.height,
+                        !compact && self.show_preview_info,
+                    );
 
                     self.refresh_tool_preview_cache_if_needed(
                         pane_area.width,
@@ -2156,15 +2189,18 @@ impl HomeView {
                 live_send::display_chord_list(&state.exit_chords)
             };
             let suffix = " to exit ";
-            // `preview_cache.dimensions` is the output pane area passed to
-            // `refresh_preview_cache_if_needed`, and `render_output_cached`
-            // uses `area.height - 1` as its visible height (one row of
-            // headroom for the inner " Output " banner / compact-branch
-            // padding). Match that here so the live `[offset/max]`
-            // indicator agrees with the actual scroll math.
-            let visible_height = (self.preview_cache.dimensions.1 as usize).saturating_sub(1);
+            // `preview_visible_rows` is the output-body height the renderer
+            // last painted into (pane height minus the inner banner row only
+            // when that banner is shown). Reuse it so the live `[offset/max]`
+            // indicator agrees with the actual scroll math; deriving it from
+            // `dimensions` with a fixed `- 1` would over-count the max by a
+            // row whenever the info header is hidden.
+            let visible_height = self.preview_visible_rows;
+            // Pull `captured_lines` from whichever cache is on screen, not the
+            // Agent cache unconditionally: in Terminal/Tool live mode the
+            // wrong cache would show a stale or empty `[offset/max]`.
             let scroll = format_scroll_indicator(
-                self.preview_cache.captured_lines,
+                self.active_captured_lines(),
                 visible_height,
                 self.preview_scroll_offset,
             )
@@ -2661,6 +2697,24 @@ mod tests {
     #[test]
     fn capture_lines_for_adds_buffer_to_height() {
         assert_eq!(capture_lines_for(30, 0), 50);
+    }
+
+    #[test]
+    fn clamp_scroll_to_capture_uses_visible_height_verbatim() {
+        // Content exactly fills a 40-row banner-less pane: visible_height == 40,
+        // so there is nothing to scroll back to and any offset clamps to 0.
+        // The pre-fix code derived `area_height - 1` internally, which left a
+        // phantom max offset of 1 and stalled live-follow a row early.
+        assert_eq!(clamp_scroll_to_capture(1, 40, 40), 0);
+        assert_eq!(clamp_scroll_to_capture(5, 40, 40), 0);
+    }
+
+    #[test]
+    fn clamp_scroll_to_capture_allows_real_scrollback() {
+        // 60 captured lines into a 40-row view leaves 20 rows of real history;
+        // offsets within that range pass through, larger ones clamp to the max.
+        assert_eq!(clamp_scroll_to_capture(10, 60, 40), 10);
+        assert_eq!(clamp_scroll_to_capture(50, 60, 40), 20);
     }
 
     #[test]
