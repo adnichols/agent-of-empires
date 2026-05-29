@@ -34,8 +34,8 @@ use super::dialogs::{
     ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
     GroupDeleteOptionsDialog, GroupPickerDialog, HookTrustDialog, HooksInstallDialog, InfoDialog,
     IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
-    ProjectsDialog, RenameDialog, RestartDialog, SnoozeDurationDialog, SortPickerDialog,
-    UnifiedDeleteDialog, UpdateConfirmDialog,
+    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RestartDialog, SnoozeDurationDialog,
+    SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -392,6 +392,7 @@ pub struct HomeView {
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) group_picker_dialog: Option<GroupPickerDialog>,
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
+    pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
@@ -776,6 +777,7 @@ impl HomeView {
             profile_picker_dialog: None,
             group_picker_dialog: None,
             sort_picker_dialog: None,
+            project_session_picker_dialog: None,
             projects_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
@@ -2119,6 +2121,7 @@ impl HomeView {
             || self.info_dialog.is_some()
             || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -2153,6 +2156,7 @@ impl HomeView {
             || self.info_dialog.is_some()
             || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -2471,6 +2475,21 @@ impl HomeView {
     /// Show the group-by picker dialog seeded with the current mode.
     pub(super) fn show_group_picker(&mut self) {
         self.group_picker_dialog = Some(GroupPickerDialog::new(self.group_by));
+    }
+
+    /// Open the saved-project picker that starts a new session pre-filled with
+    /// the chosen project's path. Shows an info dialog when no projects exist.
+    pub(super) fn open_project_session_picker(&mut self) {
+        let profile = self.config_profile();
+        let projects = crate::session::projects::load_merged(&profile).unwrap_or_default();
+        if projects.is_empty() {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Projects",
+                "No registered projects available. Add one with `aoe project add <path>`.",
+            ));
+            return;
+        }
+        self.project_session_picker_dialog = Some(ProjectSessionPickerDialog::new(projects));
     }
 
     /// Show the sort-order picker dialog seeded with the current order.

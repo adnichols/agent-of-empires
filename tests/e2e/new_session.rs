@@ -454,3 +454,85 @@ fn test_new_session_enters_live_mode_when_configured() {
 // assertion now lives in `tests/integration/tmux_control_mode.rs`
 // (`control_mode_spawn_drop_respawn_against_same_session`), which
 // spawns against a raw tmux session that doesn't go anywhere.
+
+/// Init a directory as a git repo so `aoe project add` accepts it.
+fn init_git_repo_for_project(path: &std::path::Path) {
+    use std::process::Command;
+    std::fs::create_dir_all(path).expect("create repo dir");
+    let run = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git invocation");
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test"]);
+    run(&["commit", "--allow-empty", "-q", "-m", "init"]);
+}
+
+#[test]
+#[serial]
+fn test_new_session_from_saved_project_prefills_path() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("new_from_project");
+    // Seed several projects so the picker's filter has something to narrow.
+    for name in ["frontend", "backend", "mobile"] {
+        let repo = h.home_path().join(name);
+        init_git_repo_for_project(&repo);
+        let add = h.run_cli(&["project", "add", repo.to_str().unwrap()]);
+        assert!(
+            add.status.success(),
+            "project add {name} failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+    }
+
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.send_keys("Enter"); // dismiss first-run welcome
+    h.wait_for("No sessions yet");
+
+    // `b` opens the saved-project picker, which lists every registered repo.
+    h.send_keys("b");
+    h.wait_for("New Session from Project");
+    h.assert_screen_contains("frontend");
+    h.assert_screen_contains("backend");
+    h.assert_screen_contains("mobile");
+
+    // Typing filters the list; "mob" narrows to the single "mobile" project.
+    // Send one char at a time: `type_text`'s literal (`-l`) mode arrives as a
+    // bracketed paste, which the picker's filter input doesn't capture.
+    h.send_keys("m");
+    h.send_keys("o");
+    h.send_keys("b");
+    h.wait_for_absent("frontend", std::time::Duration::from_secs(5));
+    h.assert_screen_not_contains("backend");
+    h.assert_screen_contains("mobile");
+
+    // Selecting the filtered match opens the new-session dialog pre-filled
+    // with that project's path.
+    h.send_keys("Enter");
+    h.wait_for("Title");
+    h.assert_screen_contains("Path");
+    h.assert_screen_contains("mobile");
+}
+
+#[test]
+#[serial]
+fn test_new_session_from_project_empty_state() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("new_from_project_empty");
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.send_keys("Enter"); // dismiss first-run welcome
+    h.wait_for("No sessions yet");
+
+    // With no saved projects, `b` surfaces the info dialog instead.
+    h.send_keys("b");
+    h.wait_for("No Projects");
+}
