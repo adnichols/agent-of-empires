@@ -170,13 +170,16 @@ fn set_version(version: u32) -> Result<()> {
 fn get_all_possible_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
+    // Home-dotfile location: the macOS default, the pre-XDG Linux location, and
+    // the only location on Windows.
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(crate::session::APP_DIR_NAME_OTHER));
     }
 
-    #[cfg(target_os = "linux")]
-    if let Some(config_dir) = dirs::config_dir() {
-        dirs.push(config_dir.join(crate::session::APP_DIR_NAME_LINUX));
+    // XDG location: always current on Linux, and the opt-in layout on macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Ok(base) = crate::session::xdg_config_base() {
+        dirs.push(base.join(crate::session::APP_DIR_NAME_XDG));
     }
 
     dirs

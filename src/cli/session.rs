@@ -1476,7 +1476,7 @@ mod acp_reject_tests {
     async fn set_session_id_rejects_structured_view_session() {
         let temp = tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
         let storage = Storage::new("acp-reject").unwrap();
