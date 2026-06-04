@@ -49,6 +49,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   };
 
   const openAdd = () => {
+    if (submitting) return;
     setError(null);
     resetForm();
     setEditing(null);
@@ -56,6 +57,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   };
 
   const openEdit = (p: ProjectInfo) => {
+    if (submitting) return;
     setError(null);
     setShowAdd(false);
     setPath(p.path);
@@ -67,6 +69,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   };
 
   const closeForm = () => {
+    if (submitting) return;
     setShowAdd(false);
     setEditing(null);
     setShowBrowser(false);
@@ -114,6 +117,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   };
 
   const handleRemove = async (project: ProjectInfo) => {
+    if (submitting) return;
     if (!confirm(`Remove project '${project.name}' from ${project.scope} scope?`)) return;
     setError(null);
     const result = await deleteProject(project.name, project.scope);
@@ -164,8 +168,8 @@ export function ProjectsView({ onClose, readOnly }: Props) {
 
       {formOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          onClick={closeForm}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={submitting ? undefined : closeForm}
         >
           <div
             className="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-surface-800 border border-surface-700/40 rounded-lg p-4"
@@ -289,7 +293,8 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               <button
                 type="button"
                 onClick={closeForm}
-                className="px-3 py-1.5 text-sm border border-surface-700 text-text-secondary hover:bg-surface-800 rounded-md cursor-pointer"
+                disabled={submitting}
+                className="px-3 py-1.5 text-sm border border-surface-700 text-text-secondary hover:bg-surface-800 rounded-md cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Cancel
               </button>
@@ -370,14 +375,16 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                     <button
                       type="button"
                       onClick={() => openEdit(p)}
-                      className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-text-primary hover:border-surface-700 rounded-md cursor-pointer"
+                      disabled={submitting}
+                      className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-text-primary hover:border-surface-700 rounded-md cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Edit
                     </button>
                     <button
                       type="button"
                       onClick={() => handleRemove(p)}
-                      className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-status-error hover:border-status-error/40 rounded-md cursor-pointer"
+                      disabled={submitting}
+                      className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-status-error hover:border-status-error/40 rounded-md cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Remove
                     </button>
