@@ -7,6 +7,7 @@
 //!
 //! Hook events are agent-specific and defined in `AgentHookConfig::events`.
 
+mod pi_status;
 mod status_file;
 
 use std::path::{Path, PathBuf};
@@ -15,6 +16,10 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
+pub use pi_status::{
+    install_pi_status_extension, read_matching_pi_status, PI_STATUS_EXTENSION_REL_PATH,
+    PI_STATUS_REGISTRY_PARENT,
+};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
     read_hook_urgent,

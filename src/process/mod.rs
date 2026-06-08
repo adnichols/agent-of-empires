@@ -85,17 +85,29 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     pid
 }
 
+/// Return a PID and every descendant process that can be discovered locally.
+pub fn collect_pid_tree(pid: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::collect_pid_tree(pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::collect_pid_tree(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        vec![pid]
+    }
+}
+
 /// Kill a process and all its descendants
 /// Sends SIGTERM first, then SIGKILL to any survivors
 pub fn kill_process_tree(pid: u32) {
-    #[cfg(target_os = "linux")]
-    let pids = linux::collect_pid_tree(pid);
-
-    #[cfg(target_os = "macos")]
-    let pids = macos::collect_pid_tree(pid);
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    kill_with_fallback(&pids);
+    kill_with_fallback(&collect_pid_tree(pid));
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -137,12 +149,58 @@ fn kill_with_fallback(pids: &[u32]) {
 /// Portable "is this pid still around?" check via kill(pid, 0).
 /// EPERM means the process exists but we lack permission (still exists).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn process_exists(pid: u32) -> bool {
+pub fn process_exists(pid: u32) -> bool {
     match kill(Pid::from_raw(pid as i32), None) {
         Ok(()) => true,
         Err(Errno::EPERM) => true,
         Err(_) => false,
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_exists(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+pub fn process_owner_is_current_user(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "uid=", "-p", &pid.to_string()])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(uid) = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+    else {
+        return false;
+    };
+    let current_uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .flatten()
+        });
+    Some(uid) == current_uid
+}
+
+#[cfg(not(unix))]
+pub fn process_owner_is_current_user(_pid: u32) -> bool {
+    true
 }
 
 /// Send SIGSTOP to a process and all its descendants. Used to pause

@@ -1856,20 +1856,27 @@ impl Instance {
         }
     }
 
+    fn agent_status_hooks_enabled(&self) -> bool {
+        let profile = self.effective_profile();
+        super::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .agent_status_hooks
+    }
+
     /// Install status-detection hooks for agents that support them.
     ///
     /// For sandboxed sessions hooks are installed via `build_container_config`,
     /// so this only acts on host sessions by writing to the user's home directory.
     /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
-        let profile = self.effective_profile();
-        let hooks_enabled = super::profile_config::resolve_config_or_warn(&profile)
-            .session
-            .agent_status_hooks;
-        if !hooks_enabled {
+        if !self.agent_status_hooks_enabled() {
             return;
         }
-        if self.tool == "settl" {
+        if self.tool == "pi" && !self.is_sandboxed() {
+            if let Err(e) = crate::hooks::install_pi_status_extension() {
+                tracing::warn!(target: "session.store", "Failed to install Pi status extension: {}", e);
+            }
+        } else if self.tool == "settl" {
             // settl uses TOML config, not JSON settings
             if let Err(e) = crate::hooks::install_settl_hooks() {
                 tracing::warn!(target: "session.store", "Failed to install settl hooks: {}", e);
@@ -3253,6 +3260,14 @@ impl Instance {
             &self.detect_as
         };
 
+        let pi_registry_enabled =
+            detection_tool == "pi" && !self.is_sandboxed() && self.agent_status_hooks_enabled();
+        if pi_registry_enabled {
+            if let Err(e) = crate::hooks::install_pi_status_extension() {
+                tracing::warn!(target: "session.store", "Failed to install Pi status extension: {}", e);
+            }
+        }
+
         if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
             tracing::trace!(target: "session.store",
                 "status '{}': hook detected {:?}, is_dead={}",
@@ -3298,6 +3313,24 @@ impl Instance {
                 self.last_error = None;
             }
             return;
+        }
+
+        if pi_registry_enabled && !is_dead {
+            let pane_pid = metadata
+                .and_then(|m| m.pane_pid)
+                .or_else(|| session.get_pane_pid());
+            if let Some(registry_status) =
+                crate::hooks::read_matching_pi_status(pane_pid, Path::new(&self.project_path))
+            {
+                tracing::trace!(target: "session.store",
+                    "status '{}': Pi registry detected {:?}",
+                    self.title,
+                    registry_status
+                );
+                self.status = registry_status;
+                self.last_error = None;
+                return;
+            }
         }
 
         let pane_content = session.capture_pane(50).unwrap_or_default();
@@ -3654,6 +3687,31 @@ mod tests {
             match &self.0 {
                 Some(v) => std::env::set_var("CODEX_HOME", v),
                 None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
+    struct HomeEnvGuard {
+        home: Option<std::ffi::OsString>,
+        xdg: Option<std::ffi::OsString>,
+    }
+    impl HomeEnvGuard {
+        fn capture() -> Self {
+            Self {
+                home: std::env::var_os("HOME"),
+                xdg: std::env::var_os("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
     }
@@ -7337,25 +7395,9 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         let quoted_pane_file =
             format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
         let launch = format!("cat {quoted_pane_file}; sleep 300");
-        let created = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "120",
-                "-y",
-                "40",
-                &launch,
-            ])
-            .output()
+        tmux::Session::from_name(&session_name)
+            .create_with_size("/tmp", Some(&launch), Some((120, 40)))
             .expect("spawn tmux");
-        assert!(
-            created.status.success(),
-            "tmux new-session failed: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
 
         // The clobbered hook state that produced the green row.
         let dir = crate::hooks::hook_status_dir(&inst.id).expect("hook dir");
@@ -7399,6 +7441,169 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.status,
             Status::Waiting,
             "Claude blocked on an approval prompt must reconcile Running -> Waiting (#1913)"
+        );
+    }
+
+    fn write_pi_registry_record(
+        registry_dir: &Path,
+        pid: u32,
+        status: &str,
+        cwd: &Path,
+    ) -> PathBuf {
+        std::fs::create_dir_all(registry_dir).expect("create registry dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(registry_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let record = serde_json::json!({
+            "schema": 1,
+            "tool": "pi",
+            "status": status,
+            "pid": pid,
+            "cwd": cwd,
+            "updatedAtMs": now_ms,
+            "startedAtMs": now_ms
+        });
+        let registry_file = registry_dir.join(format!("{pid}.json"));
+        std::fs::write(&registry_file, serde_json::to_vec(&record).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        registry_file
+    }
+
+    fn uid_registry_dir() -> PathBuf {
+        let uid_output = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u");
+        let uid = String::from_utf8_lossy(&uid_output.stdout)
+            .trim()
+            .to_string();
+        std::path::Path::new(crate::hooks::PI_STATUS_REGISTRY_PARENT).join(uid)
+    }
+
+    fn wait_for_pane_text(session_name: &str, expected: &str) {
+        for _ in 0..50 {
+            let cap = std::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", session_name])
+                .output();
+            if let Ok(out) = cap {
+                if String::from_utf8_lossy(&out.stdout).contains(expected) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_status_uses_pi_registry_idle_before_stale_pane_activity() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let project = std::env::temp_dir();
+        let mut inst = Instance::new("aoe_test_pi_registry_idle", project.to_str().unwrap());
+        inst.tool = "pi".to_string();
+
+        let pane = "Thinking about code\nreading file.ts\n";
+        let pane_file = std::env::temp_dir().join(format!("aoe_test_pi_registry_{}.txt", inst.id));
+        std::fs::write(&pane_file, pane).expect("write pane fixture");
+
+        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let _guard = KillTmuxOnDrop(session_name.clone());
+        let quoted_pane_file =
+            format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
+        let launch = format!("cat {quoted_pane_file}; sleep 300");
+        tmux::Session::from_name(&session_name)
+            .create_with_size(project.to_str().unwrap(), Some(&launch), Some((120, 40)))
+            .expect("spawn tmux");
+
+        let pane_pid = crate::process::get_pane_pid(&session_name).expect("pane pid");
+        let registry_file =
+            write_pi_registry_record(&uid_registry_dir(), pane_pid, "idle", &project);
+
+        wait_for_pane_text(&session_name, "Thinking about code");
+        crate::tmux::refresh_session_cache();
+        inst.update_status();
+
+        std::fs::remove_file(&pane_file).ok();
+        std::fs::remove_file(&registry_file).ok();
+
+        assert_eq!(
+            inst.status,
+            Status::Idle,
+            "fresh matching Pi registry idle status must win over stale pane activity"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_status_ignores_pi_registry_when_status_hooks_disabled() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let _home_env_guard = HomeEnvGuard::capture();
+        let temp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let mut config = crate::session::config::Config::default();
+        config.session.agent_status_hooks = false;
+        crate::session::config::save_config(&config).unwrap();
+
+        let project = std::env::temp_dir();
+        let mut inst = Instance::new("aoe_test_pi_registry_disabled", project.to_str().unwrap());
+        inst.tool = "pi".to_string();
+
+        let pane = "Thinking about code\nreading file.ts\n";
+        let pane_file = std::env::temp_dir().join(format!("aoe_test_pi_registry_{}.txt", inst.id));
+        std::fs::write(&pane_file, pane).expect("write pane fixture");
+
+        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let _guard = KillTmuxOnDrop(session_name.clone());
+        let quoted_pane_file =
+            format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
+        let launch = format!("cat {quoted_pane_file}; sleep 300");
+        tmux::Session::from_name(&session_name)
+            .create_with_size(project.to_str().unwrap(), Some(&launch), Some((120, 40)))
+            .expect("spawn tmux");
+
+        let pane_pid = crate::process::get_pane_pid(&session_name).expect("pane pid");
+        let registry_file =
+            write_pi_registry_record(&uid_registry_dir(), pane_pid, "idle", &project);
+
+        wait_for_pane_text(&session_name, "Thinking about code");
+        crate::tmux::refresh_session_cache();
+        inst.update_status();
+
+        std::fs::remove_file(&pane_file).ok();
+        std::fs::remove_file(&registry_file).ok();
+
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "disabled status hooks must force Pi detection back to pane parsing"
+        );
+        assert!(
+            !temp
+                .path()
+                .join(crate::hooks::PI_STATUS_EXTENSION_REL_PATH)
+                .exists(),
+            "polling must not install the Pi extension when status hooks are disabled"
         );
     }
 }

@@ -61,6 +61,7 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
 pub struct PaneMetadata {
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
+    pub pane_pid: Option<u32>,
 }
 
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
@@ -146,7 +147,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_pid}",
         ])
         .output();
 
@@ -267,6 +268,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                 } else {
                     Some(parts[3].to_string())
                 },
+                pane_pid: parts.get(4).and_then(|pid| pid.parse().ok()),
             },
         );
     }
