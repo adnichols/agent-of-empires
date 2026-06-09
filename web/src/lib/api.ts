@@ -813,9 +813,27 @@ export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
   );
 }
 
-export async function createSession(
-  body: CreateSessionRequest,
-): Promise<{ ok: boolean; error?: string; session?: SessionResponse }> {
+/** The repo's hooks need approval before this session can be created
+ *  (#2066). Surfaced from a `hooks_need_trust` 403 so the wizard can show
+ *  the commands and resubmit with `trust_hooks: true`. */
+export interface HooksNeedTrust {
+  /** The `on_create` commands that will run once approved. */
+  onCreate: string[];
+  /** The `on_launch` commands the same approval trusts (run on every later
+   *  session start, including TUI/CLI ones). */
+  onLaunch: string[];
+  /** The `on_destroy` commands the same approval trusts (run on delete). */
+  onDestroy: string[];
+  /** Whether the repo's `.mcp.json` also needs approval at this fingerprint. */
+  needsMcpTrust: boolean;
+}
+
+export async function createSession(body: CreateSessionRequest): Promise<{
+  ok: boolean;
+  error?: string;
+  session?: SessionResponse;
+  hooksNeedTrust?: HooksNeedTrust;
+}> {
   try {
     const res = await fetch("/api/sessions", {
       method: "POST",
@@ -826,6 +844,18 @@ export async function createSession(
       const text = await res.text();
       try {
         const data = JSON.parse(text);
+        if (data.error === "hooks_need_trust") {
+          return {
+            ok: false,
+            error: data.message || "Repository hooks require trust",
+            hooksNeedTrust: {
+              onCreate: Array.isArray(data.on_create) ? data.on_create : [],
+              onLaunch: Array.isArray(data.on_launch) ? data.on_launch : [],
+              onDestroy: Array.isArray(data.on_destroy) ? data.on_destroy : [],
+              needsMcpTrust: data.needs_mcp_trust === true,
+            },
+          };
+        }
         return {
           ok: false,
           error: data.message || `Server error (${res.status})`,
