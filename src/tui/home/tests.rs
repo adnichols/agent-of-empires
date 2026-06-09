@@ -5425,6 +5425,288 @@ fn project_groups_sort_by_top_attention_member() {
     );
 }
 
+/// A registered (pinned) project with no sessions surfaces as an empty
+/// header in project view, mirroring the WebUI where an empty project is just
+/// a registry entry decoupled from sessions. This is the core of #2047.
+#[test]
+#[serial]
+fn pinned_project_without_sessions_shows_empty_header() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    // Register a project that has no sessions at all. The path need not exist;
+    // `add` falls back to the literal path when canonicalization fails.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        group_names.iter().any(|n| n == "gamma"),
+        "pinned empty project gamma must show as a header, got {group_names:?}"
+    );
+    assert!(env.view.is_project_label_pinned("gamma"));
+}
+
+/// Pressing `p` on a project header pins it (registers the repo) instead of
+/// opening the projects dialog; the pin toggle binding wins the shared chord
+/// because a project header is selected.
+#[test]
+#[serial]
+fn p_key_pins_project_on_header() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "alpha"))
+        .expect("alpha header present");
+    env.view.cursor = alpha_idx;
+    env.view.update_selected();
+
+    assert!(!env.view.is_project_label_pinned("alpha"));
+    env.view.handle_key(key(KeyCode::Char('p')), None);
+    assert!(
+        env.view.is_project_label_pinned("alpha"),
+        "p on a project header should pin it"
+    );
+    // The pin path must not open the projects dialog (the chord is shared).
+    assert!(env.view.projects_dialog.is_none());
+
+    // Unpinning (a second toggle) drops the registry entry.
+    env.view.toggle_project_pin_at_cursor();
+    assert!(!env.view.is_project_label_pinned("alpha"));
+}
+
+/// Off a project header (here: in Manual grouping), `p` keeps its original
+/// meaning and opens the projects dialog, so the overload doesn't shadow the
+/// global binding.
+#[test]
+#[serial]
+fn p_key_opens_projects_dialog_off_project_header() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('p')), None);
+    assert!(
+        env.view.projects_dialog.is_some(),
+        "p off a project header should open the projects dialog"
+    );
+}
+
+/// The pin must persist a project across its last session leaving the view:
+/// once pinned, the header remains even when no sessions reference it. This
+/// is the user-visible promise of #2047.
+#[test]
+#[serial]
+fn pinned_project_survives_losing_last_session() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "alpha"))
+        .expect("alpha header present");
+    env.view.cursor = alpha_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(env.view.is_project_label_pinned("alpha"));
+
+    // Drop every alpha session, then rebuild as a reload would. The registry
+    // entry keeps the header alive even with zero members.
+    env.view
+        .instances
+        .retain(|i| super::project_group_name(i) != "alpha");
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_header = env.view.flat_items.iter().find_map(|i| match i {
+        Item::Group {
+            name,
+            session_count,
+            ..
+        } if name == "alpha" => Some(*session_count),
+        _ => None,
+    });
+    assert_eq!(
+        alpha_header,
+        Some(0),
+        "pinned alpha must remain as an empty (0) header after losing its sessions"
+    );
+}
+
+/// Two repos that share a basename are judged independently for pinning: a
+/// header whose own repo is not registered must read as unpinned even when a
+/// different same-basename repo is in the registry. Guards the path-keyed pin
+/// identity (CodeRabbit #2055).
+#[test]
+#[serial]
+fn same_basename_repos_pin_independently() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Register `/work/api`, but the visible header's repo is `/other/api`.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("api", "/work/api", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    let mut sess = Instance::new("api-sess", "/other/api");
+    sess.source_profile = "test".to_string();
+    env.view.instances.push(sess);
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let api_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "api"))
+        .expect("api header present");
+    // The header's repo (/other/api) is not registered, so it is NOT pinned,
+    // even though a same-basename repo (/work/api) is. The old basename match
+    // would have reported pinned here.
+    assert!(!env.view.is_project_label_pinned("api"));
+
+    // Pinning this header would register under the basename "api", which the
+    // registry already holds for /work/api, so the registry's name-uniqueness
+    // surfaces a conflict rather than silently toggling the unrelated entry.
+    env.view.cursor = api_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(
+        !env.view.is_project_label_pinned("api"),
+        "the unrelated /work/api entry must not make this header read as pinned"
+    );
+    // The conflicting pin did not register the header's repo.
+    let paths: Vec<String> = projects::load_global()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    assert_eq!(paths, vec!["/work/api".to_string()]);
+}
+
+/// "New Session" on an empty pinned project (no member sessions) must prefill
+/// the registered repo path, so the pin->launch loop works: the path can only
+/// come from the registry fallback in `group_repo_path`.
+#[test]
+#[serial]
+fn empty_pinned_project_new_session_uses_registered_path() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    assert_eq!(
+        env.view.group_repo_path("lonely"),
+        Some("/repos/lonely".to_string()),
+        "empty pinned project must source its new-session path from the registry"
+    );
+}
+
+/// In all-profiles mode the pin registry must include every loaded profile's
+/// projects, not just the default profile's, so a profile-scoped pin keeps its
+/// empty header (CodeRabbit #2055).
+#[test]
+#[serial]
+fn all_profiles_view_includes_profile_scoped_pins() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` with no sessions of its own.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let names: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "lonely"),
+        "beta's profile-scoped pin must show in all-profiles project view, got {names:?}"
+    );
+    assert!(view.is_project_label_pinned("lonely"));
+}
+
 /// Pressing `g` to flip `group_by` keeps the cursor on the previously
 /// selected session, even when the list reshapes (Manual flat list →
 /// Project grouped list). Previously `apply_group_by` clamped by index,
