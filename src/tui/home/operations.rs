@@ -141,6 +141,8 @@ impl HomeView {
         &mut self,
         new_profile: Option<&str>,
         new_tool: Option<&str>,
+        new_extra_args: Option<&str>,
+        new_command_override: Option<&str>,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -199,6 +201,22 @@ impl HomeView {
                     inst.tool = target_tool.to_string();
                 });
             }
+        }
+
+        // Apply command override + extra args swaps before restart so the
+        // adjusted launch command takes effect on the next spawn. Both come
+        // pre-resolved from the restart dialog (which re-seeds them from the
+        // selected tool's config when the engine is swapped), so we set the
+        // instance fields directly. `None` means "leave as-is".
+        if let Some(command) = new_command_override {
+            self.mutate_instance(&id, |inst| {
+                inst.command = command.to_string();
+            });
+        }
+        if let Some(extra) = new_extra_args {
+            self.mutate_instance(&id, |inst| {
+                inst.extra_args = extra.to_string();
+            });
         }
 
         // Apply profile move. Validates the target exists, lazily creates

@@ -5054,7 +5054,7 @@ fn unarchive_keeps_selection() {
 fn restart_selected_session_noop_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.selected_session = None;
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -5070,7 +5070,7 @@ fn restart_selected_session_skips_archived_row() {
     env.view.selected_session = Some(id.clone());
     env.view.mutate_instance(&id, |inst| inst.archive());
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_archived(),
@@ -5093,7 +5093,7 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     env.view.sort_order = SortOrder::Attention;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_snoozed(),
@@ -5121,7 +5121,7 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instances[0].is_snoozed(), "pre-condition");
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         !env.view.instances[0].is_snoozed(),
@@ -5145,7 +5145,7 @@ fn restart_selected_session_skips_creating_row() {
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -5172,7 +5172,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
     assert_eq!(

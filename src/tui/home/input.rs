@@ -1728,7 +1728,11 @@ impl HomeView {
                     self.restart_dialog = None;
                     let profile = data.profile.as_deref();
                     let tool = data.tool.as_deref();
-                    if let Err(e) = self.restart_selected_session(profile, tool) {
+                    let extra_args = data.extra_args.as_deref();
+                    let command_override = data.command_override.as_deref();
+                    if let Err(e) =
+                        self.restart_selected_session(profile, tool, extra_args, command_override)
+                    {
                         // Surface the restart error to the user via the
                         // InfoDialog rather than only the debug log; the
                         // user explicitly initiated this action and needs
@@ -3782,12 +3786,16 @@ impl HomeView {
             inst.source_profile.clone()
         };
         let current_tool = inst.tool.clone();
+        let current_command = inst.command.clone();
+        let current_extra_args = inst.extra_args.clone();
         let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,
             &current_profile,
             &current_tool,
+            &current_command,
+            &current_extra_args,
             profiles,
             tools,
         ));
