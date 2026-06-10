@@ -16,9 +16,10 @@ mod acp;
 mod client_log;
 mod git;
 mod log_level;
+mod mcp;
 mod projects;
 mod sessions;
-mod system;
+pub(crate) mod system;
 mod telemetry;
 
 #[cfg(feature = "serve")]
@@ -33,20 +34,22 @@ pub use acp::{
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
+pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    list_sessions, read_output, rename_session, send_message, session_diff_file,
-    session_diff_files, set_worktree_name, update_session_archive, update_session_diff_base,
-    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
-    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
+    list_sessions, preview_volume_ignores_globs, read_output, rename_session, send_message,
+    session_diff_file, session_diff_files, set_worktree_name, update_session_archive,
+    update_session_diff_base, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_workspace_ordering, CleanupDefaults,
+    OutputQuery, SendMessageRequest, SessionResponse,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,
     filesystem_home, get_about, get_current_theme, get_profile_settings, get_resolved_theme,
     get_settings, get_settings_schema, get_update_status, list_agents, list_groups, list_profiles,
-    list_sounds, list_themes, mark_web_tour_seen, rename_profile, serve_sound_file,
-    update_profile_settings, update_settings,
+    list_sounds, list_themes, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen,
+    rename_profile, serve_sound_file, update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
@@ -161,6 +164,11 @@ mod tests {
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
             (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
+            (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),
                 &["patch_log_level"],
@@ -176,6 +184,7 @@ mod tests {
                 &[
                     "update_settings",
                     "mark_web_tour_seen",
+                    "mark_volume_ignores_globs_acknowledged",
                     "create_profile",
                     "delete_profile",
                     "rename_profile",
@@ -302,6 +311,11 @@ mod tests {
                 ],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
+            (
+                "api/mcp.rs",
+                include_str!("mcp.rs"),
+                &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
+            ),
             (
                 "api/log_level.rs",
                 include_str!("log_level.rs"),

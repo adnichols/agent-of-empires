@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
+import { McpServers } from "./McpServers";
 import { NotificationSettings } from "./NotificationSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { TerminalSettings } from "./TerminalSettings";
@@ -11,6 +12,7 @@ import {
   getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
+  updateTheme,
 } from "../lib/api";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
@@ -34,11 +36,10 @@ type TabId =
   | "security"
   | "devices"
   | "structured-view"
+  | "mcp"
   | "logging";
 
-type SidebarItem =
-  | { kind: "tab"; id: TabId; label: string }
-  | { kind: "divider"; label: string };
+type SidebarItem = { kind: "tab"; id: TabId; label: string } | { kind: "divider"; label: string };
 
 // Sidebar groups mirror the TUI Settings layout (Appearance / Sessions /
 // Environment / Notifications / Web Dashboard / System) so muscle memory
@@ -57,6 +58,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "divider", label: "Sessions" },
     { kind: "tab", id: "session", label: "Session" },
     { kind: "tab", id: "structured-view", label: "Structured view" },
+    { kind: "tab", id: "mcp", label: "MCP servers" },
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -103,6 +105,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "security",
   "devices",
   "structured-view",
+  "mcp",
   "logging",
 ]);
 
@@ -135,26 +138,14 @@ const SCHEMA_BACKED_TABS = new Set<TabId>([
 /// default-flagged profile, then to the literal "default" string. Exported
 /// for unit testing because the live race is hard to drive deterministically
 /// without mounting all of SettingsView.
-export function resolveSelectedProfile(
-  current: string,
-  profiles: ProfileInfo[],
-): string {
+export function resolveSelectedProfile(current: string, profiles: ProfileInfo[]): string {
   if (profiles.some((p) => p.name === current)) return current;
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
-export function SettingsView({
-  onClose,
-  tab,
-  onSelectTab,
-  onServerAboutRefresh,
-  profile,
-  onSelectProfile,
-}: Props) {
+export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, profile, onSelectProfile }: Props) {
   const offline = useServerDown();
-  const [settings, setSettings] = useState<Record<string, unknown> | null>(
-    null,
-  );
+  const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   // Seed empty rather than "default" so the initial
@@ -188,9 +179,7 @@ export function SettingsView({
     [onSelectProfile],
   );
   const sidebar = buildSidebar();
-  const tabs = sidebar.filter(
-    (s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab",
-  );
+  const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
   const activeTab: TabId = isTabId(tab) ? tab : "session";
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   // Settings schema (single source of truth, #1692). The generic SchemaSection
@@ -267,10 +256,7 @@ export function SettingsView({
   }, [loadSettings]);
 
   const sendSave = useCallback(
-    async (
-      section: string,
-      data: Record<string, unknown>,
-    ): Promise<boolean> => {
+    async (section: string, data: Record<string, unknown>): Promise<boolean> => {
       if (!selectedProfile) return false;
       setSaving(true);
       setSaveError(null);
@@ -300,12 +286,7 @@ export function SettingsView({
   const web = (settings?.web ?? {}) as Record<string, unknown>;
 
   const saveField = useCallback(
-    (
-      section: string,
-      sectionData: Record<string, unknown>,
-      field: string,
-      value: unknown,
-    ): Promise<boolean> => {
+    (section: string, sectionData: Record<string, unknown>, field: string, value: unknown): Promise<boolean> => {
       updateLocal({ [section]: { ...sectionData, [field]: value } });
       return sendSave(section, { [field]: value });
     },
@@ -314,13 +295,35 @@ export function SettingsView({
 
   const saveSubField = useCallback(
     (section: string, field: string, value: unknown): Promise<boolean> => {
-      const sectionData = (settings?.[section] ?? {}) as Record<
-        string,
-        unknown
-      >;
+      const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
       return saveField(section, sectionData, field, value);
     },
     [settings, saveField],
+  );
+
+  // The theme name and color mode are global preferences, not
+  // profile-overridable: write them through the dedicated non-elevated
+  // /api/theme endpoint instead of the profile settings PATCH. Writing the
+  // theme into a profile let a stale override shadow the global pick on every
+  // Settings open/close (the empire->rose-pine flip). Profile-overridable rows
+  // in the same tab (e.g. idle decay) still write to the selected profile.
+  const saveThemeField = useCallback(
+    async (section: string, field: string, value: unknown): Promise<boolean> => {
+      const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
+      if (overridable) return saveSubField(section, field, value);
+      const sectionData = (settings?.theme ?? {}) as Record<string, unknown>;
+      updateLocal({ theme: { ...sectionData, [field]: value } });
+      setSaving(true);
+      setSaveError(null);
+      const ok = await updateTheme({ [field]: value });
+      setSaving(false);
+      if (!ok) {
+        setSaveError("Failed to save, please try again");
+        loadSettings();
+      }
+      return ok;
+    },
+    [schema, settings, updateLocal, loadSettings, saveSubField],
   );
 
   const renderTabContent = () => {
@@ -331,6 +334,7 @@ export function SettingsView({
       activeTab !== "security" &&
       activeTab !== "devices" &&
       activeTab !== "structured-view" &&
+      activeTab !== "mcp" &&
       activeTab !== "telemetry"
     ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
@@ -340,11 +344,7 @@ export function SettingsView({
     // loads or after it fails. Returns null once the schema is ready.
     const schemaGuard = () => {
       if (schemaLoading) {
-        return (
-          <div className="text-sm text-text-dim">
-            Loading settings schema...
-          </div>
-        );
+        return <div className="text-sm text-text-dim">Loading settings schema...</div>;
       }
       if (schemaError) {
         return (
@@ -367,11 +367,7 @@ export function SettingsView({
     // guard. Mixed tabs (session, notifications) render their non-schema rows
     // regardless and guard only the SchemaSection slot, so a slow or failed
     // schema fetch never hides the default-profile selector or the push block.
-    if (
-      SCHEMA_BACKED_TABS.has(activeTab) &&
-      activeTab !== "session" &&
-      activeTab !== "notifications"
-    ) {
+    if (SCHEMA_BACKED_TABS.has(activeTab) && activeTab !== "session" && activeTab !== "notifications") {
       const guard = schemaGuard();
       if (guard) return guard;
     }
@@ -434,7 +430,7 @@ export function SettingsView({
             section="theme"
             schema={schema}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={saveThemeField}
           />
         );
       case "diff":
@@ -485,22 +481,12 @@ export function SettingsView({
             {/* Browser-push controls render regardless of schema state. */}
             <NotificationSettings />
             <div className="space-y-4">
-              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">
-                Server Defaults
-              </h4>
+              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Server Defaults</h4>
               <p className="text-xs text-text-dim">
-                Controls which session events trigger push notifications on the
-                server.
+                Controls which session events trigger push notifications on the server.
               </p>
               {schemaGuard() ??
-                (settings && (
-                  <SchemaSection
-                    section="web"
-                    schema={schema}
-                    values={web}
-                    onSaveField={saveSubField}
-                  />
-                ))}
+                (settings && <SchemaSection section="web" schema={schema} values={web} onSaveField={saveSubField} />)}
             </div>
           </div>
         );
@@ -511,11 +497,11 @@ export function SettingsView({
         return <SecuritySettings />;
       case "devices":
         return <ConnectedDevices />;
+      case "mcp":
+        return <McpServers />;
       case "structured-view": {
         if (!settings) {
-          return (
-            <div className="text-sm text-text-dim">Loading settings...</div>
-          );
+          return <div className="text-sm text-text-dim">Loading settings...</div>;
         }
         const acp = (settings.acp ?? {}) as Record<string, unknown>;
         return (
@@ -552,10 +538,7 @@ export function SettingsView({
         <div className="flex items-center">
           {sidebar.map((item) =>
             item.kind === "divider" ? (
-              <div
-                key={item.label}
-                className="h-4 w-px bg-surface-700 mx-1 shrink-0"
-              />
+              <div key={item.label} className="h-4 w-px bg-surface-700 mx-1 shrink-0" />
             ) : (
               <button
                 key={item.id}
@@ -604,9 +587,7 @@ export function SettingsView({
         {/* Content area */}
         <div className="flex-1 overflow-y-auto">
           <div className="p-6 max-w-2xl mx-auto space-y-5">
-            <h2 className="text-lg font-semibold text-text-bright">
-              {currentTabLabel}
-            </h2>
+            <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
 
             {offline && (
               <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3">

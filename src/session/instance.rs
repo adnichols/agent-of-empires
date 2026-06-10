@@ -87,6 +87,13 @@ impl Status {
 /// Failures (both tiers) propagate as `Err` so callers keep the existing
 /// `Status::Error` + `last_error` path. Only successful outcomes are
 /// enumerated; mirrors the `EnsureReadyOutcome` shape.
+/// `last_error` the status poller stamps when a session's tmux pane is simply
+/// absent (killed, exited, server reboot) and nothing more specific was
+/// captured from the pane. The preview treats this as the calm "Stopped" case
+/// rather than a red crash error, since it carries no diagnostic detail.
+pub const TMUX_SESSION_GONE_ERROR: &str =
+    "tmux session is gone. The agent process may have exited or been killed.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
@@ -263,15 +270,8 @@ fn default_true() -> bool {
     true
 }
 
-fn status_hook_env_prefix(
-    instance_id: &str,
-    tool: &str,
-    agent: Option<&crate::agents::AgentDef>,
-) -> String {
-    let has_hooks = agent.and_then(|a| a.hook_config.as_ref()).is_some()
-        || tool == "settl"
-        || tool == "hermes"
-        || tool == "kiro";
+fn status_hook_env_prefix(instance_id: &str, agent: Option<&crate::agents::AgentDef>) -> String {
+    let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
         format!("AOE_INSTANCE_ID={} ", instance_id)
@@ -570,6 +570,16 @@ pub struct Instance {
     /// will re-set it within one tick if the pane is genuinely dead).
     #[serde(skip)]
     pub pane_dead_observed: bool,
+
+    /// Live FileWatchService handle for in-process Local fast-path
+    /// notifications when this Instance's storage is mutated. `None` for
+    /// Instances created via `Instance::new` without explicit injection;
+    /// `Storage::load*` injects its own Arc into every loaded Instance
+    /// so daemon and TUI hot paths reach the live service. Use sites
+    /// fall back to `FileWatchService::noop()` when `None`, so ad-hoc
+    /// constructions remain functional without an explicit injection.
+    #[serde(skip, default)]
+    pub(crate) file_watch: Option<std::sync::Arc<crate::file_watch::FileWatchService>>,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -688,6 +698,7 @@ pub(crate) fn persist_session_to_storage(
     instance_id: &str,
     session_id: &str,
     expected_prior: Option<&str>,
+    file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
 ) -> SidWrite {
     if !is_valid_session_id(session_id) {
         tracing::warn!(target: "session.store",
@@ -698,7 +709,7 @@ pub(crate) fn persist_session_to_storage(
         return SidWrite::Failed;
     }
 
-    let storage = match super::storage::Storage::new(profile) {
+    let storage = match super::storage::Storage::new(profile, file_watch.clone()) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(target: "session.store", "Failed to create storage for session ID persistence: {}", e);
@@ -801,7 +812,30 @@ impl Instance {
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
+            file_watch: None,
         }
+    }
+
+    /// Inject the live FileWatchService Arc into this Instance for
+    /// in-process Local fast-path notifications during subsequent storage
+    /// mutations. Called by `Storage::load*` automatically; manual call
+    /// sites are daemon-side recovery and TUI session-creation paths that
+    /// build Instances without going through Storage::load.
+    pub(crate) fn set_file_watch(
+        &mut self,
+        fw: std::sync::Arc<crate::file_watch::FileWatchService>,
+    ) {
+        self.file_watch = Some(fw);
+    }
+
+    /// Resolve the live `Arc<FileWatchService>` for this Instance, falling
+    /// back to a noop service when none was injected (ad-hoc construction
+    /// or pre-injection state). Use sites pair this with `Storage::new`
+    /// directly because `new_unwatched` would shadow a live injection.
+    fn resolve_file_watch(&self) -> std::sync::Arc<crate::file_watch::FileWatchService> {
+        self.file_watch
+            .clone()
+            .unwrap_or_else(crate::file_watch::FileWatchService::noop)
     }
 
     /// Whether a title rename should also move the worktree directory leaf,
@@ -879,7 +913,9 @@ impl Instance {
     /// `set-session-id` would otherwise be silently overwritten. No-op on
     /// storage error or if the row is gone from disk.
     fn reconcile_from_disk(&mut self) {
-        let Ok(storage) = super::storage::Storage::new(&self.effective_profile()) else {
+        let Ok(storage) =
+            super::storage::Storage::new(&self.effective_profile(), self.resolve_file_watch())
+        else {
             tracing::warn!(target: "session.store",
                 session = %self.id,
                 "failed to open storage to reload disk state before launch; using in-memory value");
@@ -942,7 +978,13 @@ impl Instance {
         }
         let profile = self.effective_profile();
         let baseline = self.agent_session_id.as_deref();
-        match persist_session_to_storage(&profile, &self.id, &fresh, baseline) {
+        match persist_session_to_storage(
+            &profile,
+            &self.id,
+            &fresh,
+            baseline,
+            &self.resolve_file_watch(),
+        ) {
             SidWrite::Applied => {
                 self.agent_session_id = Some(fresh);
             }
@@ -1237,6 +1279,18 @@ impl Instance {
 
     pub fn is_sandboxed(&self) -> bool {
         self.sandbox_info.as_ref().is_some_and(|s| s.enabled)
+    }
+
+    /// The repo this session groups under: the worktree's main repo when
+    /// present (so all branches of a repo group together), else the project
+    /// path. Shared by sidebar project grouping and new-session prefill so
+    /// the "which directory does this session belong to" rule lives in one
+    /// place.
+    pub fn repo_path(&self) -> &str {
+        self.worktree_info
+            .as_ref()
+            .map(|w| w.main_repo_path.as_str())
+            .unwrap_or(&self.project_path)
     }
 
     pub fn is_yolo_mode(&self) -> bool {
@@ -1876,28 +1930,22 @@ impl Instance {
             if let Err(e) = crate::hooks::install_pi_status_extension() {
                 tracing::warn!(target: "session.store", "Failed to install Pi status extension: {}", e);
             }
-        } else if self.tool == "settl" {
-            // settl uses TOML config, not JSON settings
-            if let Err(e) = crate::hooks::install_settl_hooks() {
-                tracing::warn!(target: "session.store", "Failed to install settl hooks: {}", e);
-            }
-        } else if self.tool == "hermes" && !self.is_sandboxed() {
-            // Hermes uses YAML config; sandbox path is handled by build_container_config
-            if let Some(home) = dirs::home_dir() {
-                let config_path = home.join(".hermes").join("config.yaml");
-                if let Err(e) = crate::hooks::install_hermes_hooks(&config_path) {
-                    tracing::warn!(target: "session.store", "Failed to install hermes hooks: {}", e);
-                }
-            }
-        } else if self.tool == "kiro" && !self.is_sandboxed() {
-            // Kiro uses its own JSON agent config format; sandbox path is
-            // handled by build_container_config.
-            if let Some(home) = dirs::home_dir() {
-                let config_path = home.join(crate::hooks::KIRO_HOOKS_AGENT_FILE);
-                match crate::hooks::install_kiro_hooks(&config_path) {
-                    Ok(()) => crate::hooks::set_kiro_default_agent_if_builtin(),
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to install kiro hooks: {}", e)
+        } else if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
+            // Sidecar agents (settl TOML, hermes YAML, kiro per-agent JSON)
+            // install into a host config file; sandbox install is handled by
+            // build_container_config. host_only agents (settl) are never
+            // sandboxed, so the gate is a no-op for them.
+            if !self.is_sandboxed() {
+                if let Some(home) = dirs::home_dir() {
+                    let config_path = home.join(sidecar.host_config_subpath);
+                    match (sidecar.install)(&config_path) {
+                        Ok(()) => {
+                            if let Some(post_install) = sidecar.post_install_host {
+                                post_install();
+                            }
+                        }
+                        Err(e) => tracing::warn!(target: "session.store",
+                            "Failed to install {} hooks: {}", self.tool, e),
                     }
                 }
             }
@@ -1918,15 +1966,24 @@ impl Instance {
             if self.is_sandboxed() {
                 // For sandboxed sessions, hooks are installed via build_container_config
             } else {
-                // Install hooks in the user's home directory settings
-                if let Some(home) = dirs::home_dir() {
-                    let settings_path = home.join(hook_cfg.settings_rel_path);
-                    if let Err(e) = crate::hooks::install_hooks(
-                        &settings_path,
-                        hook_cfg.events,
-                        crate::hooks::HookInstallTarget::Host,
-                    ) {
-                        tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
+                // Install hooks in the agent's host settings file, honoring a
+                // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
+                // land where the agent actually reads them.
+                match crate::hooks::agent_settings_path_for_host_environment(
+                    hook_cfg,
+                    &self.profile_host_environment(),
+                ) {
+                    Ok(settings_path) => {
+                        if let Err(e) = crate::hooks::install_hooks(
+                            &settings_path,
+                            hook_cfg.events,
+                            crate::hooks::HookInstallTarget::Host,
+                        ) {
+                            tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
                     }
                 }
             }
@@ -1963,7 +2020,7 @@ impl Instance {
             }
         }
 
-        let mut env_prefix = status_hook_env_prefix(&self.id, &self.tool, agent);
+        let mut env_prefix = status_hook_env_prefix(&self.id, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
         // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
@@ -2144,7 +2201,7 @@ impl Instance {
             }
         }
 
-        let storage = match super::storage::Storage::new(profile) {
+        let storage = match super::storage::Storage::new(profile, self.resolve_file_watch()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "session.store",
@@ -2264,7 +2321,7 @@ impl Instance {
     /// reload both fields from disk so memory matches whatever the
     /// closure committed (or the peer's state on Skipped).
     fn clear_session_for_resume_fallback(&mut self, profile: &str, stale_sid: &str) -> SidWrite {
-        let storage = match super::storage::Storage::new(profile) {
+        let storage = match super::storage::Storage::new(profile, self.resolve_file_watch()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "session.store",
@@ -2996,6 +3053,28 @@ impl Instance {
     /// `finalize_launch` writes those fields and they would otherwise be
     /// dropped with the clone. See `apply_post_restart_sync`.
     pub fn ensure_pane_ready(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
+        self.ensure_pane_ready_with_size(None)
+    }
+
+    /// Like [`ensure_pane_ready`](Self::ensure_pane_ready), but seeds a
+    /// freshly created or respawned pane at `size` (cols, rows) instead of
+    /// letting tmux fall back to its 80x24 default.
+    ///
+    /// Live-send entry passes the visible preview-pane size here so the agent
+    /// boots at the width it will be shown at. Without it the agent boots
+    /// narrow (80 cols) and depends on a single post-boot `resize-window`
+    /// SIGWINCH to grow into the live area. That SIGWINCH races the agent's
+    /// startup: if it lands before the agent installs its resize handler the
+    /// reflow is lost, and because the per-frame resize loop is deduped on the
+    /// (already-correct) tmux window size, nothing re-issues it. The pane then
+    /// stays pinned at ~80 cols (≈50% of a wide live area) until live mode is
+    /// exited and re-entered. Booting at the right size sidesteps the race.
+    ///
+    /// `None` keeps tmux's default for callers with no target geometry.
+    pub fn ensure_pane_ready_with_size(
+        &mut self,
+        size: Option<(u16, u16)>,
+    ) -> Result<EnsureReadyOutcome, EnsureReadyError> {
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
@@ -3011,7 +3090,7 @@ impl Instance {
             // server kill or reboot resurrects the same bad sid the
             // restart paths exist to recover from.
             let outcome = self
-                .start_with_resume_fallback(None, false)
+                .start_with_resume_fallback(size, false)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
             let stale_sid = match outcome {
@@ -3022,7 +3101,7 @@ impl Instance {
         }
         if session.is_pane_dead() {
             let outcome = self
-                .restart_with_size(None)
+                .restart_with_size(size)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
             let stale_sid = match outcome {
@@ -3173,9 +3252,7 @@ impl Instance {
             // Clear any stale tmux-derived error so the UI doesn't show
             // a misleading message after a session is converted or
             // restarted in the structured view.
-            if self.last_error.as_deref()
-                == Some("tmux session is gone. The agent process may have exited or been killed.")
-            {
+            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
                 self.last_error = None;
             }
             if self.status == Status::Error {
@@ -3225,10 +3302,7 @@ impl Instance {
             );
             self.status = Status::Error;
             if self.last_error.is_none() {
-                self.last_error = Some(
-                    "tmux session is gone. The agent process may have exited or been killed."
-                        .to_string(),
-                );
+                self.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
             }
             self.last_error_check = Some(std::time::Instant::now());
             return;
@@ -3389,14 +3463,11 @@ impl Instance {
         self.update_status_with_metadata(None);
     }
 
-    pub fn capture_output_with_size(
-        &self,
-        lines: usize,
-        width: u16,
-        height: u16,
-    ) -> Result<String> {
-        let session = self.tmux_session()?;
-        session.capture_pane_with_size(lines, Some(width), Some(height))
+    pub fn capture_output(&self, lines: usize) -> Result<String> {
+        // capture-pane has no size parameters: the pane is captured at
+        // the window's own dimensions. (A previous *_with_size variant
+        // accepted width/height and silently ignored them.)
+        self.tmux_session()?.capture_pane(lines)
     }
 }
 
@@ -3570,11 +3641,18 @@ fn resolve_detected_status(
     match detected {
         Status::Idle if has_command_override => {
             // Custom commands run agents through wrapper scripts that appear
-            // as shell processes to tmux. Only declare Error when the pane is
-            // actually dead; don't use shell-stale since the shell IS the
-            // expected wrapper process.
+            // as shell processes to tmux, so we can't trust the pane's current
+            // command here; decide from pane *content* instead. A pane that is
+            // still rendering the agent TUI is genuinely parked at its prompt,
+            // so a detected Idle is real and we keep it (otherwise on_idle /
+            // on_waiting status hooks never fire for wrapped agents, e.g. an
+            // opencode session launched via agent_command_override, see #2022).
+            // Only declare Error when the pane is actually dead; a live pane
+            // without recognizable agent content stays Unknown.
             if is_dead {
                 Status::Error
+            } else if pane_has_agent_content(pane_content, tool) {
+                Status::Idle
             } else {
                 Status::Unknown
             }
@@ -3729,7 +3807,7 @@ mod tests {
     fn test_codex_gets_status_hook_env_prefix() {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
-            status_hook_env_prefix("abc123", "codex", agent),
+            status_hook_env_prefix("abc123", agent),
             "AOE_INSTANCE_ID=abc123 "
         );
     }
@@ -4414,7 +4492,13 @@ mod tests {
 
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
     /// status/start_time mutations. Skipped if tmux isn't installed.
+    // Serialized: this test creates and kills a real tmux session. Unserialized
+    // it can kill the shared server's last session while a `#[serial]` peer's
+    // `new-session` is connecting, which fails that peer with "server exited
+    // unexpectedly" (and its own skip-on-failure fallback silently masks the
+    // same race in the other direction).
     #[test]
+    #[serial_test::serial]
     fn test_ensure_pane_ready_alive_pane_is_noop() {
         if std::process::Command::new("tmux")
             .arg("-V")
@@ -4918,6 +5002,24 @@ mod tests {
         assert!(wt.managed_by_aoe);
     }
 
+    #[test]
+    fn test_repo_path_prefers_worktree_main_repo() {
+        let mut inst = Instance::new("Test", "/tmp/worktrees/feature");
+        assert_eq!(inst.repo_path(), "/tmp/worktrees/feature");
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "feature".to_string(),
+            main_repo_path: "/tmp/main-repo".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        assert_eq!(
+            inst.repo_path(),
+            "/tmp/main-repo",
+            "worktree sessions group under the main repo, not the worktree dir"
+        );
+    }
+
     // Test generate_id function properties
     #[test]
     fn test_generate_id_uniqueness() {
@@ -5253,23 +5355,23 @@ mod tests {
     #[test]
     fn test_status_hook_env_prefix_includes_hermes() {
         assert_eq!(
-            status_hook_env_prefix("abc123", "hermes", crate::agents::get_agent("hermes")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("hermes")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "settl", crate::agents::get_agent("settl")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("settl")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "claude", crate::agents::get_agent("claude")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("claude")),
             "AOE_INSTANCE_ID=abc123 "
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "opencode", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("opencode")),
             ""
         );
         assert_eq!(
-            status_hook_env_prefix("abc123", "kiro", crate::agents::get_agent("kiro")),
+            status_hook_env_prefix("abc123", crate::agents::get_agent("kiro")),
             "AOE_INSTANCE_ID=abc123 "
         );
     }
@@ -5463,6 +5565,19 @@ mod tests {
         assert_eq!(
             resolve_detected_status(Status::Idle, false, true, true, "$ ", "opencode"),
             Status::Unknown
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_command_override_agent_content_stays_idle() {
+        // A wrapped agent (agent_command_override) whose pane still renders the
+        // agent TUI must keep its detected Idle so on_idle / on_waiting status
+        // hooks fire; previously the override masked every Idle to Unknown and
+        // those hooks never ran (#2022).
+        let content = "ctrl+p commands \u{2022} OpenCode 1.16.2";
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, false, true, content, "opencode"),
+            Status::Idle
         );
     }
 
@@ -5714,7 +5829,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("cas-persist-mismatch").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("cas-persist-mismatch").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.agent_session_id = Some("peer-wrote".to_string());
             let id = inst.id.clone();
@@ -5727,8 +5843,13 @@ mod tests {
                 })
                 .unwrap();
 
-            let outcome =
-                super::persist_session_to_storage("cas-persist-mismatch", &id, "ours", Some("old"));
+            let outcome = super::persist_session_to_storage(
+                "cas-persist-mismatch",
+                &id,
+                "ours",
+                Some("old"),
+                &crate::file_watch::FileWatchService::noop(),
+            );
             assert_eq!(outcome, super::SidWrite::Skipped);
 
             let loaded = storage.load().unwrap();
@@ -5743,7 +5864,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("cas-persist-match").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("cas-persist-match").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.agent_session_id = Some("old".to_string());
             let id = inst.id.clone();
@@ -5756,14 +5878,91 @@ mod tests {
                 })
                 .unwrap();
 
-            let outcome =
-                super::persist_session_to_storage("cas-persist-match", &id, "new", Some("old"));
+            let outcome = super::persist_session_to_storage(
+                "cas-persist-match",
+                &id,
+                "new",
+                Some("old"),
+                &crate::file_watch::FileWatchService::noop(),
+            );
             assert_eq!(outcome, super::SidWrite::Applied);
 
             let loaded = storage.load().unwrap();
             assert_eq!(loaded[0].agent_session_id.as_deref(), Some("new"));
         }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn persist_session_to_storage_delivers_notification_to_in_process_subscriber() {
+            use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
+            use std::sync::Arc;
+            use std::time::Duration;
+            use tokio::time::timeout;
 
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            // Seed via a noop service so the seed write produces no Local
+            // notification on the live service constructed below; the
+            // subscriber attaches AFTER the seed so any seed-side kernel
+            // echo is filtered out by the subscribe boundary.
+            let seed_storage =
+                crate::session::storage::Storage::new_unwatched("sid-persist-notify").unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.agent_session_id = Some("old".to_string());
+            let id = inst.id.clone();
+            let on_disk = vec![inst.clone()];
+            seed_storage
+                .update(|i, g| {
+                    *i = on_disk.clone();
+                    *g = crate::session::GroupTree::new_with_groups(&on_disk, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+            drop(seed_storage);
+
+            let svc: Arc<FileWatchService> = FileWatchService::new().expect("init");
+            let profile_dir = crate::session::get_profile_dir_path("sid-persist-notify").unwrap();
+            let sessions_path = profile_dir.join("sessions.json");
+            let (mut rx, _handle) = svc
+                .subscribe_channel(
+                    WatchSpec {
+                        dir: profile_dir,
+                        matcher: FileMatcher::Exact(sessions_path),
+                        debounce: Some(Duration::from_millis(75)),
+                    },
+                    4,
+                )
+                .expect("subscribe");
+
+            let outcome = super::persist_session_to_storage(
+                "sid-persist-notify",
+                &id,
+                "new-sid",
+                Some("old"),
+                &svc,
+            );
+            assert_eq!(outcome, super::SidWrite::Applied);
+
+            // Wiring assertion: the in-process subscriber receives a delivery
+            // for sessions.json within sub-tick budget. The Local-first
+            // invariant of notify_local_change vs the kernel echo is locked
+            // separately by file_watch::tests::
+            // notify_local_change_delivers_local_first_and_tolerates_late_kernel_echo;
+            // the dispatcher's debounce window may coalesce both into a
+            // kernel-sourced slot on platforms where canonicalize latency
+            // exceeds the kernel pipeline.
+            let evt = timeout(Duration::from_millis(2_500), rx.recv())
+                .await
+                .expect("delivery within budget")
+                .expect("dispatcher alive");
+            assert_eq!(
+                evt.path.file_name().and_then(|n| n.to_str()),
+                Some("sessions.json"),
+                "subscriber must observe the sessions.json write"
+            );
+        }
         #[test]
         #[serial]
         fn reconcile_from_disk_picks_up_peer_persist() {
@@ -5772,7 +5971,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("reconcile-test").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "reconcile-test".to_string();
             inst.agent_session_id = Some("old-sid".to_string());
@@ -5796,6 +5996,7 @@ mod tests {
                 &id,
                 "new-sid",
                 Some("old-sid"),
+                &crate::file_watch::FileWatchService::noop(),
             );
 
             assert_eq!(inst.agent_session_id.as_deref(), Some("old-sid"));
@@ -5811,7 +6012,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("reconcile-clear").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("reconcile-clear").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "reconcile-clear".to_string();
             inst.agent_session_id = Some("old-sid".to_string());
@@ -5961,7 +6163,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("intent-reconcile").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("intent-reconcile").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "intent-reconcile".to_string();
             inst.resume_intent = ResumeIntent::Default;
@@ -6002,7 +6205,7 @@ mod tests {
         }
 
         fn seed_disk_for_sidecar_test(profile: &str, inst: &Instance) {
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let snapshot = inst.clone();
             storage
                 .update(|i, g| {
@@ -6044,7 +6247,7 @@ mod tests {
                 inst.agent_session_id.as_deref(),
                 Some(SIDECAR_TEST_FRESH_UUID)
             );
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = storage
                 .load()
                 .unwrap()
@@ -6079,7 +6282,7 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some("disk-sid"));
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = storage
                 .load()
                 .unwrap()
@@ -6111,7 +6314,7 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some("disk-sid"));
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = storage
                 .load()
                 .unwrap()
@@ -6143,7 +6346,7 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some("disk-sid"));
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = storage
                 .load()
                 .unwrap()
@@ -6177,7 +6380,7 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some("disk-sid"));
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = storage
                 .load()
                 .unwrap()
@@ -6206,7 +6409,7 @@ mod tests {
             inst.reconcile_sidecar_into_disk();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some("disk-sid"));
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = storage
                 .load()
                 .unwrap()
@@ -6232,7 +6435,7 @@ mod tests {
             inst.agent_session_id = Some("memory-baseline".to_string());
             seed_disk_for_sidecar_test(profile, &inst);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             storage
                 .update(|i, _g| {
                     i[0].agent_session_id = Some("peer-wrote-this".to_string());
@@ -6276,7 +6479,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("persist-skipped-reload").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("persist-skipped-reload").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "persist-skipped-reload".to_string();
             inst.agent_session_id = Some("peer-wrote".to_string());
@@ -6313,7 +6517,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("persist-atomic-match").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("persist-atomic-match").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "persist-atomic-match".to_string();
             inst.agent_session_id = None;
@@ -6356,7 +6561,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("persist-default-intent").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("persist-default-intent").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "persist-default-intent".to_string();
             inst.agent_session_id = None;
@@ -6398,7 +6604,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("persist-intent-mismatch").unwrap();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("persist-intent-mismatch").unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "persist-intent-mismatch".to_string();
             inst.agent_session_id = None;
@@ -6453,7 +6660,8 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
             let storage =
-                crate::session::storage::Storage::new("persist-skipped-reload-both").unwrap();
+                crate::session::storage::Storage::new_unwatched("persist-skipped-reload-both")
+                    .unwrap();
             let mut inst = Instance::new("title", "/tmp/x");
             inst.source_profile = "persist-skipped-reload-both".to_string();
             inst.agent_session_id = Some("peer-sid".to_string());
@@ -6488,7 +6696,7 @@ mod tests {
         }
 
         fn seed_disk(profile: &str, inst: &Instance) {
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = inst.clone();
             storage
                 .update(|i, g| {
@@ -6521,7 +6729,7 @@ mod tests {
             let outcome = inst.clear_session_for_resume_fallback(profile, "stale");
             assert_eq!(outcome, super::SidWrite::Applied);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let loaded = storage.load().unwrap();
             assert_eq!(loaded[0].agent_session_id, None);
             assert_eq!(loaded[0].resume_intent, ResumeIntent::Default);
@@ -6547,7 +6755,7 @@ mod tests {
             let outcome = inst.clear_session_for_resume_fallback(profile, "stale");
             assert_eq!(outcome, super::SidWrite::Applied);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let loaded = storage.load().unwrap();
             assert_eq!(loaded[0].agent_session_id, None);
             assert_eq!(loaded[0].resume_intent, ResumeIntent::Default);
@@ -6569,7 +6777,7 @@ mod tests {
             inst.resume_intent = ResumeIntent::Use("stale".to_string());
             seed_disk(profile, &inst);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             storage
                 .update(|i, _g| {
                     i[0].resume_intent = ResumeIntent::Use("fresh".to_string());
@@ -6609,7 +6817,7 @@ mod tests {
             inst.resume_intent = ResumeIntent::Use("stale".to_string());
             seed_disk(profile, &inst);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             storage
                 .update(|i, _g| {
                     i[0].agent_session_id = Some("peer-fresh".to_string());
@@ -6654,7 +6862,7 @@ mod tests {
             inst.resume_intent = ResumeIntent::Use("stale".to_string());
             seed_disk(profile, &inst);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             storage
                 .update(|i, _g| {
                     i[0].agent_session_id = None;
@@ -6691,7 +6899,7 @@ mod tests {
             inst.resume_intent = ResumeIntent::Use("stale".to_string());
             seed_disk(profile, &inst);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             storage
                 .update(|i, _g| {
                     i[0].agent_session_id = None;
@@ -6735,7 +6943,7 @@ mod tests {
             let outcome = inst.clear_session_for_resume_fallback(profile, "stale");
             assert_eq!(outcome, super::SidWrite::Applied);
 
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let loaded = storage.load().unwrap();
             assert_eq!(loaded[0].agent_session_id, None);
             assert_eq!(
@@ -6804,7 +7012,7 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let storage = crate::session::storage::Storage::new("fb-test").unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched("fb-test").unwrap();
 
             let stale_sid = "11111111-1111-1111-1111-111111111111".to_string();
             let mut inst = Instance::new("fallback_dies_test", "/tmp/x");
@@ -6878,7 +7086,7 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let _storage = crate::session::storage::Storage::new("fb-test-live").unwrap();
+            let _storage = crate::session::storage::Storage::new_unwatched("fb-test-live").unwrap();
 
             let stale_sid = "22222222-2222-2222-2222-222222222222".to_string();
             let mut inst = Instance::new("fallback_lives_test", "/tmp/x");
@@ -6960,7 +7168,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let _storage = crate::session::storage::Storage::new("fb-test-grace").unwrap();
+            let _storage =
+                crate::session::storage::Storage::new_unwatched("fb-test-grace").unwrap();
 
             let stale_sid = "33333333-3333-3333-3333-333333333333".to_string();
             let mut inst = Instance::new("fallback_grace_test", "/tmp/x");
@@ -7103,7 +7312,7 @@ mod tests {
         }
 
         fn seed_disk_row(profile: &str, inst: &Instance) {
-            let storage = crate::session::storage::Storage::new(profile).unwrap();
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let on_disk = inst.clone();
             storage
                 .update(|i, g| {
@@ -7229,7 +7438,7 @@ mod tests {
             isolate_home(&temp);
 
             let profile = "publish-failed";
-            let _ = crate::session::storage::Storage::new(profile).unwrap();
+            let _ = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let mut inst = make_inst(profile, "fpfle");
 
             let tmux = TmuxSession::create(&inst.id, &inst.title);

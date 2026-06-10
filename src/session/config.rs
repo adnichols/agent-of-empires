@@ -634,6 +634,13 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_update_version: Option<String>,
 
+    /// Registry digest of the sandbox image the user dismissed the
+    /// "image update available" banner for. The banner stays hidden while the
+    /// registry still resolves to this digest and returns automatically once a
+    /// newer image is published (the digest no longer matches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_image_digest: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
@@ -658,6 +665,14 @@ pub struct AppStateConfig {
 
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
+
+    /// True once the user has acknowledged that glob `volume_ignores` entries
+    /// (e.g. `**/bin`) are expanded against the workspace at session-create time,
+    /// a point-in-time snapshot that won't shadow directories created later by an
+    /// in-container build (#2045). Gates the one-time confirm dialog shown before a
+    /// sandbox session whose resolved config contains a glob ignore.
+    #[serde(default)]
+    pub has_acknowledged_volume_ignores_globs: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<SortOrder>,
@@ -1351,17 +1366,20 @@ pub enum ColorMode {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "theme", category = "Theme")]
 pub struct ThemeConfig {
-    /// Color theme for the TUI.
+    /// Color theme for the TUI. A global preference: one theme paints every
+    /// surface regardless of the active session profile (see
+    /// `config::resolve_theme_name`), so it is not profile-overridable.
     #[serde(default)]
-    #[setting(label = "Theme", widget = "custom:theme-name")]
+    #[setting(label = "Theme", widget = "custom:theme-name", global_only)]
     pub name: String,
     /// Truecolor (24-bit RGB) or palette (xterm-256). Use palette if your
-    /// terminal mangles RGB escapes.
+    /// terminal mangles RGB escapes. Global, like the theme itself.
     #[serde(default)]
     #[setting(
         label = "Color Mode",
         widget = "select",
-        options = "truecolor:truecolor,palette:palette"
+        options = "truecolor:truecolor,palette:palette",
+        global_only
     )]
     pub color_mode: ColorMode,
     /// Off by default (0). Set a positive value to opt in: a freshly-stopped
@@ -2036,6 +2054,23 @@ impl Config {
             self.session.session_id_poller_max_threads = 1;
         }
     }
+
+    /// Effective theme name to paint, mapping the empty default to the
+    /// `default` builtin. Theme is a global preference (see
+    /// [`resolve_theme_name`]); callers read it from the global config, never
+    /// the profile-merged config.
+    pub fn effective_theme_name(&self) -> String {
+        if self.theme.name.is_empty() {
+            "default".to_string()
+        } else {
+            self.theme.name.clone()
+        }
+    }
+
+    /// Whether the theme requests xterm-256 palette downsampling.
+    pub fn theme_palette_mode(&self) -> bool {
+        matches!(self.theme.color_mode, ColorMode::Palette)
+    }
 }
 
 pub fn load_config() -> Result<Option<Config>> {
@@ -2051,6 +2086,26 @@ pub fn save_config(config: &Config) -> Result<()> {
     let content = toml::to_string_pretty(config)?;
     super::atomic_write(&path, content.as_bytes())?;
     Ok(())
+}
+
+/// Theme name to paint, read from the **global** config only.
+///
+/// The theme is a global preference: it is never profile-merged, so the TUI
+/// boot, the Settings-close repaint, the tmux status bar, and the web
+/// `/api/theme/current` all paint the same theme regardless of which session
+/// profile is active. Reading the profile-merged theme on some surfaces but
+/// the global theme on others let a per-profile override (which the web theme
+/// picker used to write) shadow the global pick on every Settings open/close,
+/// flipping the theme until the next restart. An empty name maps to the
+/// `default` builtin, matching the web dashboard's empty-name fallback.
+pub fn resolve_theme_name() -> String {
+    Config::load_or_warn().effective_theme_name()
+}
+
+/// Whether the global theme requests xterm-256 palette downsampling. Reads the
+/// global config only, for the same reason as [`resolve_theme_name`].
+pub fn resolve_theme_palette_mode() -> bool {
+    Config::load_or_warn().theme_palette_mode()
 }
 
 /// Resolve the active profile name.

@@ -23,11 +23,15 @@ import {
   setSessionArchive,
   setSessionPin,
   setSessionSnooze,
+  getSettingsSchema,
   updateProfileSettings,
-  PROFILE_WRITABLE_SECTIONS,
+  updateTheme,
+  profileWritableSections,
+  resetSettingsSchemaCache,
   updateSessionGroup,
   type ServerAbout,
 } from "./api";
+import type { SettingsFieldDescriptor } from "./types";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -107,9 +111,7 @@ describe("fetchAbout", () => {
 
 describe("setSessionPin", () => {
   it("PATCHes /api/sessions/{id}/pin with the pinned bool", async () => {
-    fetchSpy.mockResolvedValueOnce(
-      jsonResponse({ id: "sess-1", pinned_at: "2026-01-01T00:00:00Z" }),
-    );
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1", pinned_at: "2026-01-01T00:00:00Z" }));
     await setSessionPin("sess-1", true);
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe("/api/sessions/sess-1/pin");
@@ -190,25 +192,48 @@ describe("setSessionSnooze", () => {
   });
 });
 
+function fieldDescriptor(section: string, field: string): SettingsFieldDescriptor {
+  return {
+    section,
+    field,
+    category: "Test",
+    label: field,
+    description: "",
+    widget: { kind: "toggle" },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: { rule: "none" },
+    advanced: false,
+  };
+}
+
+describe("profileWritableSections", () => {
+  it("derives the writable set from the schema plus `description`", () => {
+    const schema = [fieldDescriptor("theme", "name"), fieldDescriptor("session", "yolo_mode_default")];
+    const writable = profileWritableSections(schema);
+    expect(writable.has("theme")).toBe(true);
+    expect(writable.has("session")).toBe(true);
+    // The profile-only top-level field has no descriptor but is always writable.
+    expect(writable.has("description")).toBe(true);
+    // `hooks` is absent from the schema (an RCE surface), so it is never
+    // writable; the client cannot drift from the server on this.
+    expect(writable.has("hooks")).toBe(false);
+  });
+});
+
 describe("updateProfileSettings write guard", () => {
-  // PROFILE_WRITABLE_SECTIONS mirrors the server's
-  // ALLOWED_PROFILE_SETTINGS_SECTIONS (src/server/api/mod.rs). This literal
-  // pin fails CI if the client list drifts; keep it in sync with the Rust
-  // constant and its pinned regression test by hand.
-  it("pins the allowlist to the server's writable sections", () => {
-    expect([...PROFILE_WRITABLE_SECTIONS]).toEqual([
-      "theme",
-      "session",
-      "tmux",
-      "updates",
-      "sound",
-      "sandbox",
-      "worktree",
-      "web",
-      "logging",
-      "acp",
-      "description",
-    ]);
+  // The guard reads the live settings schema (cached) to decide which sections
+  // it may PATCH, so client and server derive from one source and cannot drift.
+  // A section newly added to the Rust schema is writable here automatically
+  // (the #1757 cockpit drift could not recur). Prime the cache with a known
+  // schema, then clear the spy so the assertions below only see PATCH traffic.
+  const schema = [fieldDescriptor("theme", "name"), fieldDescriptor("session", "yolo_mode_default")];
+
+  beforeEach(async () => {
+    resetSettingsSchemaCache();
+    fetchSpy.mockResolvedValueOnce(jsonResponse(schema));
+    await getSettingsSchema();
+    fetchSpy.mockReset();
   });
 
   it("refuses to send a body containing the blocked `hooks` section", async () => {
@@ -245,6 +270,21 @@ describe("updateProfileSettings write guard", () => {
     expect(JSON.parse(init!.body as string)).toEqual({
       description: "my profile",
     });
+  });
+
+  it("defers to the server when the schema is unavailable instead of blocking", async () => {
+    // A transient schema fetch failure must not block a legitimate save: with no
+    // schema to derive the allowlist from, the guard sends the PATCH and lets
+    // the server's authoritative validation decide.
+    resetSettingsSchemaCache();
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 503 })); // schema GET
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 })); // PATCH
+    const ok = await updateProfileSettings("work", { theme: { name: "empire" } });
+    expect(ok).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const [url, init] = fetchSpy.mock.calls[1]!;
+    expect(url).toBe("/api/profiles/work/settings");
+    expect(init?.method).toBe("PATCH");
   });
 });
 
@@ -320,5 +360,39 @@ describe("isDebugBuild", () => {
 
   it("returns false when the about payload is undefined", () => {
     expect(isDebugBuild(undefined)).toBe(false);
+  });
+});
+
+// The theme is a global preference written through the dedicated, non-elevated
+// PATCH /api/theme endpoint (not the profile settings PATCH that the picker used
+// to hit). These pin the request shape and the boolean result contract so the
+// api-client surface stays covered when Playwright is gated off.
+describe("updateTheme", () => {
+  it("PATCHes /api/theme with the name and returns true on ok", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ name: "dracula" }));
+    const ok = await updateTheme({ name: "dracula" });
+    expect(ok).toBe(true);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/theme");
+    expect(init!.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ name: "dracula" });
+  });
+
+  it("forwards a color_mode-only patch", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({}));
+    await updateTheme({ color_mode: "palette" });
+    expect(JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string)).toEqual({
+      color_mode: "palette",
+    });
+  });
+
+  it("returns false on a non-ok response", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 403 }));
+    expect(await updateTheme({ name: "dracula" })).toBe(false);
+  });
+
+  it("returns false on a network error", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("offline"));
+    expect(await updateTheme({ name: "dracula" })).toBe(false);
   });
 });

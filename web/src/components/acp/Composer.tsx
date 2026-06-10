@@ -9,24 +9,13 @@
 //
 // Icons via lucide-react.
 
-import {
-  ComposerPrimitive,
-  useComposerRuntime,
-  useThreadRuntime,
-} from "@assistant-ui/react";
+import { ComposerPrimitive, useComposerRuntime, useThreadRuntime } from "@assistant-ui/react";
 import {
   unstable_defaultDirectiveFormatter as defaultDirectiveFormatter,
   type Unstable_TriggerAdapter,
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AtSign, ChevronUp, Paperclip, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
@@ -37,12 +26,7 @@ import {
   getPendingSwitchAgent,
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
-import type {
-  AcpState,
-  PromptAttachmentInput,
-  PromptAttachmentKind,
-  PromptCapabilities,
-} from "../../lib/acpTypes";
+import type { AcpState, PromptAttachmentInput, PromptAttachmentKind, PromptCapabilities } from "../../lib/acpTypes";
 import { getDraft, setDraft } from "../../lib/acpDrafts";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
@@ -61,15 +45,16 @@ export {
 
 /** Decision returned by {@link decideEnterAction} for an Enter
  *  keystroke on the structured view composer textarea.
- *  - `newline`: insert a newline natively, suppress the primitive's
- *    Send. Used on touch-primary devices so multi-line drafting
- *    matches WhatsApp / Slack / ChatGPT mobile conventions (#1129).
  *  - `send`: dispatch via our custom send path; covers the
  *    mid-turn queue branch (#1031) where ComposerPrimitive.Input
  *    hard-blocks Enter on its own.
- *  - `default`: let the primitive run its built-in keymap (desktop
- *    Enter-to-send, Shift+Enter for newline, etc.). */
-export type EnterAction = "newline" | "send" | "default";
+ *  - `default`: let the primitive run its built-in keymap. On
+ *    desktop that is Enter-to-send / Shift+Enter for newline. On
+ *    touch-primary devices the `unstable_insertNewlineOnTouchEnter`
+ *    prop on ComposerPrimitive.Input downgrades plain Enter to a
+ *    native newline, so the on-screen Return key never dispatches
+ *    (#1129); we no longer intercept it here. */
+export type EnterAction = "send" | "default";
 
 /** Pure decision helper for the composer's Enter keystroke. Extracted
  *  so the decision matrix can be unit-tested without mounting the
@@ -88,7 +73,13 @@ export function decideEnterAction(
   if (event.key !== "Enter") return "default";
   if (event.isComposing) return "default";
   if (event.shiftKey || event.ctrlKey || event.metaKey) return "default";
-  if (ctx.isMobile) return "newline";
+  // Touch-primary devices: ComposerPrimitive.Input's
+  // `unstable_insertNewlineOnTouchEnter` resolves the submit mode to
+  // "none", so plain Enter inserts a newline natively and never
+  // submits. Fall through to "default" and let the primitive own it;
+  // crucially this also keeps mobile mid-turn Enter from hitting the
+  // "send" queue path below.
+  if (ctx.isMobile) return "default";
   if (ctx.turnActive) return "send";
   return "default";
 }
@@ -133,13 +124,8 @@ export function composerWrapperLayout(opts: { keyboardOpen: boolean }): {
   style: React.CSSProperties | undefined;
 } {
   return {
-    className: [
-      "border-t border-surface-800 bg-surface-900 px-4 pt-3",
-      opts.keyboardOpen ? "pb-0" : "pb-3",
-    ].join(" "),
-    style: opts.keyboardOpen
-      ? { marginBottom: "calc(-1 * env(safe-area-inset-bottom))" }
-      : undefined,
+    className: ["border-t border-surface-800 bg-surface-900 px-4 pt-3", opts.keyboardOpen ? "pb-0" : "pb-3"].join(" "),
+    style: opts.keyboardOpen ? { marginBottom: "calc(-1 * env(safe-area-inset-bottom))" } : undefined,
   };
 }
 
@@ -167,10 +153,7 @@ function mimeToKind(mime: string): PromptAttachmentKind {
 }
 
 /** Whether the current agent accepts the given attachment kind. */
-function kindSupported(
-  kind: PromptAttachmentKind,
-  caps: PromptCapabilities | null,
-): boolean {
+function kindSupported(kind: PromptAttachmentKind, caps: PromptCapabilities | null): boolean {
   if (!caps) return false;
   if (kind === "image") return caps.image;
   if (kind === "audio") return caps.audio;
@@ -248,10 +231,7 @@ interface Props {
    *  the ComposerPrimitive.Send path (which assistant-ui hard-disables
    *  while `thread.isRunning && !capabilities.queue`). Used by the
    *  mid-turn Send button + the Enter-while-running handler. */
-  enqueuePrompt: (
-    text: string,
-    attachments?: PromptAttachmentInput[],
-  ) => void | Promise<void>;
+  enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>;
   /** Attachment kinds the current agent accepts, gating the paperclip
    *  / paste / drop affordances. Null until the handshake reports it.
    *  See #1000 / #965. */
@@ -259,9 +239,7 @@ interface Props {
   /** Attachments staged for the next send, owned by AcpRuntime so
    *  the assistant-ui Enter / Send path can read them on submit. */
   pendingAttachments: PromptAttachmentInput[];
-  setPendingAttachments: React.Dispatch<
-    React.SetStateAction<PromptAttachmentInput[]>
-  >;
+  setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
   /** When set, replace the current composer text with `text` and
    *  focus the textarea (cursor at end). Used by the context-primer
    *  banner to prefill a transcript recap before send. The `id` is
@@ -296,9 +274,7 @@ export function Composer({
 
   const attachmentsEnabled =
     !!promptCapabilities &&
-    (promptCapabilities.image ||
-      promptCapabilities.audio ||
-      promptCapabilities.embeddedContext);
+    (promptCapabilities.image || promptCapabilities.audio || promptCapabilities.embeddedContext);
 
   // Stage files dropped, pasted, or picked. Filters to kinds the agent
   // accepts and respects the per-prompt count cap; oversize / type
@@ -307,10 +283,7 @@ export function Composer({
     async (files: FileList | File[]) => {
       // Only encode up to the remaining slots: base64 work on files the
       // cap would discard anyway stalls the composer on large drops.
-      const remaining = Math.max(
-        0,
-        MAX_ATTACHMENTS - pendingAttachments.length,
-      );
+      const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
       if (remaining === 0) return;
       const list = Array.from(files).slice(0, remaining);
       const accepted: PromptAttachmentInput[] = [];
@@ -327,9 +300,7 @@ export function Composer({
         });
       }
       if (accepted.length === 0) return;
-      setPendingAttachments((prev) =>
-        prev.concat(accepted).slice(0, MAX_ATTACHMENTS),
-      );
+      setPendingAttachments((prev) => prev.concat(accepted).slice(0, MAX_ATTACHMENTS));
     },
     [pendingAttachments.length, promptCapabilities, setPendingAttachments],
   );
@@ -337,9 +308,7 @@ export function Composer({
   const supportedPendingAttachments = useMemo(
     () =>
       promptCapabilities
-        ? pendingAttachments.filter((att) =>
-            kindSupported(att.kind, promptCapabilities),
-          )
+        ? pendingAttachments.filter((att) => kindSupported(att.kind, promptCapabilities))
         : pendingAttachments,
     [pendingAttachments, promptCapabilities],
   );
@@ -450,19 +419,10 @@ export function Composer({
   // runtime's `onNew`, which reads the same staged attachments from
   // AcpRuntime. See #1000 / #965.
   const submitComposer = useCallback(() => {
-    void sendFromTextarea(
-      taRef,
-      composerRuntime,
-      enqueuePrompt,
-      supportedPendingAttachments,
-      () => setPendingAttachments([]),
+    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, supportedPendingAttachments, () =>
+      setPendingAttachments([]),
     );
-  }, [
-    composerRuntime,
-    enqueuePrompt,
-    setPendingAttachments,
-    supportedPendingAttachments,
-  ]);
+  }, [composerRuntime, enqueuePrompt, setPendingAttachments, supportedPendingAttachments]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
   // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
@@ -635,9 +595,7 @@ export function Composer({
         {...tourAnchor(TOUR_ANCHORS.composer)}
         className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
         onDragOver={(e) => {
-          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes(
-            "Files",
-          );
+          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes("Files");
           if (!hasFiles) return;
           e.preventDefault();
         }}
@@ -665,9 +623,7 @@ export function Composer({
               adapter={fileAdapter}
               className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
             >
-              <ComposerPrimitive.Unstable_TriggerPopover.Directive
-                formatter={defaultDirectiveFormatter}
-              />
+              <ComposerPrimitive.Unstable_TriggerPopover.Directive formatter={defaultDirectiveFormatter} />
               <PopoverItems trigger="@" />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
@@ -689,6 +645,15 @@ export function Composer({
             <ComposerPrimitive.Input
               ref={taRef}
               rows={2}
+              // On touch-primary devices (phone / tablet without a
+              // hardware keyboard) plain Enter inserts a newline
+              // instead of dispatching; messages send only via the
+              // explicit Send button. Detected upstream via the
+              // `(pointer: coarse) and (not (any-pointer: fine))`
+              // media query, matching WhatsApp / Slack / ChatGPT
+              // mobile conventions. Replaces our former consumer-side
+              // caret re-insertion dance. See assistant-ui#4091 / #1129.
+              unstable_insertNewlineOnTouchEnter
               // assistant-ui's default Escape binding cancels the active
               // run (see ComposerPrimitive.Input's `cancelOnEscape`
               // default). The structured view deliberately keeps cancel behind
@@ -729,11 +694,7 @@ export function Composer({
                 // let the keydown matrix handle the platforms that do
                 // fire a real Enter keydown. See #1174.
                 const ne = e.nativeEvent as InputEvent;
-                const newlineAction = decideBeforeInputAction(
-                  ne.inputType,
-                  ne.isComposing,
-                  { isMobile },
-                );
+                const newlineAction = decideBeforeInputAction(ne.inputType, ne.isComposing, { isMobile });
                 if (newlineAction === "newline") {
                   e.preventDefault();
                   e.stopPropagation();
@@ -752,9 +713,7 @@ export function Composer({
                 // `composeEventHandlers` (used by ComposerPrimitive.Input)
                 // skips the downstream handler when `defaultPrevented`
                 // is set on the SyntheticEvent.
-                if (
-                  dictationGuard.shouldSuppressUpstream(e.currentTarget.value)
-                ) {
+                if (dictationGuard.shouldSuppressUpstream(e.currentTarget.value)) {
                   e.preventDefault();
                 }
               }}
@@ -766,21 +725,19 @@ export function Composer({
                 dictationGuard.flushOnBlur();
               }}
               onKeyDown={(e) => {
-                // Three-way Enter dispatch. See decideEnterAction for
+                // Two-way Enter dispatch. See decideEnterAction for
                 // the full matrix; the inline branches below handle
                 // each outcome:
-                //   - "newline": touch-primary device, plain Enter.
-                //     Stop assistant-ui's bubble-phase Send and let
-                //     the textarea insert a newline natively (no
-                //     preventDefault). Mobile users tap the Send
-                //     button to dispatch.
                 //   - "send": desktop, mid-turn, plain Enter.
                 //     ComposerPrimitive.Input hard-blocks Enter while
                 //     thread.isRunning && !queue (#1031), so we
                 //     intercept and route through our queue path.
                 //   - "default": modifier keys, IME compose, non-Enter
-                //     keys, or desktop idle Enter; let the primitive's
-                //     built-in keymap run.
+                //     keys, desktop idle Enter, or any touch-primary
+                //     Enter; let the primitive's built-in keymap run.
+                //     Touch-primary plain Enter is downgraded to a
+                //     native newline by the Input's
+                //     `unstable_insertNewlineOnTouchEnter` prop.
                 const action = decideEnterAction(
                   {
                     key: e.key,
@@ -792,10 +749,6 @@ export function Composer({
                   { isMobile, turnActive },
                 );
                 if (action === "default") return;
-                if (action === "newline") {
-                  e.stopPropagation();
-                  return;
-                }
                 // action === "send"
                 e.preventDefault();
                 e.stopPropagation();
@@ -843,9 +796,7 @@ export function Composer({
                         <Paperclip className="h-3.5 w-3.5" />
                       </span>
                     )}
-                    <span className="max-w-[120px] truncate">
-                      {att.name ?? att.kind}
-                    </span>
+                    <span className="max-w-[120px] truncate">{att.name ?? att.kind}</span>
                     <button
                       type="button"
                       aria-label={`Remove ${att.name ?? "attachment"}`}
@@ -925,19 +876,12 @@ export function Composer({
                 />
               </div>
 
-              <div
-                data-testid="composer-actions"
-                className="flex shrink-0 items-center gap-2"
-              >
+              <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
                 <UsageHint usage={sessionUsage} />
                 {turnActive ? (
                   <>
                     <StopButton />
-                    <QueueSendButton
-                      connected={connected}
-                      queuedCount={queuedCount}
-                      onSend={submitComposer}
-                    />
+                    <QueueSendButton connected={connected} queuedCount={queuedCount} onSend={submitComposer} />
                   </>
                 ) : (
                   <SendButton connected={connected} onSend={submitComposer} />
@@ -981,9 +925,7 @@ function PopoverItems({ trigger }: { trigger: string }) {
     <ComposerPrimitive.Unstable_TriggerPopoverItems className="max-h-64 overflow-y-auto">
       {(items) =>
         items.length === 0 ? (
-          <div className="px-3 py-2 text-xs italic text-text-dim">
-            No matches
-          </div>
+          <div className="px-3 py-2 text-xs italic text-text-dim">No matches</div>
         ) : (
           items.map((item, i) => (
             <ComposerPrimitive.Unstable_TriggerPopoverItem
@@ -998,13 +940,9 @@ function PopoverItems({ trigger }: { trigger: string }) {
             >
               <span className="font-mono text-text-dim">{trigger}</span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate font-medium text-text-primary">
-                  {item.label}
-                </span>
+                <span className="block truncate font-medium text-text-primary">{item.label}</span>
                 {item.description && (
-                  <span className="block truncate text-[11px] text-text-dim">
-                    {item.description}
-                  </span>
+                  <span className="block truncate text-[11px] text-text-dim">{item.description}</span>
                 )}
               </span>
             </ComposerPrimitive.Unstable_TriggerPopoverItem>
@@ -1024,10 +962,7 @@ function PopoverItems({ trigger }: { trigger: string }) {
  *  the inserted `/<name>` and consume the next Enter as a re-pick;
  *  it also positions the cursor for free-form arg typing when the
  *  agent advertised the command as `acceptsInput=true`. See #1512. */
-export function insertSlashCommand(
-  runtime: ReturnType<typeof useComposerRuntime>,
-  item: Unstable_TriggerItem,
-) {
+export function insertSlashCommand(runtime: ReturnType<typeof useComposerRuntime>, item: Unstable_TriggerItem) {
   if (!runtime) return;
   const current = runtime.getState().text;
   const suffix = " ";
@@ -1047,9 +982,7 @@ export function insertSlashCommand(
  *  insert one ourselves so the cursor lands one position past the
  *  newline. Skips the trigger-detection whitespace padding that
  *  `insertAtCaret` does for `@` / `/`; a newline doesn't need it. */
-export function insertNewlineAtCaret(
-  ref: React.RefObject<HTMLTextAreaElement | null>,
-): void {
+export function insertNewlineAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>): void {
   const ta = ref.current;
   if (!ta) return;
   const start = ta.selectionStart ?? ta.value.length;
@@ -1057,10 +990,7 @@ export function insertNewlineAtCaret(
   const before = ta.value.slice(0, start);
   const after = ta.value.slice(end);
   const next = `${before}\n${after}`;
-  const setter = Object.getOwnPropertyDescriptor(
-    HTMLTextAreaElement.prototype,
-    "value",
-  )?.set;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
   setter?.call(ta, next);
   ta.dispatchEvent(
     new InputEvent("input", {
@@ -1083,10 +1013,7 @@ export function insertNewlineAtCaret(
  *  toolbar-injected character as untracked text and a subsequent
  *  `removeOnExecute` cannot find the trigger to strip, leaving a
  *  duplicate `@@` / `//` in the input (#1149). */
-export function insertAtCaret(
-  ref: React.RefObject<HTMLTextAreaElement | null>,
-  text: string,
-) {
+export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, text: string) {
   const ta = ref.current;
   if (!ta) return;
   const start = ta.selectionStart ?? ta.value.length;
@@ -1096,10 +1023,7 @@ export function insertAtCaret(
   // the trigger char; pad if we're mid-word.
   const needsSpace = before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
   const next = before + needsSpace + text + ta.value.slice(end);
-  const setter = Object.getOwnPropertyDescriptor(
-    HTMLTextAreaElement.prototype,
-    "value",
-  )?.set;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
   setter?.call(ta, next);
   ta.dispatchEvent(
     new InputEvent("input", {
@@ -1228,8 +1152,7 @@ function ModePicker({
   // render no picker rather than a phantom vocabulary it would reject.
   if (!channel) return null;
 
-  const current =
-    channel.modes.find((m) => m.id === channel.activeId) ?? channel.modes[0]!;
+  const current = channel.modes.find((m) => m.id === channel.activeId) ?? channel.modes[0]!;
 
   // Tint the chip by id pattern so destructive modes are visually loud.
   const tone = toneForId(channel.activeId);
@@ -1245,11 +1168,7 @@ function ModePicker({
   };
 
   return (
-    <div
-      ref={ref}
-      {...tourAnchor(TOUR_ANCHORS.modePicker)}
-      className="relative"
-    >
+    <div ref={ref} {...tourAnchor(TOUR_ANCHORS.modePicker)} className="relative">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -1289,24 +1208,14 @@ function ModePicker({
                 <span
                   className={[
                     "mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full border",
-                    opt.id === channel.activeId
-                      ? "border-brand-500 bg-brand-500"
-                      : "border-surface-700",
+                    opt.id === channel.activeId ? "border-brand-500 bg-brand-500" : "border-surface-700",
                   ].join(" ")}
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="block font-medium text-text-primary">
-                    {opt.name}
-                  </span>
-                  {opt.description && (
-                    <span className="block text-[11px] text-text-dim">
-                      {opt.description}
-                    </span>
-                  )}
+                  <span className="block font-medium text-text-primary">{opt.name}</span>
+                  {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
                 </span>
-                {isPending && (
-                  <span className="text-[10px] uppercase text-text-dim">…</span>
-                )}
+                {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
               </button>
             );
           })}
@@ -1317,12 +1226,9 @@ function ModePicker({
 }
 
 function toneForId(id: string): string {
-  if (/bypass|yolo/i.test(id))
-    return "border-rose-700/50 bg-rose-950/30 text-rose-300 hover:border-rose-700";
-  if (/accept/i.test(id))
-    return "border-amber-700/50 bg-amber-950/30 text-amber-300 hover:border-amber-700";
-  if (/plan/i.test(id))
-    return "border-cyan-800/50 bg-cyan-950/30 text-cyan-300 hover:border-cyan-700";
+  if (/bypass|yolo/i.test(id)) return "border-rose-700/50 bg-rose-950/30 text-rose-300 hover:border-rose-700";
+  if (/accept/i.test(id)) return "border-amber-700/50 bg-amber-950/30 text-amber-300 hover:border-amber-700";
+  if (/plan/i.test(id)) return "border-cyan-800/50 bg-cyan-950/30 text-cyan-300 hover:border-cyan-700";
   return "border-surface-700 bg-surface-800 text-text-secondary hover:border-surface-600";
 }
 
@@ -1331,17 +1237,10 @@ function toneForId(id: string): string {
 function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
   if (!usage || usage.size <= 0) return null;
   const pct = Math.min(100, Math.round((usage.used / usage.size) * 100));
-  const tone =
-    pct >= 90
-      ? "text-rose-400"
-      : pct >= 75
-        ? "text-amber-400"
-        : "text-text-dim";
+  const tone = pct >= 90 ? "text-rose-400" : pct >= 75 ? "text-amber-400" : "text-text-dim";
   const usedLabel = formatTokens(usage.used);
   const sizeLabel = formatTokens(usage.size);
-  const cost = usage.cost
-    ? formatCost(usage.cost.amount, usage.cost.currency)
-    : null;
+  const cost = usage.cost ? formatCost(usage.cost.amount, usage.cost.currency) : null;
   const title =
     `Context: ${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens (${pct}%)` +
     (cost ? ` · session cost ${cost}` : "");
@@ -1380,13 +1279,7 @@ function formatCost(amount: number, currency: string): string {
 
 /* ── Send / Stop ─────────────────────────────────────────────────── */
 
-function SendButton({
-  connected = true,
-  onSend,
-}: {
-  connected?: boolean;
-  onSend: () => void;
-}) {
+function SendButton({ connected = true, onSend }: { connected?: boolean; onSend: () => void }) {
   // When the session is inactive (WS closed, worker stopped, worker
   // restarting) we leave the button clickable: `sendPrompt` routes the
   // text into the local queue and the drain effect fires it on resume.
@@ -1394,12 +1287,8 @@ function SendButton({
   // sent. A custom button (not ComposerPrimitive.Send) drives submit so
   // the staged attachments ride along and an attachment-only prompt can
   // send even with empty text. See #1359 / #1000.
-  const title = connected
-    ? "Send, Enter"
-    : "Session not active, will send on resume";
-  const label = connected
-    ? "Send message"
-    : "Queue message until session resumes";
+  const title = connected ? "Send, Enter" : "Session not active, will send on resume";
+  const label = connected ? "Send message" : "Queue message until session resumes";
   return (
     <button
       type="button"
@@ -1501,10 +1390,7 @@ function QueueSendButton({
 function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
   composerRuntime: ReturnType<typeof useComposerRuntime>,
-  enqueuePrompt: (
-    text: string,
-    attachments?: PromptAttachmentInput[],
-  ) => void | Promise<void>,
+  enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
   attachments: PromptAttachmentInput[] = [],
   clearAttachments?: () => void,
 ): void {

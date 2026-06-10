@@ -14,6 +14,7 @@ use super::attached_status_hooks::AttachedStatusHookWatcher;
 use super::home::{HomeView, TerminalMode};
 use super::status_poller::StatusUpdate;
 use super::styles::Theme;
+use crate::containers::image_update::ImageUpdate;
 use crate::session::{get_update_settings, save_config, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
@@ -92,6 +93,18 @@ pub struct App {
     /// fetched latest_version equals this value, and returns
     /// automatically when a newer release ships.
     dismissed_update_version: Option<String>,
+    /// A newer sandbox image detected in its registry, surfaced as the
+    /// lowest-priority bottom banner (below app-update and transient status).
+    /// `None` until the background check finds a drift the user hasn't snoozed.
+    image_update: Option<ImageUpdate>,
+    image_update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<ImageUpdate>>>>,
+    /// In-flight `docker pull` of the sandbox image, kicked off when the user
+    /// accepts the banner's confirm. Result promotes into a transient toast.
+    image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    /// Registry digest the user dismissed via Ctrl+x on the image banner.
+    /// Persisted to `app_state.dismissed_image_digest`; the banner stays hidden
+    /// while the registry still resolves to this digest.
+    dismissed_image_digest: Option<String>,
     /// Held in an Option so `with_raw_mode_disabled` can drop it before
     /// spawning child processes. Crossterm's EventStream runs a background
     /// reader thread on stdin; if it's alive when tmux attach-session starts,
@@ -230,6 +243,7 @@ impl App {
         available_tools: AvailableTools,
         suppress_first_run_dialogs: bool,
         mosh_active: bool,
+        file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> Result<Self> {
         let no_agents = !available_tools.any_available();
         let active_profile = if profile.is_empty() {
@@ -237,23 +251,17 @@ impl App {
         } else {
             Some(profile.to_string())
         };
-        let mut home = HomeView::new(active_profile, available_tools)?;
+        let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
 
         // Check if we need to show welcome or changelog dialogs
         let mut config = Config::load_or_warn();
 
-        // Load theme from config, defaulting to the `default` builtin if
-        // empty so the TUI matches the web dashboard's empty-name fallback.
-        let theme_name = if config.theme.name.is_empty() {
-            "default"
-        } else {
-            &config.theme.name
-        };
-        let palette_mode = matches!(
-            config.theme.color_mode,
-            crate::session::config::ColorMode::Palette
-        );
-        let theme = crate::tui::styles::load_theme_with_mode(theme_name, palette_mode);
+        // Theme is a global preference: read it from the global config, never
+        // profile-merged, so boot matches Settings-close and the web dashboard
+        // (see config::resolve_theme_name). Empty maps to the `default` builtin.
+        let theme_name = config.effective_theme_name();
+        let palette_mode = config.theme_palette_mode();
+        let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
         let current_version = env!("CARGO_PKG_VERSION").to_string();
 
         if no_agents {
@@ -264,7 +272,7 @@ impl App {
             // changelog so the warning is what the user sees first, and avoid
             // overwriting a malformed config.toml with defaults via save_config.
         } else if !config.app_state.has_seen_welcome {
-            home.show_intro(theme_name);
+            home.show_intro(&theme_name);
             config.app_state.has_seen_welcome = true;
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
@@ -285,6 +293,7 @@ impl App {
         }
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
+        let dismissed_image_digest = config.app_state.dismissed_image_digest.clone();
 
         Ok(Self {
             home,
@@ -296,6 +305,10 @@ impl App {
             update_status: None,
             update_status_rx: None,
             dismissed_update_version,
+            image_update: None,
+            image_update_rx: None,
+            image_pull_rx: None,
+            dismissed_image_digest,
             event_stream: Some(EventStream::new()),
             // Initial state matches whatever `tui::run` did at startup: capture
             // is requested by default, but Mosh suppresses the actual escape, so
@@ -447,40 +460,15 @@ impl App {
     }
 
     pub fn show_startup_warning(&mut self, message: &str) {
-        // Size the dialog to fit the message after wrapping. The message area
-        // is `width - 4` columns wide (borders + 1-cell margin on each side),
-        // so each \n-separated line wraps to ceil(len / inner_width) visual
-        // rows. Borders + margin + the OK button take 6 rows.
-        //
-        // 96, not 80: at the typical ~35-col sidebar width, a centered
-        // 80-wide dialog on a 150-col terminal lands its left border exactly
-        // at the sidebar's right border, which makes the modal visually
-        // blend into the layout. 96 shifts the coincidence point off the
-        // common laptop-fullscreen width and gives long path lines (e.g.
-        // `~/.config/agent-of-empires-dev`) more breathing room.
-        const WIDTH: u16 = 96;
-        let inner_width = WIDTH.saturating_sub(4) as usize;
-        let visual_lines: usize = message
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    1
-                } else {
-                    l.len().div_ceil(inner_width)
-                }
-            })
-            .sum();
-        // +6 for borders/margin/button; +1 safety margin since byte-length
-        // wrap estimation under-counts when Paragraph word-wraps mid-line.
-        let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
         // Warnings preempt onboarding dialogs so the user sees the problem
         // before the intro walkthrough.
         self.home.intro_dialog = None;
         self.home.changelog_dialog = None;
         self.home.telemetry_consent_dialog = None;
         tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
-        self.home.info_dialog =
-            Some(crate::tui::dialogs::InfoDialog::new("Warning", message).with_size(WIDTH, height));
+        self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
+            "Warning", message,
+        ));
     }
 
     pub fn set_theme(&mut self, name: &str) {
@@ -488,17 +476,10 @@ impl App {
         // SetTheme dispatched from the Settings view preview/apply flow will
         // re-load the theme with raw RGB colors, "breaking the coloration"
         // on terminals that were working with the user's palette preference
-        // (Termius/mosh edge cases, 8-bit-only TTYs, etc.).
-        let palette_mode = crate::session::resolve_config(
-            self.home.active_profile.as_deref().unwrap_or("default"),
-        )
-        .map(|c| {
-            matches!(
-                c.theme.color_mode,
-                crate::session::config::ColorMode::Palette
-            )
-        })
-        .unwrap_or(false);
+        // (Termius/mosh edge cases, 8-bit-only TTYs, etc.). Read from the
+        // global config: theme (and its color_mode) is a global preference,
+        // not profile-merged.
+        let palette_mode = crate::session::config::resolve_theme_palette_mode();
         self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
         self.needs_redraw = true;
     }
@@ -532,6 +513,14 @@ impl App {
             } else {
                 None
             };
+
+        // Check the sandbox image for a newer registry build, once at startup.
+        // Gated on the same network-checks toggle as app updates, and only for
+        // users who actually run sandboxed sessions (so non-sandbox users never
+        // see a docker banner).
+        if settings.update_check_mode.is_enabled() && self.sandbox_in_use() {
+            self.spawn_image_update_check();
+        }
 
         // SIGHUP/SIGTERM futures so we exit cleanly when the terminal
         // emulator is force-quit, preventing PTY slot leaks (#541).
@@ -1173,6 +1162,19 @@ impl App {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
+            // The sandbox-image banner and its pull toast share the same
+            // bottom-row layout slot, so treat their changes as full-refresh
+            // work too.
+            if self.poll_image_update_check() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if self.poll_image_pull_status() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
@@ -1223,31 +1225,75 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            // Defer the 5s disk reload while the user is in live-send.
-            // The reload is on the UI thread and rebuilds the sidebar
-            // tree from disk, which causes a visible hitch in the
-            // preview. The user can't change session config from inside
-            // live mode anyway. Leaving `last_disk_refresh` un-advanced
-            // when we skip means the first tick outside live-send
-            // re-checks the interval and reloads immediately if it's
-            // been ≥5s since the last successful reload (so a change
-            // on disk during a long live-send session is picked up on
-            // exit instead of sitting stale for another 5s window).
-            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL && self.home.live_send.is_none()
-            {
-                self.home.reload()?;
-                // Pick up a Settings > Interaction > Mouse Capture toggle from
-                // disk and apply it now, so capture turns on/off within the
-                // reload window instead of waiting for a restart.
-                let profile = self.home.active_profile.as_deref().unwrap_or("default");
-                let mouse_capture_allowed = crate::session::resolve_config(profile)
-                    .map(|c| crate::tui::mouse_capture_requested(&c.session))
-                    .unwrap_or(self.mouse_capture_allowed);
-                if mouse_capture_allowed != self.mouse_capture_allowed {
-                    self.mouse_capture_allowed = mouse_capture_allowed;
-                    self.sync_mouse_capture(terminal)?;
+            // Fade the settings "Settings saved" toast once its window passes,
+            // even if the user has stopped typing. Fires at most once per save,
+            // so a full refresh here is free.
+            if self.home.tick_settings_status() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Disk reload: heartbeat (defense-in-depth) plus the
+            // file-watch-driven kick. Both gate on `live_send.is_none()`
+            // so reloads never interrupt a paste-in-progress; the dirty
+            // flag stays latched (Acquire pairs with the forwarder/adapter
+            // Release) until the next eligible tick. The watcher is scoped
+            // to `sessions.json` / `groups.json`, so the watcher path calls
+            // `reload_storage_only` (storage + profile rediscovery only);
+            // the heartbeat path calls full `reload()` to refresh the
+            // status-hook config cache and mouse-capture toggle.
+            let live_idle = self.home.live_send.is_none();
+            let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
+            // Only consume the dirty latch when we're eligible to act on
+            // it (`live_idle`). When live-send is on, the latch must
+            // persist for the next eligible tick so a watcher kick that
+            // arrived during live-send is not silently lost.
+            let dirty = if live_idle {
+                self.home
+                    .disk_dirty
+                    .swap(false, std::sync::atomic::Ordering::Acquire)
+            } else {
+                false
+            };
+            let refresh_decision = decide_disk_refresh(live_idle, heartbeat_due, dirty);
+
+            match refresh_decision {
+                DiskRefreshDecision::Heartbeat => {
+                    let reload_result = self.home.reload();
+                    let reload_ok = reload_result.is_ok();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    if reload_ok {
+                        let profile = self.home.active_profile.as_deref().unwrap_or("default");
+                        let mouse_capture_allowed = crate::session::resolve_config(profile)
+                            .map(|c| crate::tui::mouse_capture_requested(&c.session))
+                            .unwrap_or(self.mouse_capture_allowed);
+                        if mouse_capture_allowed != self.mouse_capture_allowed {
+                            self.mouse_capture_allowed = mouse_capture_allowed;
+                            self.sync_mouse_capture(terminal)?;
+                        }
+                    }
+                    last_disk_refresh = std::time::Instant::now();
+                    refresh_needed = true;
+                    needs_full_refresh = true;
                 }
-                last_disk_refresh = std::time::Instant::now();
+                DiskRefreshDecision::Watcher => {
+                    let reload_result = self.home.reload_storage_only();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+                DiskRefreshDecision::None => {}
+            }
+
+            if self.home.reload_failure_state.has_unacknowledged_failure()
+                && self.home.info_dialog.is_none()
+            {
+                let body = self.home.reload_failure_state.build_dialog_body();
+                self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Watcher Warning",
+                    &body,
+                ));
+                self.home.reload_failure_state.acknowledge_dialog();
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1421,6 +1467,13 @@ impl App {
             self.update_status = None;
         }
         let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        // Only hand the renderer the image banner when it's actually the active
+        // one; while a pull is in flight `image_banner_active` is false, so the
+        // banner can't re-render under the "pulling…" toast and clobber itself
+        // (#2072).
+        let image_update = self
+            .image_banner_active()
+            .then_some(self.image_update.as_ref());
         // Reset before the render so a frame that skips the preview path
         // (dialog open, non-home view) reads as zero capture/parse rather
         // than leaking the previous frame's durations.
@@ -1431,6 +1484,7 @@ impl App {
             &self.theme,
             self.update_info.as_ref(),
             status_text,
+            image_update.flatten(),
         );
         // Sampled trace for frame-budget diagnostics. A full-frame trace on
         // every paint would dominate the log at `default_level = trace`, so
@@ -1547,6 +1601,134 @@ impl App {
         }
 
         true
+    }
+
+    /// Whether the user runs sandboxed sessions, so a docker-image banner is
+    /// worth surfacing. True when sandbox is on by default or any current
+    /// session is sandboxed; otherwise we skip the registry check entirely.
+    fn sandbox_in_use(&self) -> bool {
+        if Config::load_or_warn().sandbox.enabled_by_default {
+            return true;
+        }
+        self.home.instances().iter().any(|i| i.is_sandboxed())
+    }
+
+    /// Is the sandbox-image banner the one currently shown? It sits below the
+    /// app-update banner and transient toast, so it only owns the `u`/Ctrl+x
+    /// keys when neither of those is up, and it must stay hidden while a pull it
+    /// already started is still running (otherwise it re-arms `u` into the "pull
+    /// already in progress" no-op, #2072).
+    fn image_banner_active(&self) -> bool {
+        should_show_image_banner(
+            self.image_update.is_some(),
+            self.update_info.is_some(),
+            self.update_status.is_some(),
+            self.image_pull_rx.is_some(),
+        )
+    }
+
+    /// Spawn the background sandbox-image staleness check. Mirrors
+    /// `spawn_update_check`: the result lands on `image_update_rx` for the
+    /// main loop's `poll_image_update_check` to pick up.
+    fn spawn_image_update_check(&mut self) {
+        if self.image_update_rx.is_some() {
+            return;
+        }
+        let image = Config::load_or_warn().sandbox.default_image.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.image_update_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = crate::containers::image_update::check_for_image_update(&image).await;
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the image-update check (non-blocking). Returns true when a fresh,
+    /// non-snoozed update just arrived and the banner should show.
+    fn poll_image_update_check(&mut self) -> bool {
+        let Some(mut rx) = self.image_update_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(Some(update))) => {
+                // Honor the per-digest snooze; a newer image clears it
+                // automatically because its digest no longer matches.
+                if self.dismissed_image_digest.as_deref() == Some(update.remote_digest.as_str()) {
+                    return false;
+                }
+                self.image_update = Some(update);
+                true
+            }
+            Ok(Ok(None)) => false,
+            Ok(Err(e)) => {
+                tracing::debug!(target: "containers.image_update", error = %e, "image update check failed");
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.image_update_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+        }
+    }
+
+    /// Kick off a `docker pull` of the sandbox image after the user accepts the
+    /// banner's confirm dialog. The blocking pull runs on a std thread (the
+    /// runtime call shells out); the result promotes into a transient toast.
+    fn spawn_image_pull(&mut self, image: String) {
+        if self.image_pull_rx.is_some() {
+            return;
+        }
+        // Persistent, not transient: a `docker pull` routinely runs longer than
+        // the 10s transient window, and if the toast expired mid-pull the status
+        // line went blank and the (still-`Some`) image banner re-rendered under
+        // it, clobbering itself; pressing `u` again then hit the "pull already in
+        // progress" guard (#2072). `poll_image_pull_status` replaces this with a
+        // transient success/failure toast once the pull resolves. Mirrors the
+        // app-update flow, which is also persistent while the install runs.
+        self.update_status = Some(UpdateStatus::persistent(format!("pulling {image}…")));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.image_pull_rx = Some(rx);
+        std::thread::spawn(move || {
+            use crate::containers::ContainerRuntimeInterface;
+            let result = crate::containers::get_container_runtime()
+                .pull_image(&image)
+                .map_err(anyhow::Error::from);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the in-progress image pull. On success the banner clears (the local
+    /// copy now matches the registry) and a confirmation toast shows. Returns
+    /// true when the status line changed.
+    fn poll_image_pull_status(&mut self) -> bool {
+        let Some(mut rx) = self.image_pull_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.image_update = None;
+                self.update_status = Some(UpdateStatus::transient(
+                    "sandbox image updated. New sessions will use it.".into(),
+                ));
+                true
+            }
+            Ok(Err(e)) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("image pull failed: {e}")));
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.image_pull_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "image pull ended unexpectedly".into(),
+                ));
+                true
+            }
+        }
     }
 
     /// Kick off a background install when `update_check_mode = "auto"` and a
@@ -1731,6 +1913,21 @@ fn persist_dismissed_update_version(version: Option<String>) {
     }
 }
 
+/// Persist `app_state.dismissed_image_digest` so dismissing the sandbox-image
+/// banner (Ctrl+x) survives restarts. Like the update snooze, failures are
+/// logged but never surfaced.
+fn persist_dismissed_image_digest(digest: Option<String>) {
+    let mut config = Config::load_or_warn();
+    config.app_state.dismissed_image_digest = digest;
+    if let Err(e) = save_config(&config) {
+        tracing::warn!(
+            target: "containers.image_update",
+            error = %e,
+            "failed to persist dismissed_image_digest"
+        );
+    }
+}
+
 /// Convert `check_interval_hours` to a `Duration` for the periodic re-check,
 /// clamped to a sane minimum. See `MIN_PERIODIC_RECHECK_INTERVAL`.
 fn periodic_recheck_interval(check_interval_hours: u64) -> Duration {
@@ -1789,6 +1986,66 @@ fn poll_update_receiver(
     } else {
         (current_info, None, false)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskRefreshDecision {
+    Heartbeat,
+    Watcher,
+    None,
+}
+
+/// Pure refresh-policy decision. Inputs are plain values so this helper
+/// is side-effect free; callers are responsible for actually consuming
+/// the watcher latch (`AtomicBool::swap`) before invoking it. Keeping
+/// decision and mutation separate lets the unit tests below be
+/// table-driven without owning an atomic.
+fn decide_disk_refresh(live_idle: bool, heartbeat_due: bool, dirty: bool) -> DiskRefreshDecision {
+    if !live_idle {
+        return DiskRefreshDecision::None;
+    }
+    if heartbeat_due {
+        DiskRefreshDecision::Heartbeat
+    } else if dirty {
+        DiskRefreshDecision::Watcher
+    } else {
+        DiskRefreshDecision::None
+    }
+}
+
+/// Whether the sandbox-image banner should own the bottom row right now. It is
+/// the lowest-priority banner, so it yields to the app-update banner and any
+/// transient toast, and it stays hidden while a pull it kicked off is still
+/// running. That last clause is the #2072 fix: without it the banner reappeared
+/// the moment the "pulling…" toast cleared, redrawing itself on top of an
+/// in-flight pull and re-arming `u` into the "pull already in progress" no-op.
+/// Factored out of `App::image_banner_active` so the policy is unit-testable.
+fn should_show_image_banner(
+    has_image_update: bool,
+    has_app_update: bool,
+    has_status: bool,
+    pull_in_flight: bool,
+) -> bool {
+    has_image_update && !has_app_update && !has_status && !pull_in_flight
+}
+
+/// Catches reload errors so the tick loop never propagates them. A
+/// malformed `sessions.json` or `groups.json` written by a peer process
+/// is logged, recorded in `ReloadFailureState` for one-shot dialog
+/// surfacing, and the tick loop continues with the previous in-memory
+/// state. The next successful reload clears the recorded failure.
+fn handle_tick_reload_storage(
+    result: anyhow::Result<()>,
+    state: &mut crate::tui::home::ReloadFailureState,
+) {
+    if let Err(ref e) = result {
+        tracing::warn!(
+            target: "tui.file_watch",
+            error = %e,
+            "tick storage reload failed; preserving in-memory state, will retry on next tick"
+        );
+    }
+    state.record_storage(&result);
 }
 
 /// What a `q` key press at the home screen should do. Factored out of the
@@ -1874,9 +2131,24 @@ impl App {
             // a beat (visible flash). Ratatui's diff renderer handles the
             // 1-row layout shrink on the next normal draw.
             (KeyCode::Char('x'), KeyModifiers::CONTROL)
-                if (self.update_info.is_some() || self.update_status.is_some())
+                if (self.update_info.is_some()
+                    || self.update_status.is_some()
+                    || self.image_update.is_some())
                     && !self.home.has_dialog() =>
             {
+                // The image banner is lowest priority, so Ctrl+x only dismisses
+                // it when it's the one actually showing. Otherwise it targets
+                // the app update / toast as before, leaving any pending image
+                // update to surface once those clear.
+                if self.image_banner_active() {
+                    if let Some(update) = self.image_update.as_ref() {
+                        let digest = update.remote_digest.clone();
+                        self.dismissed_image_digest = Some(digest.clone());
+                        persist_dismissed_image_digest(Some(digest));
+                    }
+                    self.image_update = None;
+                    return Ok(());
+                }
                 if let Some(info) = self.update_info.as_ref() {
                     let v = info.latest_version.clone();
                     self.dismissed_update_version = Some(v.clone());
@@ -1884,6 +2156,19 @@ impl App {
                 }
                 self.update_info = None;
                 self.update_status = None;
+                return Ok(());
+            }
+            // `u` on the sandbox-image banner opens the pull confirm. The app
+            // update owns `u` via the home bindings, but the image banner only
+            // shows when no app update is up (see `image_banner_active`), so
+            // there's no collision.
+            (KeyCode::Char('u'), KeyModifiers::NONE)
+                if self.image_banner_active() && !self.home.has_dialog() =>
+            {
+                if let Some(update) = self.image_update.as_ref() {
+                    let image = update.image.clone();
+                    self.home.prompt_pull_sandbox_image(image);
+                }
                 return Ok(());
             }
             _ => {}
@@ -1954,6 +2239,7 @@ impl App {
         for cand in candidates {
             match crate::session::idle_reap::claim_idle_stop(
                 &cand.profile,
+                self.home.file_watch.clone(),
                 &cand.session_id,
                 now,
                 cand.threshold_secs,
@@ -2049,6 +2335,15 @@ impl App {
             }
             Action::SetTransientStatus(text) => {
                 self.update_status = Some(UpdateStatus::transient(text));
+            }
+            Action::SpawnImagePull(image) => {
+                if self.image_pull_rx.is_some() {
+                    self.update_status = Some(UpdateStatus::transient(
+                        "image pull already in progress".into(),
+                    ));
+                    return Ok(());
+                }
+                self.spawn_image_pull(image);
             }
             Action::SendMessage(id, message) => {
                 // Flip the row to Starting and show a toast so the user has
@@ -2540,6 +2835,10 @@ pub enum Action {
     SetTheme(String),
     SpawnUpdate(crate::update::install::InstallMethod, String),
     SetTransientStatus(String),
+    /// Pull the sandbox image after the user accepts the "image update
+    /// available" banner's confirm. Deferred to `execute_action` so the loop
+    /// can show a "pulling…" status before the blocking pull starts.
+    SpawnImagePull(String),
     /// Send a message to a session. Deferred to `execute_action` (rather
     /// than handled inline in the dialog Submit branch) so the app loop
     /// can render a "Reviving..." status before the potentially-slow
@@ -2572,6 +2871,28 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_banner_shows_only_when_it_owns_the_row() {
+        // The plain case: an image update is pending and nothing outranks it.
+        assert!(should_show_image_banner(true, false, false, false));
+        // No pending update: nothing to show.
+        assert!(!should_show_image_banner(false, false, false, false));
+        // The app-update banner and any transient toast both outrank it.
+        assert!(!should_show_image_banner(true, true, false, false));
+        assert!(!should_show_image_banner(true, false, true, false));
+    }
+
+    #[test]
+    fn image_banner_stays_hidden_while_its_own_pull_runs() {
+        // #2072: once the user accepts the pull, the banner must stay down for
+        // the whole `docker pull`. Even after the "pulling…" toast clears
+        // (has_status = false) the in-flight pull keeps the banner hidden, so it
+        // can't redraw under the pull and re-arm `u` into "pull already in
+        // progress".
+        assert!(!should_show_image_banner(true, false, false, true));
+        assert!(!should_show_image_banner(true, false, true, true));
+    }
 
     #[test]
     fn ctrl_q_never_quits() {
@@ -2615,6 +2936,66 @@ mod tests {
         assert_eq!(
             quit_intent(KeyModifiers::NONE, true, false),
             QuitIntent::ConfirmDuringCreation,
+        );
+    }
+
+    #[test]
+    fn heartbeat_wins_when_both_disk_paths_are_ready() {
+        assert_eq!(
+            decide_disk_refresh(true, true, true),
+            DiskRefreshDecision::Heartbeat,
+            "when live-idle and both heartbeat and watcher are ready, the full reload wins"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, true, false),
+            DiskRefreshDecision::Heartbeat,
+            "heartbeat fires even without a watcher kick"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, false, true),
+            DiskRefreshDecision::Watcher,
+            "watcher kick alone fires the storage-only path"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, false, false),
+            DiskRefreshDecision::None,
+            "no inputs ready yields no refresh"
+        );
+    }
+
+    #[test]
+    fn live_send_blocks_every_decision_branch() {
+        // The pure helper must return None for every (heartbeat_due,
+        // dirty) combination when live-send is on. Latch preservation is
+        // the caller's responsibility (see
+        // `caller_gating_preserves_dirty_latch_during_live_send`).
+        for &heartbeat in &[false, true] {
+            for &dirty in &[false, true] {
+                assert_eq!(
+                    decide_disk_refresh(false, heartbeat, dirty),
+                    DiskRefreshDecision::None,
+                    "live_send must block refresh (heartbeat={heartbeat}, dirty={dirty})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caller_gating_preserves_dirty_latch_during_live_send() {
+        // Mirrors the gating logic in the tick loop: only consume the
+        // latch when live_idle is true. A watcher kick that arrived
+        // during live-send must remain observable on the next eligible
+        // tick.
+        let dirty_atomic = std::sync::atomic::AtomicBool::new(true);
+        let live_idle = false;
+        let _dirty = if live_idle {
+            dirty_atomic.swap(false, std::sync::atomic::Ordering::Acquire)
+        } else {
+            false
+        };
+        assert!(
+            dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
+            "live_send tick must NOT consume the dirty latch; it must persist for the next tick"
         );
     }
 
