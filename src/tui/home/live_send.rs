@@ -541,6 +541,16 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// would lag the first fast capture by ~250ms.
     nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the displayed pane is the live-send target. Only then does the
+    /// worker pay for the cursor query (a one-line `display-message` folded
+    /// into the same fork) and publish a cursor; otherwise `cursor` stays
+    /// `None` so a backgrounded or merely-browsed preview paints no cursor.
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Newest pane cursor, refreshed every live cycle (even when the captured
+    /// text is unchanged, so a bare cursor move still updates). Cleared on
+    /// `set_live(false)` and `set_target`. The render loop reads it via
+    /// `current_cursor` to place a real terminal cursor over the live preview.
+    cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -563,6 +573,8 @@ impl LiveCaptureWorker {
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(false));
+        let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -570,6 +582,8 @@ impl LiveCaptureWorker {
         let forward_empty_cell = forward_empty.clone();
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
+        let live_cell = live.clone();
+        let cursor_cell = cursor.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
@@ -592,13 +606,27 @@ impl LiveCaptureWorker {
                 if lines > 0 && !name.is_empty() {
                     let session = crate::tmux::Session::from_name(&name);
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // Only the live-send target pays for the cursor query; it
+                    // folds into the same fork as the capture, so a live cycle
+                    // is still one `tmux` invocation. Backgrounded / browsed
+                    // previews capture text only and carry no cursor.
+                    let is_live = live_cell.load(Ordering::Relaxed);
                     // A failed fork reads as "gone". For preserve panes that
                     // means hold the last-good frame (drop it); for forward
                     // panes (terminals) surface it as empty so stale text clears.
-                    let capture = match session.capture_pane(lines) {
-                        Ok(content) => Some(content),
-                        Err(_) if forward_empty => Some(String::new()),
-                        Err(_) => None,
+                    let (capture, cursor_now) = if is_live {
+                        match session.capture_pane_with_cursor(lines) {
+                            Ok((content, cur)) => (Some(content), cur),
+                            Err(_) if forward_empty => (Some(String::new()), None),
+                            Err(_) => (None, None),
+                        }
+                    } else {
+                        let cap = match session.capture_pane(lines) {
+                            Ok(content) => Some(content),
+                            Err(_) if forward_empty => Some(String::new()),
+                            Err(_) => None,
+                        };
+                        (cap, None)
                     };
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
@@ -606,15 +634,23 @@ impl LiveCaptureWorker {
                         // them; only changed captures reach (and wake) the
                         // render loop, so an idle pane never repaints.
                         let changed = last_captured.as_deref() != Some(content.as_str());
-                        if (forward_empty || !content.is_empty()) && changed {
-                            // Publish only if the target hasn't changed during
-                            // the fork. Otherwise these are the *old* pane's
-                            // bytes and would flash under the new view's header
-                            // (`set_target` also clears the mailbox, but the
-                            // fork may have started before that switch).
-                            let still_current =
-                                target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
-                            if still_current {
+                        // Recheck the target once for both publishes: a retarget
+                        // mid-fork means these bytes (and this cursor) belong to
+                        // the old pane and must not land under the new view.
+                        // `set_target` also clears the mailbox, but the fork may
+                        // have started before that switch.
+                        let still_current =
+                            target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
+                        if still_current {
+                            // Cursor refreshes every live cycle, independent of
+                            // the content dedup: a bare cursor move leaves the
+                            // captured cells unchanged but must still update the
+                            // painted cursor. When not live, `cursor_now` is None
+                            // so the slot clears and no cursor is painted.
+                            if let Ok(mut guard) = cursor_cell.lock() {
+                                *guard = cursor_now;
+                            }
+                            if (forward_empty || !content.is_empty()) && changed {
                                 if let Ok(mut guard) = slot.lock() {
                                     *guard = Some(content.clone());
                                 }
@@ -644,6 +680,8 @@ impl LiveCaptureWorker {
             forward_empty,
             nudge,
             stop,
+            live,
+            cursor,
         }
     }
 
@@ -687,6 +725,11 @@ impl LiveCaptureWorker {
                 if let Ok(mut latest) = self.latest.lock() {
                     *latest = None;
                 }
+                // Drop the old pane's cursor too, so it can't flash over the
+                // new pane's first frame before the next live capture lands.
+                if let Ok(mut cursor) = self.cursor.lock() {
+                    *cursor = None;
+                }
                 true
             } else {
                 false
@@ -705,6 +748,15 @@ impl LiveCaptureWorker {
     /// reconcile so entering/leaving live mode retunes the worker in place
     /// without a respawn.
     pub(in crate::tui) fn set_live(&self, live: bool) {
+        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
+        if !live {
+            // Drop any painted cursor the moment the displayed pane stops
+            // being the live-send target, so a backgrounded preview doesn't
+            // keep a stale cursor from the last live cycle.
+            if let Ok(mut guard) = self.cursor.lock() {
+                *guard = None;
+            }
+        }
         let ms = if live {
             LIVE_CAPTURE_INTERVAL_FAST_MS
         } else {
@@ -734,6 +786,14 @@ impl LiveCaptureWorker {
     /// render loop then keeps the current preview).
     pub(in crate::tui) fn take_latest(&self) -> Option<String> {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// The newest live-send cursor, or `None` when the displayed pane isn't
+    /// the live-send target (or its cursor is hidden). Cloned, not taken, so
+    /// the cursor persists across frames until the next live cycle refreshes
+    /// it. The render loop maps this onto the preview output rect.
+    pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
+        self.cursor.lock().ok().and_then(|guard| *guard)
     }
 }
 
@@ -779,7 +839,8 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
                 if !head.is_empty() {
                     send_literal(&target, head)?;
                 }
-                return dispatch_hex_bytes(&target, &vec![0x3b; semis]);
+                return crate::tmux::Session::from_name(tmux_name)
+                    .send_raw_bytes(&vec![0x3b; semis]);
             }
             // `-l --` mirrors `send_literal_no_enter`: literal-mode
             // send, followed by the end-of-options marker so a payload
@@ -793,11 +854,10 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             // `-H` sends each subsequent arg as the hex byte value of an
             // ASCII character. We use this for control bytes (CR, TAB,
             // ESC) and the bracketed-paste markers, none of which can
-            // ride a `-l` payload safely. One arg per byte means a large
-            // multi-line paste would overflow the OS `execve` argv limit
-            // (macOS ARG_MAX is 256 KiB) and fail with E2BIG, silently
-            // dropping the whole paste, so split it across bounded forks.
-            return dispatch_hex_bytes(&target, bytes);
+            // ride a `-l` payload safely. Chunking against ARG_MAX and
+            // the per-byte hex encoding live in the shared tmux layer
+            // (the web live view's input path uses the same fn).
+            return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
         }
         TmuxAction::Resize { cols, rows } => {
             cmd.args([
@@ -827,8 +887,6 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
 /// a large paste overflows around 20 KB and fails wholesale with E2BIG.
 /// 4 KiB per fork keeps every argv under ~45 KiB, comfortably below the
 /// limit on every platform while keeping the fork count low.
-const MAX_HEX_BYTES_PER_SEND: usize = 4096;
-
 /// Split a literal payload into its leading content and the number of
 /// trailing `;` bytes. tmux's command parser drops a trailing `;` from a
 /// `send-keys -l` payload, reading it as a command separator even after the
@@ -859,41 +917,6 @@ fn send_literal(target: &str, s: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// Dispatch a raw byte payload as one or more `tmux send-keys -H` forks,
-/// each bounded by [`MAX_HEX_BYTES_PER_SEND`]. tmux injects the bytes
-/// into the pane in order, so splitting a bracketed paste across forks is
-/// transparent to the agent: it still reassembles one contiguous paste
-/// from the `\e[200~` ... `\e[201~` byte stream.
-fn dispatch_hex_bytes(target: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
-    for batch in hex_send_batches(bytes) {
-        let mut cmd = Command::new("tmux");
-        cmd.stderr(Stdio::null());
-        cmd.args(["send-keys", "-t", target, "-H"]);
-        cmd.args(&batch);
-        let status = cmd
-            .status()
-            .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
-        if !status.success() {
-            anyhow::bail!(
-                "live-send tmux subprocess exited non-zero for {} bytes",
-                bytes.len()
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Split a byte payload into the hex-argument batches passed to
-/// successive `tmux send-keys -H` forks. Pure so the chunking bound and
-/// byte-order preservation are unit-testable without a tmux session.
-fn hex_send_batches(bytes: &[u8]) -> Vec<Vec<String>> {
-    bytes
-        .chunks(MAX_HEX_BYTES_PER_SEND)
-        .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
-        .collect()
 }
 
 /// What the translator says to do with one incoming key event.
@@ -1528,48 +1551,6 @@ mod tests {
         // verifies the passthrough.
         assert_literal(translate(k(KeyCode::Char('q'))), "q");
         assert_literal(translate(k(KeyCode::Char('Q'))), "Q");
-    }
-
-    #[test]
-    fn large_hex_paste_splits_into_bounded_send_keys_batches() {
-        // Regression for the silently-dropped large paste: a ~100 KB
-        // bracketed paste, encoded one hex arg per byte, overflows the
-        // `execve` argv limit (macOS ARG_MAX = 256 KiB) and the whole
-        // `tmux send-keys` fails with E2BIG. The fix splits the payload
-        // into bounded batches; verify it splits, each batch stays under
-        // the cap, and the bytes reconstruct in order.
-        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        let batches = hex_send_batches(&payload);
-        assert!(
-            batches.len() > 1,
-            "a large paste must split across multiple forks, got {}",
-            batches.len()
-        );
-        for batch in &batches {
-            assert!(
-                batch.len() <= MAX_HEX_BYTES_PER_SEND,
-                "a single fork's argv must stay under the ARG_MAX bound",
-            );
-        }
-        let roundtrip: Vec<u8> = batches
-            .iter()
-            .flatten()
-            .map(|h| u8::from_str_radix(h, 16).unwrap())
-            .collect();
-        assert_eq!(
-            roundtrip, payload,
-            "chunking must preserve every byte and its order",
-        );
-    }
-
-    #[test]
-    fn small_hex_paste_stays_one_batch() {
-        // A short bracketed paste fits in a single fork: no behavior
-        // change for the common case.
-        let payload = b"\x1b[200~hi\x1b[201~".to_vec();
-        let batches = hex_send_batches(&payload);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].first().map(String::as_str), Some("1b"));
     }
 
     #[test]

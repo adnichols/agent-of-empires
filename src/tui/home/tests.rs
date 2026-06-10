@@ -30,20 +30,55 @@ fn create_test_env_empty() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _storage = Storage::new("test").unwrap(); // ensure profile dir exists
+    let _storage = Storage::new_unwatched("test").unwrap(); // ensure profile dir exists
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv { _temp: temp, view }
 }
 
+#[test]
+#[serial]
+fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    let current = vec!["test".to_string()];
+
+    assert!(
+        view.disk_watch_handles.is_empty(),
+        "construction outside a tokio runtime must not prewire subscriptions"
+    );
+    view.rewire_disk_subscriptions(&current).unwrap();
+    assert!(
+        view.disk_watch_handles.is_empty(),
+        "rewire outside a tokio runtime must stay a no-op for lib tests"
+    );
+    assert!(
+        !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
+        "the noop branch must leave disk_dirty clear outside a runtime"
+    );
+}
+
 fn create_test_env_with_sessions(count: usize) -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
     for i in 0..count {
         instances.push(Instance::new(
@@ -60,7 +95,12 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -71,7 +111,7 @@ fn create_test_env_with_groups() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
 
     let inst1 = Instance::new("ungrouped", "/tmp/u");
@@ -94,7 +134,12 @@ fn create_test_env_with_groups() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -106,7 +151,7 @@ fn create_test_env_with_mixed_sessions() -> TestEnv {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
 
     let inst_ungrouped = Instance::new("Uncategorized", "/tmp/u");
@@ -134,7 +179,12 @@ fn create_test_env_with_mixed_sessions() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -171,7 +221,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None);
+                view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -250,7 +300,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None);
+            env.view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
 
@@ -636,7 +686,7 @@ fn test_enter_on_acp_session_opens_structured_view() {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = vec![
         Instance::new("plain", "/tmp/0"),
         Instance::new("acp", "/tmp/1"),
@@ -652,7 +702,12 @@ fn test_enter_on_acp_session_opens_structured_view() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.cursor = 1;
@@ -1169,9 +1224,14 @@ fn test_uppercase_p_picker_switch_profile() {
     crate::session::create_profile("first").unwrap();
     crate::session::create_profile("second").unwrap();
 
-    let _storage = Storage::new("first").unwrap();
+    let _storage = Storage::new_unwatched("first").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("first".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("first".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1362,7 +1422,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
 
     // Ungrouped session
@@ -1402,7 +1462,12 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1417,7 +1482,7 @@ fn test_group_has_managed_worktrees() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
     inst1.group_path = "work".to_string();
@@ -1444,7 +1509,12 @@ fn test_group_has_managed_worktrees() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1460,7 +1530,7 @@ fn test_group_has_containers() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
     inst1.group_path = "work".to_string();
@@ -1488,7 +1558,12 @@ fn test_group_has_containers() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1537,6 +1612,135 @@ fn test_delete_selected_group_updates_groups_field() {
     let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
+}
+
+/// Archiving a manual group archives every session under it, including
+/// nested subgroups, and leaves sessions outside the group untouched.
+#[test]
+#[serial]
+fn test_archive_selected_group_archives_all_members() {
+    let mut env = create_test_env_with_group_sessions();
+
+    // Select the "work" group.
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+
+    // "work" holds two direct sessions plus one in the nested "work/projects".
+    assert_eq!(env.view.active_sessions_in_selected_group().len(), 3);
+
+    env.view.archive_selected_group().unwrap();
+
+    for inst in env.view.instances() {
+        let in_work = inst.group_path == "work" || inst.group_path.starts_with("work/");
+        assert_eq!(
+            inst.is_archived(),
+            in_work,
+            "session {} (group {:?}) archived state should match group membership",
+            inst.title,
+            inst.group_path
+        );
+    }
+}
+
+/// In project group-by mode, archiving a project header archives every live
+/// session that maps to that repo, even though their stored `group_path`
+/// values differ from the synthetic project name.
+#[test]
+#[serial]
+fn test_archive_selected_group_project_mode() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    // Two sessions sharing one repo, one session in a different repo.
+    let a1 = Instance::new("alpha-1", "/tmp/alpha");
+    let a2 = Instance::new("alpha-2", "/tmp/alpha");
+    let b1 = Instance::new("beta-1", "/tmp/beta");
+    let instances = vec![a1, a2, b1];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    // Select the "alpha" project header.
+    for (i, item) in view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "alpha" {
+                view.cursor = i;
+                view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(view.selected_group.as_deref(), Some("alpha"));
+    assert_eq!(view.active_sessions_in_selected_group().len(), 2);
+
+    view.archive_selected_group().unwrap();
+
+    for inst in view.instances() {
+        let in_alpha = inst.project_path == "/tmp/alpha";
+        assert_eq!(
+            inst.is_archived(),
+            in_alpha,
+            "session {} (repo {}) archived state should match project membership",
+            inst.title,
+            inst.project_path
+        );
+    }
+}
+
+/// The group-level prompt opens a confirmation carrying the `archive_group`
+/// action and counts only the active members, and no-ops without a prompt when
+/// the group has nothing left to archive.
+#[test]
+#[serial]
+fn test_prompt_archive_selected_group() {
+    let mut env = create_test_env_with_group_sessions();
+
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+
+    env.view.prompt_archive_selected_group();
+    assert_eq!(
+        env.view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("archive_group")
+    );
+
+    // Confirm, which archives the group and clears the prompt.
+    env.view.confirm_dialog = None;
+    env.view.archive_selected_group().unwrap();
+
+    // With every member archived, a second prompt is a silent no-op.
+    env.view.prompt_archive_selected_group();
+    assert!(env.view.confirm_dialog.is_none());
 }
 
 #[test]
@@ -1614,7 +1818,7 @@ fn test_delete_group_with_sessions_respects_worktree_option() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
     inst1.group_path = "work".to_string();
@@ -1638,7 +1842,12 @@ fn test_delete_group_with_sessions_respects_worktree_option() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1671,7 +1880,7 @@ fn test_delete_group_with_sessions_respects_container_option() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/work");
     inst1.group_path = "work".to_string();
@@ -1696,7 +1905,12 @@ fn test_delete_group_with_sessions_respects_container_option() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -2185,7 +2399,7 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut running = Instance::new("running", "/tmp/running");
     running.status = Status::Running;
@@ -2201,7 +2415,12 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.strict_hotkeys = false;
     view.group_by = GroupByMode::Manual;
     view.sort_order = SortOrder::Attention;
@@ -2699,7 +2918,7 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
         let xs = vec![Instance::new("Alpha Session", "/tmp/a")];
         storage_a
@@ -2711,7 +2930,7 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
             .unwrap();
     }
 
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     {
         let xs = vec![Instance::new("Beta Session", "/tmp/b")];
         storage_b
@@ -2724,7 +2943,7 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -2745,7 +2964,7 @@ fn test_filtered_view_loads_single_profile() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
         let xs = vec![Instance::new("Alpha Session", "/tmp/a")];
         storage_a
@@ -2757,7 +2976,7 @@ fn test_filtered_view_loads_single_profile() {
             .unwrap();
     }
 
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     {
         let xs = vec![Instance::new("Beta Session", "/tmp/b")];
         storage_b
@@ -2770,7 +2989,12 @@ fn test_filtered_view_loads_single_profile() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("alpha".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -2786,7 +3010,7 @@ fn test_all_profiles_view_has_no_profile_headers() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
         let xs = vec![Instance::new("A1", "/tmp/a")];
         storage_a
@@ -2798,7 +3022,7 @@ fn test_all_profiles_view_has_no_profile_headers() {
             .unwrap();
     }
 
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     {
         let xs = vec![Instance::new("B1", "/tmp/b")];
         storage_b
@@ -2811,7 +3035,7 @@ fn test_all_profiles_view_has_no_profile_headers() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -2832,7 +3056,7 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     {
         let xs = vec![Instance::new("A1", "/tmp/a")];
         storage_a
@@ -2844,7 +3068,7 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
             .unwrap();
     }
 
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     {
         let xs = vec![Instance::new("B1", "/tmp/b")];
         storage_b
@@ -2857,7 +3081,7 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -2889,7 +3113,7 @@ fn test_default_row_tag_mode_renders_no_tag() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
     storage_a
@@ -2901,7 +3125,7 @@ fn test_default_row_tag_mode_renders_no_tag() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -2925,7 +3149,7 @@ fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
     storage_a
@@ -2936,7 +3160,7 @@ fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
         })
         .unwrap();
 
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     let instances_b = vec![Instance::new("B1", "/tmp/b")];
     let group_tree_b = GroupTree::new_with_groups(&instances_b, &[]);
     storage_b
@@ -2948,7 +3172,7 @@ fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = crate::session::config::RowTagMode::Auto;
     view.flat_items = view.build_flat_items();
@@ -2983,7 +3207,7 @@ fn test_row_tag_auto_omits_tag_in_filtered_view() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
     storage_a
@@ -2995,7 +3219,12 @@ fn test_row_tag_auto_omits_tag_in_filtered_view() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("alpha".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = crate::session::config::RowTagMode::Auto;
     view.flat_items = view.build_flat_items();
@@ -3026,7 +3255,7 @@ fn test_row_tag_profile_renders_in_filtered_view() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
     storage_a
@@ -3038,7 +3267,12 @@ fn test_row_tag_profile_renders_in_filtered_view() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("alpha".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = crate::session::config::RowTagMode::Profile;
     view.flat_items = view.build_flat_items();
@@ -3075,7 +3309,7 @@ fn test_row_tag_branch_dedups_with_divergence_display() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage = Storage::new("alpha").unwrap();
+    let storage = Storage::new_unwatched("alpha").unwrap();
     // Title and branch DIFFER, so the existing divergence display
     // would render the branch.
     let mut inst = Instance::new("my-session", "/tmp/a");
@@ -3097,7 +3331,7 @@ fn test_row_tag_branch_dedups_with_divergence_display() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = crate::session::config::RowTagMode::Branch;
     view.flat_items = view.build_flat_items();
@@ -3130,7 +3364,7 @@ fn test_row_tag_branch_renders_when_title_matches_branch() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage = Storage::new("alpha").unwrap();
+    let storage = Storage::new_unwatched("alpha").unwrap();
     // Title and branch MATCH, so the divergence display stays quiet.
     let mut inst = Instance::new("feature/foo", "/tmp/a");
     inst.worktree_info = Some(crate::session::WorktreeInfo {
@@ -3151,7 +3385,7 @@ fn test_row_tag_branch_renders_when_title_matches_branch() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = crate::session::config::RowTagMode::Branch;
     view.flat_items = view.build_flat_items();
@@ -3184,7 +3418,7 @@ fn test_row_tag_auto_skips_for_empty_source_profile() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let storage = Storage::new("legacy").unwrap();
+    let storage = Storage::new_unwatched("legacy").unwrap();
     let mut inst = Instance::new("Legacy1", "/tmp/legacy");
     inst.source_profile = String::new();
     let instances = vec![inst];
@@ -3198,7 +3432,7 @@ fn test_row_tag_auto_skips_for_empty_source_profile() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = crate::session::config::RowTagMode::Auto;
     view.flat_items = view.build_flat_items();
@@ -3224,7 +3458,7 @@ fn test_create_session_in_all_mode_is_findable() {
     setup_test_home(&temp);
 
     // Create a profile so "all" mode has something
-    let storage = Storage::new("alpha").unwrap();
+    let storage = Storage::new_unwatched("alpha").unwrap();
     {
         let xs = vec![Instance::new("Existing", "/tmp/a")];
         storage
@@ -3240,7 +3474,7 @@ fn test_create_session_in_all_mode_is_findable() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3287,7 +3521,7 @@ fn test_save_preserves_per_profile_collapsed_state() {
     setup_test_home(&temp);
 
     // Create alpha with group "work" (collapsed)
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     let mut inst_a = Instance::new("A1", "/tmp/a");
     inst_a.group_path = "work".to_string();
     let mut tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
@@ -3301,7 +3535,7 @@ fn test_save_preserves_per_profile_collapsed_state() {
         .unwrap();
 
     // Create beta with group "work" (expanded, the default)
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     let mut inst_b = Instance::new("B1", "/tmp/b");
     inst_b.group_path = "work".to_string();
     let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
@@ -3315,7 +3549,7 @@ fn test_save_preserves_per_profile_collapsed_state() {
 
     // Load unified view
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3373,7 +3607,7 @@ fn test_save_preserves_per_profile_collapsed_state() {
 fn test_create_profile_rejects_reserved_name_all() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _storage = Storage::new("default").unwrap();
+    let _storage = Storage::new_unwatched("default").unwrap();
 
     let result = crate::session::create_profile("all");
     assert!(result.is_err());
@@ -3396,7 +3630,7 @@ fn test_delete_group_scoped_to_owning_profile() {
     setup_test_home(&temp);
 
     // Create alpha with group "work"
-    let storage_a = Storage::new("alpha").unwrap();
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
     let mut inst_a = Instance::new("A1", "/tmp/a");
     inst_a.group_path = "work".to_string();
     let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
@@ -3409,7 +3643,7 @@ fn test_delete_group_scoped_to_owning_profile() {
         .unwrap();
 
     // Create beta with the same group name "work"
-    let storage_b = Storage::new("beta").unwrap();
+    let storage_b = Storage::new_unwatched("beta").unwrap();
     let mut inst_b = Instance::new("B1", "/tmp/b");
     inst_b.group_path = "work".to_string();
     let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
@@ -3422,7 +3656,7 @@ fn test_delete_group_scoped_to_owning_profile() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3529,6 +3763,178 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
     env.view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.group_value(), "work");
+    // The group has a member at "/tmp/work", so the path is borrowed from it
+    // instead of being left on the default cwd (issue #2023).
+    assert_eq!(dialog.path_value(), "/tmp/work");
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_prefills_path() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+
+    // Move cursor to the "work" group row, as a right-click would.
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    // The group right-click menu's "New Session" routes here.
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromGroup should open the new-session dialog");
+    assert_eq!(dialog.path_value(), "/tmp/work");
+    assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    env.view.available_tools = AvailableTools::with_tools(&[]);
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no agents means the new-session form must not open"
+    );
+    assert!(
+        env.view.no_agents_dialog.is_some(),
+        "should point the user at agent setup instead, like 'n'"
+    );
+}
+
+#[test]
+#[serial]
+fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
+    use crate::session::config::GroupByMode;
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // In project mode the group label is the repo basename ("work" from
+    // "/tmp/work"), not the stored group_path.
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { name, .. } if name == "work"))
+        .expect("work project group should exist in flat_items");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromGroup should open the new-session dialog");
+    assert_eq!(
+        dialog.path_value(),
+        "/tmp/work",
+        "project-mode prefill should borrow the member repo path"
+    );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_snooze_opens_duration_dialog() {
+    use crate::session::config::SortOrder;
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    // Snooze is offered in Attention sort (it mirrors the Attention-gated `h`
+    // keybinding); dispatching it on an active session opens the duration
+    // picker, the same path the keyboard takes.
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_some(),
+        "context-menu Snooze on an active session must open the duration picker"
+    );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_snooze_wakes_snoozed_session() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+    let id = env
+        .view
+        .selected_session
+        .clone()
+        .expect("a session should be selected");
+
+    // Pre-snooze the session so the toggle takes the wake path.
+    env.view.snooze_session_for(&id, 60).unwrap();
+    assert!(
+        env.view
+            .instances
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.is_snoozed()),
+        "session should be snoozed before the toggle"
+    );
+
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "waking a snoozed session must not open the duration picker"
+    );
+    assert!(
+        !env.view
+            .instances
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.is_snoozed()),
+        "context-menu Snooze on a snoozed session must wake it immediately"
+    );
 }
 
 #[test]
@@ -3549,7 +3955,7 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst = Instance::new("worktree-session", "/tmp/repo-worktrees/feature-branch");
     inst.worktree_info = Some(WorktreeInfo {
@@ -3571,7 +3977,12 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
     }
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3674,7 +4085,7 @@ fn test_rename_selected_group_with_children() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("parent-session", "/tmp/p");
     inst1.group_path = "work".to_string();
@@ -3691,7 +4102,12 @@ fn test_rename_selected_group_with_children() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3779,7 +4195,7 @@ fn test_rename_group_removes_old_path() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst = Instance::new("work-session", "/tmp/w");
     inst.group_path = "work".to_string();
@@ -3794,7 +4210,12 @@ fn test_rename_group_removes_old_path() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3818,7 +4239,7 @@ fn test_rename_group_empty_group() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let instances: Vec<Instance> = vec![];
     let mut group_tree = GroupTree::new_with_groups(&instances, &[]);
@@ -3832,7 +4253,12 @@ fn test_rename_group_empty_group() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3863,7 +4289,7 @@ fn test_rename_group_duplicate_returns_error() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("work-session", "/tmp/w");
     inst1.group_path = "work".to_string();
@@ -3880,7 +4306,12 @@ fn test_rename_group_duplicate_returns_error() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3907,7 +4338,7 @@ fn test_rename_group_resort_az() {
     config.app_state.sort_order = Some(SortOrder::AZ);
     save_config(&config).unwrap();
 
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut inst1 = Instance::new("s1", "/tmp/1");
     inst1.group_path = "zzz".to_string();
@@ -3924,7 +4355,12 @@ fn test_rename_group_resort_az() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -3997,7 +4433,12 @@ fn test_apply_creation_results_returns_session_id() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("default".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("default".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -4124,10 +4565,15 @@ fn test_cursor_follows_session_after_deletion() {
 fn home_defaults_to_agent_when_config_unset() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _storage = Storage::new("test").unwrap();
+    let _storage = Storage::new_unwatched("test").unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     assert_eq!(view.view_mode, ViewMode::Structured);
 }
 
@@ -4614,7 +5060,7 @@ fn update_bar_renders_status_toast_without_update_info() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, Some(toast));
+            env.view.render(f, area, &theme, None, Some(toast), None);
         })
         .unwrap();
 
@@ -4635,6 +5081,116 @@ fn update_bar_renders_status_toast_without_update_info() {
     assert!(
         out.contains("[Ctrl+x] dismiss"),
         "expected the dismiss hint alongside the toast.\nFull buffer:\n{out}"
+    );
+}
+
+/// The sandbox-image update banner renders (with its `[u] pull` /
+/// `[Ctrl+x] dismiss` hints) when an `ImageUpdate` is present and no
+/// higher-priority banner is up. Guards the lowest-priority slot in
+/// `render_update_bar`.
+#[test]
+#[serial]
+fn update_bar_renders_sandbox_image_banner() {
+    use crate::containers::image_update::ImageUpdate;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let image_update = ImageUpdate {
+        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+        remote_digest: "sha256:abc".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, None, None, Some(&image_update));
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("sandbox image update available"),
+        "expected the sandbox image banner to render.\nFull buffer:\n{out}"
+    );
+    assert!(
+        out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+        "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
+    );
+}
+
+/// The app-update banner wins the shared bottom row over a pending
+/// sandbox-image update: only one shows at a time, so the lower-priority
+/// image banner must stay hidden (and its `[u] pull` hint absent) while an
+/// app update is up. This is what keeps the `u` / Ctrl+x keys unambiguous.
+#[test]
+#[serial]
+fn app_update_banner_takes_precedence_over_image_banner() {
+    use crate::containers::image_update::ImageUpdate;
+    use crate::tui::styles::load_theme;
+    use crate::update::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let update_info = UpdateInfo {
+        available: true,
+        current_version: "1.0.0".to_string(),
+        latest_version: "1.1.0".to_string(),
+    };
+    let image_update = ImageUpdate {
+        image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+        remote_digest: "sha256:abc".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(
+                f,
+                area,
+                &theme,
+                Some(&update_info),
+                None,
+                Some(&image_update),
+            );
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("update available 1.0.0"),
+        "expected the app update banner to win the row.\nFull buffer:\n{out}"
+    );
+    assert!(
+        !out.contains("sandbox image update available"),
+        "image banner must stay hidden while an app update is shown.\nFull buffer:\n{out}"
     );
 }
 
@@ -4725,7 +5281,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -4830,6 +5386,78 @@ fn toggle_archive_at_cursor_noop_with_no_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
 }
 
+/// Approach 2: archiving in the default (non-Attention) sort keeps the cursor
+/// AND selection on the just-archived session instead of swapping to a
+/// neighbor, and reveals the Archived section so the row stays visible. This is
+/// what lets the preview render the calm "Archived" placeholder for the same
+/// row the user is looking at, rather than flashing a dead-pane warning and
+/// then snapping selection to the session below.
+#[test]
+#[serial]
+fn archive_keeps_selection_and_reveals_section() {
+    let mut env = create_test_env_with_sessions(2);
+    // Start with the Archived section collapsed (the default / reported repro).
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_archived(),
+        "the session must be archived"
+    );
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(id.as_str()),
+        "selection must stay on the archived session, not swap to a neighbor"
+    );
+    assert!(
+        !env.view.archived_section_collapsed,
+        "archiving must reveal the Archived section so the row stays visible"
+    );
+    match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id: cur, .. }) => {
+            assert_eq!(cur, &id, "cursor must land on the archived row")
+        }
+        _ => panic!("cursor should be on the archived session row"),
+    }
+}
+
+/// Restoring with `z` unarchives the row and keeps it selected, following it
+/// back to its real tier. Unarchive does not restart the agent: the row stays
+/// Stopped (archive killed its pane) and the user restarts with `e`.
+#[test]
+#[serial]
+fn unarchive_keeps_selection() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_archived(),
+        "second toggle unarchives"
+    );
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(id.as_str()),
+        "unarchived row stays selected"
+    );
+    match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id: cur, .. }) => {
+            assert_eq!(cur, &id, "cursor follows the unarchived row")
+        }
+        _ => panic!("cursor should be on the unarchived session row"),
+    }
+}
+
 /// `restart_selected_session` must drop the press silently when nothing is
 /// selected. No restart_with_size call, no save, no cooldown insertion.
 #[test]
@@ -4837,7 +5465,7 @@ fn toggle_archive_at_cursor_noop_with_no_selection() {
 fn restart_selected_session_noop_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.selected_session = None;
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -4853,7 +5481,7 @@ fn restart_selected_session_skips_archived_row() {
     env.view.selected_session = Some(id.clone());
     env.view.mutate_instance(&id, |inst| inst.archive());
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_archived(),
@@ -4876,7 +5504,7 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     env.view.sort_order = SortOrder::Attention;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_snoozed(),
@@ -4904,7 +5532,7 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instances[0].is_snoozed(), "pre-condition");
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
         !env.view.instances[0].is_snoozed(),
@@ -4928,7 +5556,7 @@ fn restart_selected_session_skips_creating_row() {
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -4955,7 +5583,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
-    let result = env.view.restart_selected_session(None, None);
+    let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
     assert_eq!(
@@ -4971,7 +5599,7 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
     use crate::session::Status;
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut alpha_waiting = Instance::new("alpha-waiting", "/repos/alpha");
     alpha_waiting.status = Status::Waiting;
@@ -4993,7 +5621,12 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     TestEnv { _temp: temp, view }
 }
 
@@ -5104,6 +5737,614 @@ fn project_groups_sort_by_top_attention_member() {
         group_order,
         vec!["alpha".to_string(), "beta".to_string()],
         "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
+    );
+}
+
+/// A registered (pinned) project with no sessions surfaces as an empty
+/// header in project view, mirroring the WebUI where an empty project is just
+/// a registry entry decoupled from sessions. This is the core of #2047.
+#[test]
+#[serial]
+fn pinned_project_without_sessions_shows_empty_header() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    // Register a project that has no sessions at all. The path need not exist;
+    // `add` falls back to the literal path when canonicalization fails.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        group_names.iter().any(|n| n == "gamma"),
+        "pinned empty project gamma must show as a header, got {group_names:?}"
+    );
+    assert!(env.view.is_project_label_pinned("gamma"));
+}
+
+/// Pressing `p` on a project header pins it (registers the repo) instead of
+/// opening the projects dialog; the pin toggle binding wins the shared chord
+/// because a project header is selected.
+#[test]
+#[serial]
+fn p_key_pins_project_on_header() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "alpha"))
+        .expect("alpha header present");
+    env.view.cursor = alpha_idx;
+    env.view.update_selected();
+
+    assert!(!env.view.is_project_label_pinned("alpha"));
+    env.view.handle_key(key(KeyCode::Char('p')), None);
+    assert!(
+        env.view.is_project_label_pinned("alpha"),
+        "p on a project header should pin it"
+    );
+    // The pin path must not open the projects dialog (the chord is shared).
+    assert!(env.view.projects_dialog.is_none());
+
+    // Unpinning (a second toggle) drops the registry entry.
+    env.view.toggle_project_pin_at_cursor();
+    assert!(!env.view.is_project_label_pinned("alpha"));
+}
+
+/// Off a project header (here: in Manual grouping), `p` keeps its original
+/// meaning and opens the projects dialog, so the overload doesn't shadow the
+/// global binding.
+#[test]
+#[serial]
+fn p_key_opens_projects_dialog_off_project_header() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('p')), None);
+    assert!(
+        env.view.projects_dialog.is_some(),
+        "p off a project header should open the projects dialog"
+    );
+}
+
+/// Pin a project, archive its only session, then unpin: the empty header must
+/// leave the main flow (the archived session stays under the Archived section).
+#[test]
+#[serial]
+fn unpin_archived_only_project_leaves_main_flow() {
+    use crate::session::{config::GroupByMode, is_within_archived_section};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pin beta.
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "beta"))
+        .expect("beta header present");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(env.view.is_project_label_pinned("beta"));
+
+    // Archive both beta sessions.
+    let beta_ids: Vec<String> = env
+        .view
+        .instances
+        .iter()
+        .filter(|i| super::project_group_name(i) == "beta")
+        .map(|i| i.id.clone())
+        .collect();
+    for id in &beta_ids {
+        env.view
+            .apply_user_action(id, |inst| inst.archive())
+            .unwrap();
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Now unpin via the cursor on the empty main-flow beta header.
+    let beta_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, path, .. } if name == "beta" && !is_within_archived_section(path)))
+        .expect("empty beta header present in main flow after archiving");
+    env.view.cursor = beta_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !env.view.is_project_label_pinned("beta"),
+        "beta must read as unpinned after the toggle; registry still has it"
+    );
+
+    // Count beta headers OUTSIDE the Archived section.
+    let mut in_archived = false;
+    let mut main_beta = 0;
+    for item in &env.view.flat_items {
+        if let Item::Group { path, name, .. } = item {
+            if is_within_archived_section(path) {
+                in_archived = true;
+            } else if name == "beta" && !in_archived {
+                main_beta += 1;
+            }
+        }
+    }
+    assert_eq!(
+        main_beta, 0,
+        "unpinned archived-only beta must not render in the main flow; got: {:?}",
+        env.view.flat_items
+    );
+}
+
+/// A registry entry whose path differs from an archived session's repo path
+/// sharing the same basename must still read as pinned and be unpinnable.
+/// The empty header is surfaced by LABEL match (`unpopulated_projects`), so
+/// pin state and the unpin toggle must resolve by the same rule. Previously
+/// `project_header_repo_path` let the archived row lend the header its path:
+/// the path comparison failed (repo gone from disk, `canonical_key` compares
+/// raw strings), the header read as unpinned, and `p` routed to the pin
+/// branch and died on the name conflict, leaving a phantom header the user
+/// could not clear.
+#[test]
+#[serial]
+fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnable() {
+    use crate::session::config::GroupByMode;
+    use crate::session::is_within_archived_section;
+    use crate::session::projects::{self, Project, ProjectScope};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    // A live session in another project, plus an ARCHIVED session whose repo
+    // basename is "otari" but whose recorded path differs from the registry
+    // entry below (repo deleted/moved, so neither canonicalizes).
+    let mut alpha = Instance::new("alpha-running", "/repos/alpha");
+    alpha.status = Status::Running;
+    let mut orphan = Instance::new("otari-old", "/old/home/otari");
+    orphan.status = Status::Stopped;
+    orphan.archive();
+
+    let instances = vec![alpha, orphan];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // Stale registry entry: same basename, different (nonexistent) path.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    view.group_by = GroupByMode::Project;
+    view.refresh_registered_projects();
+    view.flat_items = view.build_flat_items();
+
+    // 1. The phantom: an empty otari header renders in the main flow.
+    let otari_idx = view.flat_items.iter().position(|i| {
+        matches!(i, Item::Group { name, path, .. }
+            if name == "otari" && !is_within_archived_section(path))
+    });
+    assert!(
+        otari_idx.is_some(),
+        "stale registry entry must surface an empty otari header; got {:?}",
+        view.flat_items
+    );
+
+    // 2. With no live session populating the label, pin state resolves by
+    //    label, the same rule that injected the header.
+    assert!(
+        view.is_project_label_pinned("otari"),
+        "registry-backed empty header must read as pinned even when an \
+         archived session recorded a different path for the same basename"
+    );
+
+    // 3. `p` on the header routes to the unpin branch and clears it.
+    view.cursor = otari_idx.unwrap();
+    view.update_selected();
+    view.toggle_project_pin_at_cursor();
+
+    let still_there = view.flat_items.iter().any(|i| {
+        matches!(i, Item::Group { name, path, .. }
+            if name == "otari" && !is_within_archived_section(path))
+    });
+    assert!(
+        !still_there,
+        "unpin must drop the empty header from the main flow; got {:?}",
+        view.flat_items
+    );
+    assert!(
+        projects::load_global().unwrap().is_empty(),
+        "unpin must remove the stale registry entry"
+    );
+    // The archived session itself is untouched; it stays under Archived.
+    assert!(
+        view.flat_items
+            .iter()
+            .any(|i| { matches!(i, Item::Group { path, .. } if is_within_archived_section(path)) }),
+        "archived section still present"
+    );
+}
+
+/// The pin must persist a project across its last session leaving the view:
+/// once pinned, the header remains even when no sessions reference it. This
+/// is the user-visible promise of #2047.
+#[test]
+#[serial]
+fn pinned_project_survives_losing_last_session() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "alpha"))
+        .expect("alpha header present");
+    env.view.cursor = alpha_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(env.view.is_project_label_pinned("alpha"));
+
+    // Drop every alpha session, then rebuild as a reload would. The registry
+    // entry keeps the header alive even with zero members.
+    env.view
+        .instances
+        .retain(|i| super::project_group_name(i) != "alpha");
+    env.view.flat_items = env.view.build_flat_items();
+
+    let alpha_header = env.view.flat_items.iter().find_map(|i| match i {
+        Item::Group {
+            name,
+            session_count,
+            ..
+        } if name == "alpha" => Some(*session_count),
+        _ => None,
+    });
+    assert_eq!(
+        alpha_header,
+        Some(0),
+        "pinned alpha must remain as an empty (0) header after losing its sessions"
+    );
+}
+
+/// Two repos that share a basename are judged independently for pinning: a
+/// header whose own repo is not registered must read as unpinned even when a
+/// different same-basename repo is in the registry. Guards the path-keyed pin
+/// identity (CodeRabbit #2055).
+#[test]
+#[serial]
+fn same_basename_repos_pin_independently() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Register `/work/api`, but the visible header's repo is `/other/api`.
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("api", "/work/api", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    let mut sess = Instance::new("api-sess", "/other/api");
+    sess.source_profile = "test".to_string();
+    env.view.instances.push(sess);
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let api_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "api"))
+        .expect("api header present");
+    // The header's repo (/other/api) is not registered, so it is NOT pinned,
+    // even though a same-basename repo (/work/api) is. The old basename match
+    // would have reported pinned here.
+    assert!(!env.view.is_project_label_pinned("api"));
+
+    // Pinning this header would register under the basename "api", which the
+    // registry already holds for /work/api, so the registry's name-uniqueness
+    // surfaces a conflict rather than silently toggling the unrelated entry.
+    env.view.cursor = api_idx;
+    env.view.update_selected();
+    env.view.toggle_project_pin_at_cursor();
+    assert!(
+        !env.view.is_project_label_pinned("api"),
+        "the unrelated /work/api entry must not make this header read as pinned"
+    );
+    // The conflicting pin did not register the header's repo.
+    let paths: Vec<String> = projects::load_global()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+    assert_eq!(paths, vec!["/work/api".to_string()]);
+}
+
+/// "New Session" on an empty pinned project (no member sessions) must prefill
+/// the registered repo path, so the pin->launch loop works: the path can only
+/// come from the registry fallback in `group_repo_path`.
+#[test]
+#[serial]
+fn empty_pinned_project_new_session_uses_registered_path() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    assert_eq!(
+        env.view.group_repo_path("lonely"),
+        Some("/repos/lonely".to_string()),
+        "empty pinned project must source its new-session path from the registry"
+    );
+}
+
+/// In all-profiles mode the pin registry must include every loaded profile's
+/// projects, not just the default profile's, so a profile-scoped pin keeps its
+/// empty header (CodeRabbit #2055).
+#[test]
+#[serial]
+fn all_profiles_view_includes_profile_scoped_pins() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` with no sessions of its own.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let names: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "lonely"),
+        "beta's profile-scoped pin must show in all-profiles project view, got {names:?}"
+    );
+    assert!(view.is_project_label_pinned("lonely"));
+}
+
+/// Unpinning a PROFILE-scoped pin from all-profiles mode must actually clear
+/// it. Regression for #2055: the empty header surfaced from a non-default
+/// profile's registry, but the unpin removed against `config_profile()` (the
+/// default profile) rather than the profile that owned the entry, so the
+/// header never disappeared.
+#[test]
+#[serial]
+fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Two discoverable profiles, each with a session, so all-profiles mode
+    // loads both registries.
+    for (profile, title, path) in [
+        ("alpha", "Alpha Session", "/tmp/a"),
+        ("beta", "Beta Session", "/tmp/b"),
+    ] {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let xs = vec![Instance::new(title, path)];
+        storage
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+    // A profile-scoped pin in `beta` (NOT the default profile) with no sessions.
+    projects::add(
+        "beta",
+        ProjectScope::Profile,
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    let idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "lonely"))
+        .expect("lonely header present in all-profiles project view");
+    view.cursor = idx;
+    view.update_selected();
+    view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !view.is_project_label_pinned("lonely"),
+        "lonely must read as unpinned after the toggle"
+    );
+    // The entry is gone from beta's on-disk registry, not just the in-memory view.
+    assert!(
+        projects::load_profile("beta").unwrap().is_empty(),
+        "the profile-scoped registry entry must be removed from disk"
+    );
+    let still: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !still.iter().any(|n| n == "lonely"),
+        "unpinned lonely must drop from the view, got {still:?}"
+    );
+}
+
+/// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
+/// `--allow-override`) must fully unpin in a single press. `load_merged` only
+/// surfaces the shadowing profile entry, so removing just that one would
+/// re-surface the global entry and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path.
+#[test]
+#[serial]
+fn unpin_clears_both_global_and_profile_entries_for_a_path() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let mut env = create_test_env_empty();
+    // Same path pinned globally and profile-scoped (override allows the shadow).
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project::new("dual-global", "/repos/dual", ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    projects::add(
+        "test",
+        ProjectScope::Profile,
+        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile),
+        true,
+    )
+    .unwrap();
+
+    env.view.group_by = GroupByMode::Project;
+    env.view.refresh_registered_projects();
+    env.view.flat_items = env.view.build_flat_items();
+
+    let idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { name, .. } if name == "dual"))
+        .expect("dual header present");
+    env.view.cursor = idx;
+    env.view.update_selected();
+
+    // One press must fully unpin.
+    env.view.toggle_project_pin_at_cursor();
+
+    assert!(
+        !env.view.is_project_label_pinned("dual"),
+        "dual must read as unpinned after a single press"
+    );
+    assert!(
+        projects::load_global().unwrap().is_empty(),
+        "global entry must be removed"
+    );
+    assert!(
+        projects::load_profile("test").unwrap().is_empty(),
+        "profile entry must be removed"
+    );
+    let names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "dual"),
+        "unpinned dual must drop from the view, got {names:?}"
     );
 }
 
@@ -5263,10 +6504,10 @@ fn manual_grouping_attention_sort_stays_flat() {
 fn prune_empty_group_drops_source_when_no_session_remains() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _ = Storage::new("alpha").unwrap();
-    let _ = Storage::new("beta").unwrap();
+    let _ = Storage::new_unwatched("alpha").unwrap();
+    let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
 
     // Pre-state: alpha has one session in group "work", beta is empty.
     let mut moved = Instance::new("moved", "/tmp/moved");
@@ -5301,10 +6542,10 @@ fn prune_empty_group_drops_source_when_no_session_remains() {
 fn prune_empty_group_keeps_source_when_sibling_session_remains() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _ = Storage::new("alpha").unwrap();
-    let _ = Storage::new("beta").unwrap();
+    let _ = Storage::new_unwatched("alpha").unwrap();
+    let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
 
     let mut moved = Instance::new("moved", "/tmp/moved");
     moved.source_profile = "alpha".to_string();
@@ -5338,10 +6579,10 @@ fn prune_empty_group_keeps_source_when_sibling_session_remains() {
 fn prune_empty_group_keeps_source_when_descendant_session_remains() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _ = Storage::new("alpha").unwrap();
-    let _ = Storage::new("beta").unwrap();
+    let _ = Storage::new_unwatched("alpha").unwrap();
+    let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
 
     let mut moved = Instance::new("moved", "/tmp/moved");
     moved.source_profile = "alpha".to_string();
@@ -5377,10 +6618,10 @@ fn prune_empty_group_keeps_source_when_descendant_session_remains() {
 fn prune_empty_group_keeps_source_when_descendant_group_remains() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _ = Storage::new("alpha").unwrap();
-    let _ = Storage::new("beta").unwrap();
+    let _ = Storage::new_unwatched("alpha").unwrap();
+    let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
 
     let mut moved = Instance::new("moved", "/tmp/moved");
     moved.source_profile = "alpha".to_string();
@@ -5418,12 +6659,17 @@ fn prune_empty_group_keeps_source_when_descendant_group_remains() {
 fn prune_empty_group_survives_save_and_reload() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let _ = Storage::new("alpha").unwrap();
-    let _ = Storage::new("beta").unwrap();
+    let _ = Storage::new_unwatched("alpha").unwrap();
+    let _ = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
 
     {
-        let mut view = HomeView::new(None, tools.clone()).unwrap();
+        let mut view = HomeView::new(
+            None,
+            tools.clone(),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
         let moved = {
             let mut inst = Instance::new("moved", "/tmp/moved");
             inst.source_profile = "alpha".to_string();
@@ -5452,7 +6698,7 @@ fn prune_empty_group_survives_save_and_reload() {
         view.save().unwrap();
     }
 
-    let reloaded = HomeView::new(None, tools).unwrap();
+    let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     assert!(
         reloaded.group_trees.contains_key("alpha"),
         "alpha tree must still load after the move"
@@ -5757,6 +7003,59 @@ fn archived_section_nests_by_project_in_project_mode() {
         }
         other => panic!("expected beta-error session row, got {:?}", other),
     }
+}
+
+/// A project whose only remaining member is archived must NOT leave an empty
+/// phantom header in the main (non-archived) flow. The archived session shows
+/// under the Archived section instead; an empty project header would be
+/// undeletable in project mode ("Project groups are automatic").
+#[test]
+#[serial]
+fn archived_only_project_leaves_no_phantom_header() {
+    use crate::session::{config::GroupByMode, is_within_archived_section};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+
+    // Drain beta down to a single ARCHIVED member: archive beta-error, then
+    // delete beta-running (the "last visible session in the group").
+    let beta_error = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.title == "beta-error")
+        .map(|i| i.id.clone())
+        .unwrap();
+    let beta_running = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.title == "beta-running")
+        .map(|i| i.id.clone())
+        .unwrap();
+    env.view
+        .apply_user_action(&beta_error, |inst| inst.archive())
+        .unwrap();
+    env.view.instances.retain(|i| i.id != beta_running);
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Count "beta" headers that live OUTSIDE the Archived section.
+    let mut in_archived = false;
+    let mut main_beta_headers = 0;
+    for item in &env.view.flat_items {
+        if let Item::Group { path, name, .. } = item {
+            if is_within_archived_section(path) {
+                in_archived = true;
+            } else if name == "beta" && !in_archived {
+                main_beta_headers += 1;
+            }
+        }
+    }
+    assert_eq!(
+        main_beta_headers, 0,
+        "archived-only project must not render a header in the main flow; got flat_items: {:?}",
+        env.view.flat_items
+    );
 }
 
 /// Collapsing the Archived umbrella in Project mode hides both sub-folder
@@ -6326,7 +7625,7 @@ mod scroll_pane_isolation {
             terminal
                 .draw(|f| {
                     let area = f.area();
-                    env.view.render(f, area, &theme, None, None);
+                    env.view.render(f, area, &theme, None, None, None);
                 })
                 .unwrap();
             env.view.preview_pane_area.width
@@ -6422,6 +7721,131 @@ mod click_to_select {
         assert_eq!(
             env.view.cursor, 2,
             "SelectOnly must still move the cursor to the clicked row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_only_click_on_different_row_exits_live_mode() {
+        // With `click_action = SelectOnly`, clicking a *different* row while
+        // live-sending must leave live mode (otherwise keystrokes stay aimed at
+        // the old session while the cursor/preview walk away). The click still
+        // emits no action and still moves the cursor.
+        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::SelectOnly;
+        save_config(&config).unwrap();
+
+        let live_id = env.view.selected_session.clone().unwrap();
+        env.view.live_send = Some(LiveSendState {
+            session_id: live_id,
+            title: "live".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let action = env.view.handle_click(5, 3);
+        assert_eq!(action, None, "SelectOnly click never emits an action");
+        assert_eq!(env.view.cursor, 2, "the click still moves the cursor");
+        assert!(
+            env.view.live_send.is_none(),
+            "clicking a different row in SelectOnly mode must exit live mode"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_only_click_on_live_row_stays_live() {
+        // Clicking the row that's already live-sending is not a "leave" gesture:
+        // the cursor is already there, so SelectOnly must not tear down live mode.
+        use crate::session::config::{save_config, ClickAction, Config};
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        // Row 3 resolves to index 2, so make index 2 the live row.
+        env.view.cursor = 2;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::SelectOnly;
+        save_config(&config).unwrap();
+
+        let live_id = env.view.selected_session.clone().unwrap();
+        env.view.live_send = Some(LiveSendState {
+            session_id: live_id,
+            title: "live".to_string(),
+            tmux_name: "aoe_test_live".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let action = env.view.handle_click(5, 3);
+        assert_eq!(action, None, "SelectOnly click never emits an action");
+        assert!(
+            env.view.live_send.is_some(),
+            "clicking the already-live row must not exit live mode"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn single_click_on_archived_row_selects_without_reviving() {
+        // A parked (archived) session has had its pane killed. Single-clicking
+        // it is a "let me look" gesture and must NOT resurrect it: no
+        // EnterLiveSend (which would respawn the pane) and the session stays
+        // archived (no auto-unarchive). This holds even under the default
+        // `click_action = LiveSend`. Bringing it back stays explicit: `z`,
+        // double-click, or Enter.
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        // Keep archived rows visible so the archived row is clickable.
+        env.view.archived_section_collapsed = false;
+
+        // Archive the row at cursor 0.
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let archived_id = env.view.selected_session.clone().unwrap();
+        env.view.toggle_archive_at_cursor().unwrap();
+        assert!(
+            env.view.get_instance(&archived_id).unwrap().is_archived(),
+            "precondition: the session must be archived"
+        );
+
+        // Locate the archived row in the flat list and click it.
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|it| matches!(it, Item::Session { id, .. } if id == &archived_id))
+            .expect("archived session must render under the expanded Archived section");
+        let row = env.view.list_inner_area.y + idx as u16;
+        let action = env.view.handle_click(5, row);
+
+        assert_eq!(
+            action, None,
+            "single click on an archived row must not request live-send"
+        );
+        assert!(
+            env.view.live_send.is_none(),
+            "single click on an archived row must not enter live-send mode"
+        );
+        assert!(
+            env.view.get_instance(&archived_id).unwrap().is_archived(),
+            "single click on an archived row must not unarchive it"
+        );
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(archived_id.as_str()),
+            "single click should still select the archived row"
         );
     }
 
@@ -7840,7 +9264,7 @@ mod preview_drag_select {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -7891,7 +9315,7 @@ mod preview_drag_select {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None);
+                env.view.render(f, area, &theme, None, None, None);
             })
             .unwrap();
 
@@ -8940,7 +10364,7 @@ mod save_field_merge {
     fn boot_view_with_one_session(title: &str, path: &str) -> (TempDir, HomeView, String) {
         let temp = TempDir::new().unwrap();
         setup_test_home(&temp);
-        let storage = Storage::new("test").unwrap();
+        let storage = Storage::new_unwatched("test").unwrap();
         let inst = Instance::new(title, path);
         let id = inst.id.clone();
         storage
@@ -8952,7 +10376,12 @@ mod save_field_merge {
             .unwrap();
 
         let tools = AvailableTools::with_tools(&["claude"]);
-        let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+        let view = HomeView::new(
+            Some("test".to_string()),
+            tools,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
         (temp, view, id)
     }
 
@@ -8961,7 +10390,7 @@ mod save_field_merge {
     fn test_save_preserves_peer_field_update() {
         let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
-        let peer_storage = Storage::new("test").unwrap();
+        let peer_storage = Storage::new_unwatched("test").unwrap();
         let peer_archived_at = Utc::now();
         peer_storage
             .update(|insts, _| {
@@ -8974,7 +10403,7 @@ mod save_field_merge {
 
         view.save().expect("save must merge peer-owned field write");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         let row = reloaded.iter().find(|i| i.id == id).expect("row present");
         assert_eq!(
             row.archived_at,
@@ -8988,7 +10417,7 @@ mod save_field_merge {
     fn test_save_preserves_peer_added_row() {
         let (_temp, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
 
-        let peer_storage = Storage::new("test").unwrap();
+        let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
             .update(|insts, _| {
                 insts.push(Instance::new("peer-added", "/tmp/peer"));
@@ -8999,7 +10428,7 @@ mod save_field_merge {
         view.save()
             .expect("save must not delete rows the TUI does not know about");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         assert!(
             reloaded.iter().any(|i| i.title == "peer-added"),
             "peer-added row must survive TUI save"
@@ -9018,7 +10447,7 @@ mod save_field_merge {
         view.remove_instance(&id);
         view.save().expect("save must propagate the delete");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         assert!(
             !reloaded.iter().any(|i| i.id == id),
             "tombstoned row must be removed from disk"
@@ -9051,7 +10480,7 @@ mod save_field_merge {
     fn test_save_preserves_peer_added_group() {
         let (_temp, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
 
-        let peer_storage = Storage::new("test").unwrap();
+        let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
             .update(|_insts, groups| {
                 groups.push(crate::session::Group::new("peer-grp", "peer-grp"));
@@ -9062,7 +10491,11 @@ mod save_field_merge {
         view.save()
             .expect("save must not clobber groups the TUI does not know about");
 
-        let reloaded = Storage::new("test").unwrap().load_with_groups().unwrap().1;
+        let reloaded = Storage::new_unwatched("test")
+            .unwrap()
+            .load_with_groups()
+            .unwrap()
+            .1;
         assert!(
             reloaded.iter().any(|g| g.path == "peer-grp"),
             "peer-added group must survive TUI save"
@@ -9077,7 +10510,7 @@ mod save_field_merge {
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("apply_user_action must persist");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         let row = reloaded.iter().find(|i| i.id == id).expect("row present");
         assert!(
             row.archived_at.is_some(),
@@ -9090,7 +10523,7 @@ mod save_field_merge {
     fn test_apply_user_action_does_not_clobber_peer_field() {
         let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
-        let peer_storage = Storage::new("test").unwrap();
+        let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
             .update(|insts, _| {
                 if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
@@ -9103,7 +10536,7 @@ mod save_field_merge {
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("archive must persist");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         let row = reloaded.iter().find(|i| i.id == id).expect("row present");
         assert!(row.archived_at.is_some(), "TUI archive landed");
         assert_eq!(
@@ -9125,7 +10558,7 @@ mod save_field_merge {
             .get_instance(&id)
             .expect("in-memory row present")
             .archived_at;
-        let disk_ts = Storage::new("test")
+        let disk_ts = Storage::new_unwatched("test")
             .unwrap()
             .load()
             .unwrap()
@@ -9150,7 +10583,7 @@ mod save_field_merge {
         // contradictory triage state on the next render.
         let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
-        let peer_storage = Storage::new("test").unwrap();
+        let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
             .update(|insts, _| {
                 if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
@@ -9163,7 +10596,7 @@ mod save_field_merge {
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("archive must persist");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         let row = reloaded.iter().find(|i| i.id == id).expect("row present");
         assert!(row.archived_at.is_some(), "TUI archive landed");
         assert!(
@@ -9182,7 +10615,7 @@ mod save_field_merge {
         // invariant from the archive XOR rules tested above.
         let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
-        let peer_storage = Storage::new("test").unwrap();
+        let peer_storage = Storage::new_unwatched("test").unwrap();
         peer_storage
             .update(|insts, _| {
                 if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
@@ -9195,7 +10628,7 @@ mod save_field_merge {
         view.apply_user_action(&id, |inst| inst.snooze(30))
             .expect("snooze must persist");
 
-        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
         let row = reloaded.iter().find(|i| i.id == id).expect("row present");
         assert!(row.snoozed_until.is_some(), "TUI snooze landed");
         assert_eq!(
@@ -9211,7 +10644,7 @@ mod save_field_merge {
 
         // Simulate `aoe session remove victim` from another process: peer
         // deletes the row from disk while TUI still has it in memory.
-        Storage::new("test")
+        Storage::new_unwatched("test")
             .unwrap()
             .update(|insts, _g| {
                 insts.retain(|i| i.id != id);
@@ -9230,7 +10663,7 @@ mod save_field_merge {
             view.get_instance(&id).is_none(),
             "peer-deleted row must be dropped from instance_map"
         );
-        let disk = Storage::new("test").unwrap().load().unwrap();
+        let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
         assert!(
             !disk.iter().any(|i| i.id == id),
             "save() must not resurrect the peer-deleted row on disk"
@@ -9249,7 +10682,7 @@ mod save_field_merge {
 
         view.save().expect("save must persist TUI-added row");
 
-        let disk = Storage::new("test").unwrap().load().unwrap();
+        let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
         assert!(
             disk.iter().any(|i| i.id == new_id),
             "TUI-added row must be persisted to disk"
@@ -9273,7 +10706,7 @@ mod save_field_merge {
 
         view.save().expect("save must succeed");
 
-        let disk = Storage::new("test").unwrap().load().unwrap();
+        let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
         assert!(
             !disk.iter().any(|i| i.id == new_id),
             "add+remove in same save cycle must not leak the row to disk"
@@ -9284,8 +10717,10 @@ mod save_field_merge {
     #[serial]
     fn test_move_to_profile_marks_tombstone_and_pending_added() {
         let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
-        view.storages
-            .insert("target".to_string(), Storage::new("target").unwrap());
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
 
         view.move_to_profile(&id, "target", "moved/group".to_string())
             .unwrap();
@@ -9311,14 +10746,16 @@ mod save_field_merge {
     #[serial]
     fn test_move_to_profile_save_roundtrip_persists_under_target() {
         let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
-        view.storages
-            .insert("target".to_string(), Storage::new("target").unwrap());
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
 
         view.move_to_profile(&id, "target", String::new()).unwrap();
         view.save().expect("save must succeed across profiles");
 
-        let old_disk = Storage::new("test").unwrap().load().unwrap();
-        let new_disk = Storage::new("target").unwrap().load().unwrap();
+        let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+        let new_disk = Storage::new_unwatched("target").unwrap().load().unwrap();
         assert!(
             !old_disk.iter().any(|i| i.id == id),
             "old profile disk must NOT contain the moved row"
@@ -9357,7 +10794,7 @@ mod save_field_merge {
         view.save().unwrap();
 
         // Peer clears the sid on disk (simulates `aoe session set-session-id ""`).
-        Storage::new("test")
+        Storage::new_unwatched("test")
             .unwrap()
             .update(|insts, _g| {
                 if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
@@ -9415,7 +10852,7 @@ mod save_field_merge {
             !view.get_instance(&id).unwrap().is_archived(),
             "stamp_last_accessed must clear archived_at in memory"
         );
-        let disk_row = Storage::new("test")
+        let disk_row = Storage::new_unwatched("test")
             .unwrap()
             .load()
             .unwrap()
@@ -9454,7 +10891,7 @@ mod save_field_merge {
             !view.get_instance(&id).unwrap().is_snoozed(),
             "stamp_last_accessed must clear snoozed_until in memory"
         );
-        let disk_row = Storage::new("test")
+        let disk_row = Storage::new_unwatched("test")
             .unwrap()
             .load()
             .unwrap()
@@ -9476,6 +10913,7 @@ mod right_click_context_menu {
     //! `d`. Click-outside dismisses the menu.
 
     use super::*;
+    use crate::session::config::SortOrder;
     use crate::session::Item;
     use crate::tui::dialogs::ContextMenuAction;
     use ratatui::layout::Rect;
@@ -9566,7 +11004,13 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
+        // Attention sort surfaces the full session menu (Rename / Archive /
+        // Snooze / Delete), so Delete is three Downs away.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(env.view.context_menu.is_none());
@@ -9586,6 +11030,116 @@ mod right_click_context_menu {
         assert!(env.view.context_menu.is_none());
         assert!(env.view.rename_dialog.is_none());
         assert!(env.view.unified_delete_dialog.is_none());
+    }
+
+    /// Right-click a session, pick the Archive item (Rename -> Archive is one
+    /// Down), and the row gets archived through the same `z` codepath. No
+    /// follow-up dialog: archiving is immediate.
+    #[test]
+    #[serial]
+    fn right_click_archive_action_archives_session() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1);
+        let id = env.view.selected_session.clone().unwrap();
+        assert!(
+            !env.view.get_instance(&id).unwrap().is_archived(),
+            "precondition: session starts unarchived"
+        );
+
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
+        env.view.handle_key(key(KeyCode::Enter), None);
+
+        assert!(env.view.context_menu.is_none(), "menu closes after archive");
+        assert!(
+            env.view.get_instance(&id).unwrap().is_archived(),
+            "context-menu Archive must archive the session"
+        );
+    }
+
+    /// An archived row's context menu offers Unarchive, and picking it restores
+    /// the session.
+    #[test]
+    #[serial]
+    fn right_click_unarchive_action_restores_session() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        // Reveal the section and archive the first row so it stays visible.
+        env.view.archived_section_collapsed = false;
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let id = env.view.selected_session.clone().unwrap();
+        env.view.toggle_archive_at_cursor().unwrap();
+        assert!(env.view.get_instance(&id).unwrap().is_archived());
+
+        // Right-click the archived row: its menu must read "Unarchive".
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|it| matches!(it, Item::Session { id: i, .. } if i == &id))
+            .expect("archived row must be visible");
+        let row = env.view.list_inner_area.y + idx as u16;
+        assert!(env.view.handle_right_click(5, row));
+        let labels: Vec<&str> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(_, l)| *l)
+            .collect();
+        // Default sort here is Newest, where Snooze is gated out, so the
+        // archived-row menu is just Rename / Unarchive / Delete.
+        assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
+
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            !env.view.get_instance(&id).unwrap().is_archived(),
+            "context-menu Unarchive must unarchive the session"
+        );
+    }
+
+    /// The Snooze row mirrors the `'h'` keybinding, which only fires in
+    /// Attention sort. So the right-click session menu must omit Snooze in
+    /// every other sort and include it in Attention sort.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_gates_snooze_to_attention_sort() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+
+        let menu_actions = |env: &TestEnv| -> Vec<ContextMenuAction> {
+            env.view
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .items_for_test()
+                .iter()
+                .map(|(a, _)| *a)
+                .collect()
+        };
+
+        // Newest sort (the default): no Snooze row.
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        assert!(
+            !menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+            "Snooze must be hidden outside Attention sort"
+        );
+        env.view.context_menu = None;
+
+        // Attention sort: Snooze row present.
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        assert!(
+            menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+            "Snooze must appear in Attention sort"
+        );
     }
 
     #[test]
@@ -9885,7 +11439,7 @@ mod apply_session_id_updates {
 
     fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
         use crate::session::config::GroupByMode;
-        let storage = Storage::new(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         storage
             .update(|i, g| {
                 *i = vec![inst.clone()];
@@ -9894,7 +11448,12 @@ mod apply_session_id_updates {
             })
             .unwrap();
         let tools = AvailableTools::with_tools(&["claude"]);
-        let mut view = HomeView::new(Some(profile.to_string()), tools).unwrap();
+        let mut view = HomeView::new(
+            Some(profile.to_string()),
+            tools,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
         view.group_by = GroupByMode::Manual;
         view.flat_items = view.build_flat_items();
         view.update_selected();
@@ -10014,7 +11573,7 @@ mod apply_session_id_updates {
         inst.agent_session_id = Some(peer_sid.to_string());
         let mut view = build_view_with_inst(profile, &inst);
 
-        let storage = Storage::new(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         storage
             .update(|i, _g| {
                 i[0].agent_session_id = Some(other_peer.to_string());
@@ -10120,6 +11679,107 @@ mod apply_session_id_updates {
         assert!(
             captured_env(&expected_name).is_none(),
             "no tmux session means no publish target"
+        );
+    }
+
+    /// Discarding unsaved Settings changes via a mouse click on the
+    /// confirmation dialog's [Yes] button must revert a live theme preview,
+    /// exactly like the keyboard discard path. Regression for the
+    /// empire -> rose-pine flip where the click path closed Settings but
+    /// never dispatched `SetTheme`, leaving the previewed theme applied until
+    /// the next restart.
+    #[test]
+    #[serial]
+    fn settings_mouse_discard_reverts_theme_preview() {
+        use crate::tui::dialogs::ConfirmDialog;
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut env = create_test_env_empty();
+        let view = &mut env.view;
+        view.open_settings();
+        assert!(view.settings_view.is_some(), "settings view should open");
+
+        // Stand in the state reached after the user previewed a theme (so the
+        // view has unsaved changes) and pressed Esc to close: the unsaved-
+        // changes confirm dialog floats over the settings takeover.
+        view.settings_close_confirm = true;
+        view.confirm_dialog = Some(ConfirmDialog::new(
+            "Unsaved Changes",
+            "You have unsaved changes. Discard them?",
+            "discard_settings",
+        ));
+
+        // Render once so the dialog's [Yes] button hit-rect is populated at the
+        // exact coordinates it draws.
+        let theme = load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+
+        let yes = view
+            .confirm_dialog
+            .as_ref()
+            .unwrap()
+            .yes_button_area_for_test();
+        assert!(yes.width > 0, "render should populate the [Yes] hit-rect");
+
+        // Click the center of [Yes] to discard.
+        view.handle_dialog_click(yes.x + yes.width / 2, yes.y + yes.height / 2);
+
+        // The click path must queue the same theme revert the keyboard path
+        // returns. Before the fix this was `None` and the previewed theme stuck.
+        assert!(
+            matches!(view.pending_dialog_click_action, Some(Action::SetTheme(_))),
+            "mouse discard should queue a SetTheme revert, got {:?}",
+            view.pending_dialog_click_action
+        );
+        assert!(view.settings_view.is_none(), "settings should be closed");
+        assert!(!view.settings_close_confirm, "confirm flag should reset");
+    }
+}
+
+/// Live-send must boot a cold/dead agent pane at the visible preview size so it
+/// does not start at tmux's 80x24 default and then depend on a single,
+/// race-prone post-boot `resize-window` SIGWINCH to grow into the live area.
+/// Regression guard for the "live mode opens at ~50% width" race: if this seed
+/// regresses back to `None`/default, the agent boots narrow again.
+mod live_send_boot_size_tests {
+    use super::create_test_env_empty;
+    use ratatui::layout::Rect;
+
+    #[test]
+    #[serial_test::serial]
+    fn boots_agent_at_visible_preview_size() {
+        let mut env = create_test_env_empty();
+        // The rect `finalize_live_send_resize` would resize the pane to.
+        env.view.preview_pane_area = Rect::new(35, 1, 123, 38);
+
+        assert_eq!(
+            env.view.live_send_boot_size(),
+            Some((123, 38)),
+            "cold agent must boot at the preview pane's visible size, not tmux's 80x24 default"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn never_seeds_a_zero_sized_pane() {
+        let mut env = create_test_env_empty();
+        // No preview has been drawn yet (attach-on-create style entry): the
+        // cached rect is empty. The seed must fall back, never hand tmux a
+        // degenerate 0x0 boot size.
+        env.view.preview_pane_area = Rect::default();
+
+        let seed = env.view.live_send_boot_size();
+        assert!(
+            !matches!(seed, Some((0, _)) | Some((_, 0))),
+            "empty preview rect must fall back, not seed a 0-dimension size; got {seed:?}"
         );
     }
 }

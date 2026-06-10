@@ -9,6 +9,7 @@ pub mod acp_reconciler;
 pub mod acp_ws;
 pub mod api;
 pub mod auth;
+pub mod live_ws;
 pub mod login;
 pub mod push;
 pub mod push_send;
@@ -39,6 +40,7 @@ const ACP_CHANNEL_CAPACITY: usize = 256;
 #[cfg(feature = "serve")]
 pub use crate::acp::protocol::AcpBroadcastFrame;
 
+use crate::file_watch::{FileMatcher, FileWatchService, SubscriptionHandle, WatchSpec};
 use crate::session::Instance;
 use crate::session::Status;
 use crate::session::Storage;
@@ -48,8 +50,6 @@ use self::rate_limit::RateLimiter;
 #[derive(Embed)]
 #[folder = "web/dist/"]
 struct StaticAssets;
-
-// ── TokenManager ────────────────────────────────────────────────────────────
 
 struct TokenState {
     current: Option<String>,
@@ -211,8 +211,6 @@ fn test_token_grace_override() -> Option<Duration> {
     None
 }
 
-// ── AppState ────────────────────────────────────────────────────────────────
-
 /// Per-profile cleanup defaults with a refresh timestamp. Re-resolved from
 /// disk after `CLEANUP_DEFAULTS_TTL`.
 pub struct CleanupDefaultsCache {
@@ -226,6 +224,52 @@ impl CleanupDefaultsCache {
     pub fn stale(&self) -> bool {
         self.refreshed_at.elapsed() >= CLEANUP_DEFAULTS_TTL
     }
+}
+
+/// A cached branch-diff scan (`compute_changed_files`) with its refresh
+/// timestamp. The scan is the heavy part of every diff request, and both the
+/// file-list endpoint and the per-file endpoint need the identical result, so
+/// rapidly clicking through the sidebar would otherwise re-scan the whole tree
+/// per file. The TTL is short because the working tree changes as the agent
+/// edits; it only dedupes bursts of requests, and `compute_file_contents`
+/// always reads the live working tree, so file contents are never served stale.
+struct ChangedFilesEntry {
+    refreshed_at: std::time::Instant,
+    files: Vec<crate::git::diff::DiffFile>,
+}
+
+pub const CHANGED_FILES_TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Per-profile entry tracking a live `FileWatchService` subscription and the
+/// `tokio::spawn`ed forwarder that drains its receiver into
+/// `AppState::disk_changed`. Stored under `AppState::disk_watch_handles`.
+///
+/// Teardown drops `SubscriptionHandle` first so the dispatcher
+/// deregisters this id and no further events are queued, then aborts
+/// `forwarder`. Aborting first would race a buffered `try_send`
+/// already in flight before the deregister.
+pub(crate) struct DiskWatchEntry {
+    /// RAII guard from `subscribe_channel`. Drop unsubscribes and unwatches
+    /// the directory if its refcount drops to zero.
+    handle: SubscriptionHandle,
+    /// Abort handle for the forwarder task that drains the per-profile
+    /// receiver into `disk_changed`.
+    forwarder: tokio::task::AbortHandle,
+}
+
+/// Whether the caller has applied tmux scrape (and suppression) to
+/// `fresh.status`. `status_poll_loop` passes `TmuxApplied`; the watcher
+/// consumer passes `DiskOnly`.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum StatusSource {
+    /// Caller already scraped tmux into `fresh.status` and applied
+    /// `recently_restarted` suppression. The helper trusts `fresh.status`
+    /// for existing ids.
+    TmuxApplied,
+    /// `fresh` was loaded from disk only. Prior in-memory `status` and
+    /// `idle_entered_at` win for existing ids; new ids surface with disk
+    /// values.
+    DiskOnly,
 }
 
 /// Shared application state accessible by all request handlers.
@@ -260,6 +304,13 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
+    /// Ids whose startup-recovery cascade is scheduled but not yet complete.
+    /// Phase A seeds it; each Phase B worker drains its id on completion. The
+    /// background refresher walks it to keep queued candidates' marks in
+    /// `recently_restarted` fresh past `RECENTLY_RESTARTED_TTL`, closing the
+    /// race where a candidate waiting on a `STARTUP_RECOVERY_CONCURRENCY`
+    /// permit ages out of suppression and trips a phantom `Status::Error`.
+    pub recovery_pending: crate::session::recovery::RecoveryPending,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -267,6 +318,11 @@ pub struct AppState {
     /// Cached remote owner per repo path. Remote owners don't change, so
     /// entries live for the lifetime of the process.
     pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// Short-TTL cache of `compute_changed_files` keyed by `(repo_path,
+    /// base_branch)`, shared by the file-list and per-file diff endpoints so a
+    /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.
+    changed_files_cache:
+        std::sync::RwLock<std::collections::HashMap<(String, String), ChangedFilesEntry>>,
     /// Broadcasts session status transitions to consumers (currently the
     /// push-notification module). Emitted from `status_poll_loop` after
     /// each tmux scrape when `old != new`. Keep the Sender around even
@@ -363,9 +419,61 @@ pub struct AppState {
     /// graceful drain open until the browser tab decides to disconnect.
     /// See #1198.
     pub shutdown: CancellationToken,
+    /// Process-wide file-watch primitive. Threaded into `Storage::new` so
+    /// in-process writes surface immediately via `notify_local_change`,
+    /// and used to register per-profile `subscribe_channel` watches that
+    /// fan into `disk_changed`.
+    pub(crate) file_watch: Arc<FileWatchService>,
+    /// Wakeup signal for `disk_watcher_consumer`. Per-profile forwarder
+    /// tasks call `notify_one()` on every received `FileEvent`; the
+    /// consumer task awaits `notified()` and reloads `state.instances`.
+    /// `notify_waiters` is intentionally NOT used: the consumer does a
+    /// single-receiver wait and we want at-least-once wake semantics.
+    pub(crate) disk_changed: Arc<tokio::sync::Notify>,
+    /// Per-profile disk-watch subscriptions plus their forwarder tasks.
+    /// Keyed by profile name. Mutated by `init_disk_watch_subscriptions`
+    /// at startup and by the profile create / delete REST handlers.
+    pub(crate) disk_watch_handles:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, DiskWatchEntry>>>,
 }
 
 impl AppState {
+    /// Read-through cache over `compute_changed_files`. Returns a fresh scan
+    /// when the cached entry is missing or older than `CHANGED_FILES_TTL`;
+    /// errors are never cached. Safe to call from `spawn_blocking` (the lock is
+    /// a `std::sync::RwLock`, held only across the map lookup/insert).
+    pub fn changed_files_cached(
+        &self,
+        repo_path: &std::path::Path,
+        base_branch: &str,
+    ) -> crate::git::error::Result<Vec<crate::git::diff::DiffFile>> {
+        let key = (
+            repo_path.to_string_lossy().into_owned(),
+            base_branch.to_string(),
+        );
+        if let Ok(cache) = self.changed_files_cache.read() {
+            if let Some(entry) = cache.get(&key) {
+                if entry.refreshed_at.elapsed() < CHANGED_FILES_TTL {
+                    return Ok(entry.files.clone());
+                }
+            }
+        }
+        let files = crate::git::diff::compute_changed_files(repo_path, base_branch)?;
+        if let Ok(mut cache) = self.changed_files_cache.write() {
+            // Drop expired entries while we hold the write lock so the map can't
+            // grow without bound across stale (repo, base) combinations.
+            cache.retain(|_, e| e.refreshed_at.elapsed() < CHANGED_FILES_TTL);
+            cache.insert(
+                key,
+                ChangedFilesEntry {
+                    refreshed_at: std::time::Instant::now(),
+                    files: files.clone(),
+                },
+            );
+        }
+        Ok(files)
+    }
+
     /// Get or create the per-instance serialization mutex. The outer
     /// `RwLock` is only held long enough to insert/lookup the `Arc<Mutex>`;
     /// the caller awaits the inner mutex without holding the map lock.
@@ -408,8 +516,6 @@ fn epoch_millis() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
-
-// ── Server ──────────────────────────────────────────────────────────────────
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
 /// terminals at once. macOS's default soft cap of 256 is exhausted
@@ -503,7 +609,20 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     raise_fd_limit();
 
-    let instances = load_all_instances()?;
+    // Single live `FileWatchService` per daemon. Threaded into AppState
+    // and into every `Storage::new` call so in-process writes surface via
+    // `notify_local_change` and per-profile subscriptions multiplex
+    // through one kernel watcher.
+    let file_watch = FileWatchService::new().unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "server.file_watch",
+            error = %e,
+            "FileWatchService::new failed; falling back to noop"
+        );
+        FileWatchService::noop()
+    });
+
+    let instances = load_all_instances(&file_watch)?;
 
     // Load or generate auth token
     let auth_token = if no_auth {
@@ -837,6 +956,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         serve_mode,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
+        recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -844,6 +964,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             entries: std::collections::HashMap::new(),
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
+        changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
         session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
@@ -864,6 +985,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
+        file_watch: Arc::clone(&file_watch),
+        disk_changed: Arc::new(tokio::sync::Notify::new()),
+        disk_watch_handles: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     let app = build_router(state.clone());
@@ -924,6 +1048,42 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     }
 
     if let Some((lock, candidates)) = recovery_inputs {
+        // Background mark-refresher (#1264). Re-stamps every still-pending
+        // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
+        // so a candidate queued past the TTL behind a
+        // STARTUP_RECOVERY_CONCURRENCY permit does not age out of suppression
+        // and trip a phantom Status::Error in status_poll_loop. Exits once the
+        // pending set drains (every worker finished) or on shutdown.
+        {
+            let pending = state.recovery_pending.clone();
+            let recently = state.recently_restarted.clone();
+            let shutdown = state.shutdown.clone();
+            crate::task_util::spawn_supervised(
+                "server.startup_recovery_refresher",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    let mut interval =
+                        tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // First tick fires immediately; skip past it so we don't
+                    // redundantly re-stamp the marks Phase A just wrote.
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if !crate::session::recovery::refresh_recovery_pending(
+                                    &pending, &recently,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ = shutdown.cancelled() => break,
+                        }
+                    }
+                },
+            );
+        }
+
         let cascade_state = state.clone();
         crate::task_util::spawn_supervised(
             "server.startup_recovery_cascade",
@@ -943,6 +1103,23 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             status_poll_loop(poll_state).await;
         },
     );
+
+    // File-watch wire-up: register the initial per-profile subscriptions
+    // BEFORE the server starts serving requests so cold-start writes do not
+    // rely solely on the 2s polling fallback. Per-profile subscribe errors
+    // are still logged and skipped; polling stays canonical when a watch
+    // cannot be installed.
+    init_disk_watch_subscriptions(state.clone()).await;
+    {
+        let consumer_state = state.clone();
+        crate::task_util::spawn_supervised(
+            "server.disk_watcher_consumer",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                disk_watcher_consumer(consumer_state).await;
+            },
+        );
+    }
 
     // Acp broadcast listener: a single subscriber that handles
     // every in-process consumer of acp events. Status mirroring
@@ -1174,6 +1351,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
+        // Unified MCP management surface (#1996)
+        .route("/api/mcp/servers", get(api::get_mcp_servers))
+        .route(
+            "/api/mcp/servers/{name}/resolve",
+            post(api::resolve_mcp_conflict),
+        )
+        .route("/api/mcp/servers/{name}/keep", post(api::keep_mcp_server))
+        .route("/api/mcp/servers/{name}/drop", post(api::drop_mcp_server))
         .route(
             "/api/sessions/{id}",
             patch(api::rename_session).delete(api::delete_session),
@@ -1251,9 +1436,20 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
         )
+        .route(
+            "/api/app-state/volume-ignores-globs-acknowledged",
+            post(api::mark_volume_ignores_globs_acknowledged),
+        )
+        .route(
+            "/api/sandbox/volume-ignores-preview",
+            get(api::preview_volume_ignores_globs),
+        )
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))
+        // Dedicated, non-elevated global-theme write: a cosmetic theme change
+        // must not trip the passphrase wall on `PATCH /api/settings`.
+        .route("/api/theme", patch(api::update_theme))
         .route("/api/sounds", get(api::list_sounds))
         .route("/api/sounds/file/{name}", get(api::serve_sound_file))
         // Push notifications
@@ -1300,6 +1496,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // Terminal WebSockets
         .route("/sessions/{id}/ws", get(ws::terminal_ws))
+        .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))
+        .route(
+            "/sessions/{id}/terminal/live-ws",
+            get(live_ws::live_paired_terminal_ws),
+        )
+        .route(
+            "/sessions/{id}/container-terminal/live-ws",
+            get(live_ws::live_container_terminal_ws),
+        )
         .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
         .route(
             "/sessions/{id}/container-terminal/ws",
@@ -1477,34 +1682,35 @@ async fn security_headers(
     response
 }
 
-async fn serve_index(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-
+async fn serve_index(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> impl axum::response::IntoResponse {
     let path = uri.path().trim_start_matches('/');
-    if !path.is_empty() && path != "index.html" && path.contains('.') {
-        if let Some(file) = StaticAssets::get(path) {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            return (
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, mime.as_ref().to_string())],
-                file.data.to_vec(),
-            )
-                .into_response();
-        }
+    if !path.is_empty()
+        && path != "index.html"
+        && path.contains('.')
+        && StaticAssets::get(path).is_some()
+    {
+        return serve_embedded_file(path, &headers);
     }
-    serve_embedded_file("index.html")
+    serve_embedded_file("index.html", &headers)
 }
 
 async fn serve_asset(
     axum::extract::Path(path): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
-    serve_embedded_file(&format!("assets/{}", path))
+    serve_embedded_file(&format!("assets/{}", path), &headers)
 }
 
-async fn serve_public_file(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
+async fn serve_public_file(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> impl axum::response::IntoResponse {
     // Strip leading slash to match rust-embed paths
     let path = uri.path().trim_start_matches('/');
-    serve_embedded_file(path)
+    serve_embedded_file(path, &headers)
 }
 
 /// Best-effort launch of `url` in the user's default browser. Suppressed
@@ -1530,22 +1736,123 @@ fn maybe_open_browser(url: &str) {
     }
 }
 
-fn serve_embedded_file(path: &str) -> axum::response::Response {
+/// The content-hashed entry bundle filename (`index-<hash>.js`) baked
+/// into the embedded `index.html`. This is the dashboard's build
+/// identity: the client compares its own entry script's filename
+/// against this value (via `GET /api/about`) and offers a reload when
+/// they differ. Installed PWAs (especially iOS) resume a long-lived
+/// page with no refresh affordance, so without this prompt a phone can
+/// keep running a stale dashboard for weeks after the binary updates.
+pub fn web_build_id() -> Option<&'static str> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let index = StaticAssets::get("index.html")?;
+        let html = std::str::from_utf8(index.data.as_ref()).ok()?;
+        extract_web_build_id(html)
+    })
+    .as_deref()
+}
+
+/// Pull `index-<hash>.js` out of the built index.html. Vite names the
+/// entry chunk `assets/index-<hash>.js`; lazy chunks get their own
+/// names, so the first match is the entry.
+fn extract_web_build_id(html: &str) -> Option<String> {
+    let start = html.find("assets/index-")?;
+    let name = &html[start + "assets/".len()..];
+    let end = name.find(".js")?;
+    Some(format!("{}.js", &name[..end]))
+}
+
+fn serve_embedded_file(
+    path: &str,
+    request_headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
     use axum::http::{header, StatusCode};
     use axum::response::IntoResponse;
 
     match StaticAssets::get(path) {
         Some(file) => {
+            // Strong ETag from rust-embed's content hash, so `no-cache`
+            // revalidation costs a 304 instead of a re-download.
+            let etag = {
+                let hash = file.metadata.sha256_hash();
+                let mut s = String::with_capacity(hash.len() * 2 + 2);
+                s.push('"');
+                for b in hash {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{:02x}", b);
+                }
+                s.push('"');
+                s
+            };
+            if request_headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|inm| {
+                    inm.split(',')
+                        .any(|t| t.trim().trim_start_matches("W/") == etag)
+                })
+            {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::ETAG, etag),
+                        (header::CACHE_CONTROL, cache_control_for(path).to_string()),
+                    ],
+                )
+                    .into_response();
+            }
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+                [
+                    (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, cache_control_for(path).to_string()),
+                ],
                 file.data.to_vec(),
             )
                 .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
+}
+
+/// Cache policy for embedded dashboard files. Vite content-hashes
+/// everything under `assets/`, so those are immutable; everything else
+/// (index.html, sw.js, manifest, icons, fonts) must revalidate on every
+/// load or an installed PWA keeps booting a stale shell long after the
+/// binary shipped new assets. Revalidation is cheap: the ETag above
+/// turns it into a 304.
+fn cache_control_for(path: &str) -> &'static str {
+    if is_content_hashed_asset(path) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// True for `assets/<name>-<hash>.<ext>` where `<hash>` is a Rollup
+/// content hash: 8 chars (the default length) of the base64url
+/// alphabet, immediately preceded by `-`. The `assets/` prefix alone is
+/// not enough: should a non-hashed file ever land there through a Vite
+/// config change, a year of `immutable` would pin clients to it.
+/// Misclassifying a hashed file the other way is harmless; it just
+/// revalidates via ETag like everything else.
+fn is_content_hashed_asset(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("assets/") else {
+        return false;
+    };
+    let Some((stem, _ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    if bytes.len() < 9 || bytes[bytes.len() - 9] != b'-' {
+        return false;
+    }
+    bytes[bytes.len() - 8..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 /// Kind tag for a local IPv4 address. Ordering in this enum is also the
@@ -1678,16 +1985,35 @@ async fn load_or_generate_token() -> anyhow::Result<String> {
 }
 
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
-fn load_all_instances() -> anyhow::Result<Vec<Instance>> {
-    let profiles = crate::session::list_profiles().unwrap_or_default();
+fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<Instance>> {
+    let profiles = match crate::session::list_profiles() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                error = %e,
+                "list_profiles failed; load_all_instances returning empty set"
+            );
+            return Ok(Vec::new());
+        }
+    };
     let mut all = Vec::new();
     for profile in &profiles {
-        if let Ok(storage) = Storage::new(profile) {
-            if let Ok(mut instances) = storage.load() {
+        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
+            Ok(mut instances) => {
                 for inst in &mut instances {
                     inst.source_profile = profile.clone();
                 }
                 all.extend(instances);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    profile = %profile,
+                    error = %e,
+                    "load_all_instances skipped profile; sessions for this profile will be \
+                     absent from state until next successful reload"
+                );
             }
         }
     }
@@ -1703,10 +2029,440 @@ fn load_all_instances() -> anyhow::Result<Vec<Instance>> {
 fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
-    fresh.last_error = prior.last_error;
+    // Only preserve `last_error` while the session is still in Error. A healthy
+    // `fresh` clears it in `update_status_with_metadata_inner`; carrying the
+    // prior string over unconditionally would re-stick a stale error on a now-green
+    // session every poll tick when a healthy transition happened through a path that
+    // did not explicitly null `last_error` in-memory (issue #1271).
+    if fresh.status == Status::Error {
+        fresh.last_error = prior.last_error;
+    }
     fresh.session_id_poller = prior.session_id_poller;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh
+}
+
+// INVARIANTS for `reload_state_instances_from_disk` (do not break without
+// revisiting `tests/serve_disk_reload_helper_equivalence.rs`):
+// 1. Both call sites (`status_poll_loop` and `disk_watcher_consumer`) must
+//    invoke this helper. They differ in cadence, in what they do BEFORE
+//    calling it (tmux scrape lives only in `status_poll_loop`), and in
+//    the StatusSource they pass.
+// 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
+//    five #[serde(skip)] runtime fields (`last_error_check`,
+//    `last_start_time`, `last_error`, `session_id_poller`,
+//    `retroactive_capture_excludes`) that disk reload zeroes by design.
+// 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
+//    or `idle_entered_at`. Those three are handled per StatusSource:
+//    DiskOnly takes prior.status and `prior.idle_entered_at.or(fresh.idle_entered_at)`,
+//    TmuxApplied takes fresh's. `last_accessed_at` is monotonic-max
+//    regardless.
+// 4. The acp overlay filter is `inst.is_structured()`, never the lazy
+//    ACP session id. The latter is set lazily by the ACP handshake
+//    and is None for newly-spawned acp sessions; using it as the
+//    filter would silently drop overlay coverage for pre-handshake
+//    rows.
+// 5. `prior_by_id` is built with `.drain(..)` once, then read with
+//    `.get()` rather than `.remove()` in the merge loop, so the same map is
+//    still populated when `apply_acp_overlay_inplace` runs.
+// 6. Polling is canonical. The watcher path
+//    adds latency reduction; correctness still holds when it fails.
+// 7. `status_poll_loop` and `disk_watcher_consumer` may interleave
+//    per-tick; both serialise on `state.instances.write().await`. A
+//    DiskOnly merge between a TmuxApplied write and a subsequent tmux
+//    scrape can briefly carry the prior status; it self-corrects on
+//    the next 2s tick. Polling is canonical (invariant 6) so this is
+//    acceptable.
+
+/// Reload `state.instances` by merging caller-supplied `fresh` against the
+/// prior in-memory snapshot per id, then reapplying the acp overlay.
+/// The caller is responsible for the disk read and, on the
+/// `TmuxApplied` path only, for emitting `state.status_tx`
+/// diffs BEFORE invoking the helper.
+/// Snapshot of the prior in-memory `state.instances` keyed by id, used
+/// for per-id merging in `reload_state_instances_from_disk` and the
+/// acp-overlay pass. Intentionally exposes only `drain_from` and `get`;
+/// no `remove` method, because invariant 5 of the merge contract
+/// requires the same map to be populated when
+/// `apply_acp_overlay_inplace` runs after the merge loop. The compiler
+/// rejects any future `.remove()` call instead of relying on prose.
+struct PriorById(std::collections::HashMap<String, Instance>);
+
+impl PriorById {
+    fn drain_from(current: &mut Vec<Instance>) -> Self {
+        Self(
+            current
+                .drain(..)
+                .map(|inst| (inst.id.clone(), inst))
+                .collect(),
+        )
+    }
+
+    fn get(&self, id: &str) -> Option<&Instance> {
+        self.0.get(id)
+    }
+}
+
+#[doc(hidden)]
+pub(crate) async fn reload_state_instances_from_disk(
+    state: &Arc<AppState>,
+    fresh: Vec<Instance>,
+    status_source: StatusSource,
+) {
+    // Snapshot suppression here so a worker that unmarks between the
+    // caller's input build and the per-id decision cannot combine a
+    // cleared mark with a stale row to re-emit the phantom Error
+    // transition the suppression exists to prevent. Idempotent on the
+    // poll path, where the caller already applied the same override
+    // inside `spawn_blocking`.
+    let suppressed_ids =
+        crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+
+    let mut current = state.instances.write().await;
+    let prior_by_id = PriorById::drain_from(&mut current);
+
+    let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
+    for mut row in fresh {
+        if let Some(prior) = prior_by_id.get(&row.id).cloned() {
+            let prior_status = prior.status;
+            let prior_last_accessed = prior.last_accessed_at;
+            let prior_idle_entered = prior.idle_entered_at;
+            row = merge_runtime_fields(prior, row);
+            match status_source {
+                StatusSource::DiskOnly => {
+                    row.status = prior_status;
+                    row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
+                }
+                StatusSource::TmuxApplied => {
+                    // Caller already applied tmux scrape to fresh.status;
+                    // that is the authoritative value. idle_entered_at is
+                    // recomputed by upstream status-transition logic;
+                    // trust fresh.
+                }
+            }
+            row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
+        }
+        if suppressed_ids.contains(&row.id) {
+            row.status = Status::Starting;
+        }
+        merged.push(row);
+    }
+
+    #[cfg(feature = "serve")]
+    apply_acp_overlay_inplace(&prior_by_id, &mut merged);
+
+    *current = merged;
+}
+
+/// Apply the acp status / timestamps overlay to `merged`, sourcing
+/// values from `prior_by_id`. The merge loop above uses `.get()` (NOT
+/// `.remove()`), so this lookup still finds entries here. Filter is
+/// `inst.is_structured()` per the invariant above; filtering on
+/// the lazy session id would silently drop overlay coverage for
+/// pre-handshake rows.
+#[cfg(feature = "serve")]
+fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
+    for inst in merged.iter_mut() {
+        if !inst.is_structured() {
+            continue;
+        }
+        let Some(prior) = prior_by_id.get(&inst.id) else {
+            continue;
+        };
+        inst.status = prior.status;
+        inst.last_accessed_at = prior.last_accessed_at;
+        inst.idle_entered_at = prior.idle_entered_at;
+    }
+}
+
+/// Build a per-profile disk-watch entry: register a `subscribe_channel`
+/// against `<profile_dir>/{sessions,groups}.json` and spawn a forwarder
+/// task that drains the receiver into `state.disk_changed`. Returns
+/// `None` when the profile dir cannot be resolved or `subscribe_channel`
+/// fails; both cases are logged. Polling stays canonical, so a `None`
+/// here degrades propagation to the 2s tick rather than failing closed.
+async fn build_disk_watch_entry(state: &Arc<AppState>, profile: &str) -> Option<DiskWatchEntry> {
+    let profile_dir = match crate::session::get_profile_dir_path(profile) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                profile = %profile,
+                error = %e,
+                "could not resolve profile dir; live propagation disabled"
+            );
+            return None;
+        }
+    };
+    let sessions_path = profile_dir.join("sessions.json");
+    let groups_path = profile_dir.join("groups.json");
+    let spec = WatchSpec {
+        dir: profile_dir,
+        matcher: FileMatcher::AnyOf(vec![sessions_path, groups_path]),
+        debounce: Some(std::time::Duration::from_millis(75)),
+    };
+    let (mut rx, handle) = match state.file_watch.subscribe_channel(spec, 16) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                profile = %profile,
+                error = %e,
+                "subscribe_channel failed; live propagation disabled for this profile"
+            );
+            return None;
+        }
+    };
+    let signal = state.disk_changed.clone();
+    let profile = profile.to_owned();
+    let shutdown = state.shutdown.clone();
+    let join = crate::task_util::spawn_supervised(
+        "server.disk_watch.forwarder",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    ev = rx.recv() => match ev {
+                        Some(_) => signal.notify_one(),
+                        None => break,
+                    }
+                }
+            }
+            tracing::debug!(
+                target: "server.file_watch",
+                profile = %profile,
+                "disk-watch forwarder exit"
+            );
+        },
+    );
+    // Test-only barrier: when armed, signals `entered` after the
+    // subscription is built and parks on `release`. The enclosing
+    // `add_profile_disk_watch` / `rename_profile_disk_watch` hold `disk_watch_handles` through the
+    // build, so a task parked here also holds that lock; this lets a
+    // controlled-ordering test drive a concurrent same-profile remove
+    // against a known mid-build state.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let armed = disk_watch_build_barrier().lock().unwrap().clone();
+        if let Some(barrier) = armed {
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+        }
+    }
+    Some(DiskWatchEntry {
+        handle,
+        forwarder: join.abort_handle(),
+    })
+}
+
+/// Test-only barrier installed inside `build_disk_watch_entry` to
+/// deterministically pin a building task at a known point so a
+/// concurrent same-profile remove can run against it. Not compiled
+/// into production builds.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct DiskWatchBuildBarrier {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) armed: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn disk_watch_build_barrier(
+) -> &'static std::sync::Mutex<Option<Arc<DiskWatchBuildBarrier>>> {
+    static BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<DiskWatchBuildBarrier>>>> =
+        std::sync::OnceLock::new();
+    BARRIER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// RAII guard for the test barrier slot: installs on construction and
+/// clears unconditionally on drop, so a panicking test cannot leave
+/// the slot armed for subsequent tests in the same process.
+#[cfg(test)]
+pub(crate) struct DiskWatchBuildBarrierGuard;
+
+#[cfg(test)]
+impl DiskWatchBuildBarrierGuard {
+    pub(crate) fn install(barrier: Arc<DiskWatchBuildBarrier>) -> Self {
+        *disk_watch_build_barrier().lock().unwrap() = Some(barrier);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for DiskWatchBuildBarrierGuard {
+    fn drop(&mut self) {
+        *disk_watch_build_barrier().lock().unwrap() = None;
+    }
+}
+
+/// Drop the subscription handle FIRST so the dispatcher stops queuing
+/// events on this id, then abort the forwarder; aborting first would
+/// race a buffered `try_send`. Centralized so every teardown path keeps
+/// the same canonical order.
+fn drop_disk_watch_entry(entry: DiskWatchEntry) {
+    let DiskWatchEntry { handle, forwarder } = entry;
+    drop(handle);
+    forwarder.abort();
+}
+
+/// Install a disk-watch subscription for `profile` under one critical
+/// section. If a prior entry exists for the same name, it is replaced
+/// (drop handle, abort forwarder, then install the new entry).
+///
+/// Holding `disk_watch_handles` across `build_disk_watch_entry` is the
+/// linearisation point: a concurrent `remove_profile_disk_watch` for
+/// the same name cannot interleave between "subscription created" and
+/// "entry installed" and silently leave a stale watcher behind for a
+/// profile that was just removed.
+pub(crate) async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
+    let mut handles = state.disk_watch_handles.lock().await;
+    let Some(entry) = build_disk_watch_entry(state, profile).await else {
+        return;
+    };
+    if let Some(prior) = handles.remove(profile) {
+        drop_disk_watch_entry(prior);
+    }
+    handles.insert(profile.to_owned(), entry);
+    tracing::debug!(
+        target: "server.file_watch",
+        profile = %profile,
+        op = "add",
+        "disk-watch subscription registered"
+    );
+}
+
+/// Remove the disk-watch subscription for `profile` (no-op if absent).
+pub(crate) async fn remove_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
+    let mut handles = state.disk_watch_handles.lock().await;
+    if let Some(entry) = handles.remove(profile) {
+        drop_disk_watch_entry(entry);
+        tracing::debug!(
+            target: "server.file_watch",
+            profile = %profile,
+            op = "remove",
+            "disk-watch subscription removed"
+        );
+    }
+}
+
+/// Swap the disk-watch subscription from `old` to `new` under one
+/// critical section. Concurrent same-name add/remove cannot interleave
+/// between the two halves; this is concurrent-atomic, not
+/// failure-atomic. On `build_disk_watch_entry` failure the `old` entry
+/// is still removed because the production caller (rename_profile) has
+/// already moved the on-disk directory and the old kernel watch points
+/// at a path that no longer exists.
+pub(crate) async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    let mut handles = state.disk_watch_handles.lock().await;
+    if let Some(entry) = handles.remove(old) {
+        drop_disk_watch_entry(entry);
+    }
+    let Some(entry) = build_disk_watch_entry(state, new).await else {
+        return;
+    };
+    if let Some(prior) = handles.remove(new) {
+        drop_disk_watch_entry(prior);
+    }
+    handles.insert(new.to_owned(), entry);
+    tracing::debug!(
+        target: "server.file_watch",
+        old = %old,
+        new = %new,
+        op = "rename",
+        "disk-watch subscription renamed"
+    );
+}
+
+/// Wire up disk-watch subscriptions for every currently-active profile.
+/// Called during startup before request serving begins so the initial
+/// watcher set is in place before any handler mutates storage. Per-profile
+/// `subscribe_channel` errors are logged and skipped; polling stays
+/// canonical so propagation degrades to the 2s tick rather than failing
+/// closed. Emits one bootstrap wake at the end so any write that landed
+/// while we were walking the profile list is reconciled immediately once
+/// the consumer begins awaiting `disk_changed`.
+pub(crate) async fn init_disk_watch_subscriptions(state: Arc<AppState>) {
+    init_disk_watch_subscriptions_inner(state, |_: &str| {}, false).await;
+}
+
+/// Test-only variant that runs `hook` after each profile's subscription
+/// is installed, so a test can drive disk writes between iterations to
+/// exercise the bootstrap reconciliation path.
+#[cfg(test)]
+async fn init_disk_watch_subscriptions_with_hook<F>(state: Arc<AppState>, hook: F)
+where
+    F: FnMut(&str) + Send,
+{
+    init_disk_watch_subscriptions_inner(state, hook, true).await;
+}
+
+async fn init_disk_watch_subscriptions_inner<F>(state: Arc<AppState>, mut hook: F, with_hook: bool)
+where
+    F: FnMut(&str) + Send,
+{
+    let profiles = crate::session::list_profiles().unwrap_or_default();
+    let count = profiles.len();
+    for profile in &profiles {
+        add_profile_disk_watch(&state, profile).await;
+        hook(profile);
+    }
+    state.disk_changed.notify_one();
+    let suffix = if with_hook { " (with hook)" } else { "" };
+    tracing::info!(
+        target: "server.file_watch",
+        profiles_count = count,
+        "disk-watch subscriptions initialized{suffix}",
+    );
+}
+
+/// Background task: reload `state.instances` from disk on every wake of
+/// `state.disk_changed`. Mirrors `status_poll_loop`'s lock-acquisition
+/// pattern but does NOT touch tmux or `state.status_tx`. Polling stays
+/// canonical; this task is pure latency reduction.
+async fn disk_watcher_consumer(state: Arc<AppState>) {
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = state.disk_changed.notified() => {}
+        }
+        let started = std::time::Instant::now();
+        let file_watch_for_load = state.file_watch.clone();
+        let fresh =
+            match tokio::task::spawn_blocking(move || load_all_instances(&file_watch_for_load))
+                .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "server.file_watch",
+                        error = %e,
+                        "disk reload failed"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "server.file_watch",
+                        error = %e,
+                        "spawn_blocking joined with error"
+                    );
+                    continue;
+                }
+            };
+        let count = fresh.len();
+        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        tracing::trace!(
+            target: "server.file_watch",
+            latency_us = started.elapsed().as_micros() as u64,
+            instance_count = count,
+            "disk reload completed"
+        );
+    }
 }
 
 /// Background task: emit an opt-in telemetry `usage_snapshot` immediately and
@@ -2071,36 +2827,25 @@ async fn status_poll_loop(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        // Snapshot prior statuses so we can detect transitions without
-        // holding the lock across the blocking tmux work.
         let prev: std::collections::HashMap<String, crate::session::Status> = {
             let instances = state.instances.read().await;
             instances.iter().map(|i| (i.id.clone(), i.status)).collect()
         };
 
-        // Run blocking tmux subprocess calls in a dedicated thread.
-        // Snapshot the suppression set BEFORE `batch_pane_metadata()` so
-        // a worker that unmarks between the scrape and the per-instance
-        // decision cannot combine "pane missing" metadata with a cleared
-        // mark and re-emit the phantom Error transition the suppression
-        // exists to prevent.
+        // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker
+        // that unmarks between the scrape and the per-instance decision
+        // cannot combine "pane missing" metadata with a cleared mark and
+        // re-emit the phantom Error transition the suppression exists to
+        // prevent.
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+        let file_watch_for_poll = state.file_watch.clone();
         let updated = tokio::task::spawn_blocking(move || {
-            let mut instances = load_all_instances().unwrap_or_default();
-
+            let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
-
             for inst in &mut instances {
                 if suppressed_ids.contains(&inst.id) {
-                    // Suppress the status update: a recovery cascade just
-                    // ran for this id, and `last_start_time` was lost on
-                    // the disk reload above. Surfacing `Status::Error`
-                    // ("tmux session is gone") here would broadcast a
-                    // phantom transition before the agent has finished
-                    // settling. The TTL window is sized to cover the
-                    // worst-case cascade + cold-start latency.
                     inst.status = Status::Starting;
                     continue;
                 }
@@ -2108,54 +2853,14 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
             }
-
             instances
         })
         .await;
 
-        if let Ok(mut instances) = updated {
-            // The poll loop refreshes from disk every tick, but the
-            // acp_status_listener's status writes are in-memory only
-            // (status is derived from live ACP events, not persisted
-            // per-event). Without re-applying them here the disk reload
-            // would silently revert acp sessions to whatever Status
-            // was last persisted (typically Idle from spawn) and the
-            // sidebar dot would never turn green after a prompt.
-            #[cfg(feature = "serve")]
-            {
-                type AcpStatusOverlay = std::collections::HashMap<
-                    String,
-                    (
-                        Status,
-                        Option<chrono::DateTime<chrono::Utc>>,
-                        Option<chrono::DateTime<chrono::Utc>>,
-                    ),
-                >;
-                let overlay: AcpStatusOverlay = {
-                    let state_instances = state.instances.read().await;
-                    state_instances
-                        .iter()
-                        .filter(|i| i.is_structured())
-                        .map(|i| {
-                            (
-                                i.id.clone(),
-                                (i.status, i.last_accessed_at, i.idle_entered_at),
-                            )
-                        })
-                        .collect()
-                };
-                for inst in &mut instances {
-                    if !inst.is_structured() {
-                        continue;
-                    }
-                    if let Some((status, last_accessed, idle_entered)) = overlay.get(&inst.id) {
-                        inst.status = *status;
-                        inst.last_accessed_at = *last_accessed;
-                        inst.idle_entered_at = *idle_entered;
-                    }
-                }
-            }
-
+        if let Ok(instances) = updated {
+            // Diff BEFORE the helper: status_tx must observe the raw
+            // post-suppression, post-tmux-scrape values, never the acp
+            // overlay applied by the helper.
             let now = chrono::Utc::now();
             for inst in &instances {
                 if let Some(old) = prev.get(&inst.id) {
@@ -2170,30 +2875,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     }
                 }
             }
-            // Merge by id rather than blind-replace: preserves the
-            // in-memory-only `#[serde(skip)]` runtime state on Instance
-            // (last_error, last_start_time, last_error_check,
-            // session_id_poller, retroactive_capture_excludes) that the
-            // disk reload otherwise resets to default every 2 s.
-            // Additions on disk surface here; ids absent from disk are
-            // dropped, matching the prior wholesale-replace semantics
-            // for create/delete propagation.
-            {
-                let mut current = state.instances.write().await;
-                let mut by_id: std::collections::HashMap<String, Instance> = current
-                    .drain(..)
-                    .map(|inst| (inst.id.clone(), inst))
-                    .collect();
-                let mut merged = Vec::with_capacity(instances.len());
-                for fresh in instances {
-                    if let Some(prior) = by_id.remove(&fresh.id) {
-                        merged.push(merge_runtime_fields(prior, fresh));
-                    } else {
-                        merged.push(fresh);
-                    }
-                }
-                *current = merged;
-            }
+            reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
 
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
@@ -2282,13 +2964,16 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
     ));
     for cand in candidates {
         let sem = sem.clone();
+        let file_watch = state.file_watch.clone();
         tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let claim = {
                 let cand = cand.clone();
+                let file_watch = file_watch.clone();
                 tokio::task::spawn_blocking(move || {
                     crate::session::idle_reap::claim_idle_stop(
                         &cand.profile,
+                        file_watch,
                         &cand.session_id,
                         now,
                         cand.threshold_secs,
@@ -2325,8 +3010,11 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
                     // of leaving a sticky-but-wrong `Stopped`.
                     let id = cand.session_id.clone();
                     let profile = cand.profile.clone();
+                    let file_watch_for_storage = file_watch.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(storage) = crate::session::Storage::new(&profile) {
+                        if let Ok(storage) =
+                            crate::session::Storage::new(&profile, file_watch_for_storage)
+                        {
                             let _ = storage.update(|instances, _groups| {
                                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                                     inst.status = crate::session::Status::Error;
@@ -2444,6 +3132,14 @@ async fn daemon_startup_recovery_mark(
     for inst in &candidates {
         crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &inst.id);
     }
+    // Seed the pending set so the refresher (spawned between Phase A and
+    // Phase B) keeps these marks fresh while candidates wait on a
+    // STARTUP_RECOVERY_CONCURRENCY permit. Each worker drains its own id on
+    // completion.
+    crate::session::recovery::seed_recovery_pending(
+        &state.recovery_pending,
+        candidates.iter().map(|i| i.id.clone()),
+    );
 
     tracing::info!(
         target: "session.startup_recovery",
@@ -2463,6 +3159,9 @@ async fn daemon_startup_recovery_cascade(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         crate::session::recovery::STARTUP_RECOVERY_CONCURRENCY,
     ));
+    // Captured up front for the completion sweep below; the worker loop
+    // consumes `candidates`.
+    let all_ids: Vec<String> = candidates.iter().map(|i| i.id.clone()).collect();
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for inst in candidates {
@@ -2498,7 +3197,8 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "tmux probe failed during recovery re-check; skipping cascade",
                     );
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -2521,10 +3221,12 @@ async fn daemon_startup_recovery_cascade(
                     .unwrap_or(false)
             };
             if !still_candidate {
-                // Phase A pre-marked this id; without unmarking, the
-                // status_poll_loop would suppress the real status for
-                // the full TTL even though we are not running a cascade.
-                crate::session::recovery::unmark_recently_restarted(
+                // Phase A pre-marked this id and seeded recovery_pending;
+                // without draining, the refresher would keep re-stamping the
+                // mark and status_poll_loop would suppress the real status
+                // even though we are not running a cascade.
+                crate::session::recovery::drain_recovery_pending(
+                    &inst_state.recovery_pending,
                     &inst_state.recently_restarted,
                     &id,
                 );
@@ -2583,7 +3285,8 @@ async fn daemon_startup_recovery_cascade(
                     // reload; once the cascade has finished the on-disk
                     // status is current and the poll path resolves to the
                     // correct status without help.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -2626,7 +3329,8 @@ async fn daemon_startup_recovery_cascade(
                     // Release the suppression so the next poll respects the
                     // Error state instead of forcing Status::Starting for
                     // the rest of the TTL window.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -2650,7 +3354,8 @@ async fn daemon_startup_recovery_cascade(
                     // Same suppression release as above: without unmarking,
                     // the next poll forces Status::Starting and wipes the
                     // panic-specific last_error written above.
-                    crate::session::recovery::unmark_recently_restarted(
+                    crate::session::recovery::drain_recovery_pending(
+                        &inst_state.recovery_pending,
                         &inst_state.recently_restarted,
                         &id,
                     );
@@ -2660,6 +3365,21 @@ async fn daemon_startup_recovery_cascade(
     }
 
     while tasks.join_next().await.is_some() {}
+
+    // Completion sweep: every worker drains its own id on each exit arm
+    // (including the spawn_blocking panic arm), but a panic in a worker's
+    // async body *outside* that match would skip its drain and leave the id
+    // pending, so the refresher would re-stamp it until daemon shutdown. By
+    // the time the JoinSet is fully drained every worker has terminated, so
+    // sweeping all ids guarantees `recovery_pending` is empty and the
+    // refresher exits on its next tick. Idempotent for ids already drained.
+    for id in &all_ids {
+        crate::session::recovery::drain_recovery_pending(
+            &state.recovery_pending,
+            &state.recently_restarted,
+            id,
+        );
+    }
     drop(lock);
 }
 
@@ -2800,8 +3520,9 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let session_id_for_save = frame.session_id.clone();
             let profile_for_save = profile.clone();
             let acp_change_for_save = acp_change.clone();
+            let file_watch = state.file_watch.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let storage = crate::session::Storage::new(&profile_for_save)?;
+                let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
                 storage.update(|all, _groups| {
                     if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
                         apply_acp_session_change(
@@ -3026,9 +3747,555 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
+/// Test-only constructors that integration tests in `tests/` need to drive
+/// `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
+/// without going through the full daemon. Mirrors the pattern at
+/// `src/tmux/mod.rs`'s `test_support` module: gated on
+/// `#[cfg(any(test, feature = "test-support"))]` so the surface stays out of
+/// production builds, and `#[doc(hidden)]` so it's invisible in rustdoc.
+#[cfg(all(feature = "serve", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicI64;
+
+    /// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
+    /// fields are seeded with empty / default values; only `instances`,
+    /// `recently_restarted`, and the file-watch trio are real. Acp
+    /// fields are stubbed because the helper's acp overlay reads them.
+    pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
+        let app_dir = tempfile::tempdir().expect("tempdir");
+        let acp_db = app_dir.path().join("acp_events.db");
+        let event_store =
+            Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"));
+        let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
+        let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
+            tx: acp_events_tx.clone(),
+            event_store: event_store.clone(),
+        });
+        let supervisor =
+            std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
+        Arc::new(AppState {
+            profile: "test".to_string(),
+            read_only: false,
+            instances: RwLock::new(prior),
+            token_manager: Arc::new(TokenManager::new(None, Duration::from_secs(3600))),
+            login_manager: Arc::new(login::LoginManager::new(None)),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            behind_tunnel: false,
+            auth_mode: "none",
+            serve_mode: "local",
+            instance_locks: RwLock::new(HashMap::new()),
+            recently_restarted: crate::session::recovery::new_recently_restarted(),
+            recovery_pending: crate::session::recovery::new_recovery_pending(),
+            cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
+                refreshed_at: std::time::Instant::now(),
+                entries: HashMap::new(),
+            }),
+            changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+            remote_owner_cache: RwLock::new(HashMap::new()),
+            session_primaries: Arc::new(RwLock::new(HashMap::new())),
+            session_pause_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+            acp_events_tx,
+            acp_event_store: event_store,
+            acp_supervisor: supervisor,
+            push: None,
+            push_enabled: false,
+            web_config: crate::session::config::WebConfig::default(),
+            last_web_activity: AtomicI64::new(0),
+            telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
+            telemetry_web_clients: FormFactorCounters::default(),
+            telemetry_structured_clients: FormFactorCounters::default(),
+            telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+            telemetry_structured: StructuredTelemetryCounters::default(),
+            telemetry_last_reported: std::sync::Mutex::new(None),
+            shutdown: CancellationToken::new(),
+            file_watch: FileWatchService::noop(),
+            disk_changed: Arc::new(tokio::sync::Notify::new()),
+            disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub async fn has_disk_watch_handle(state: &Arc<AppState>, profile: &str) -> bool {
+        state.disk_watch_handles.lock().await.contains_key(profile)
+    }
+
+    pub async fn disk_watch_handle_count(state: &Arc<AppState>) -> usize {
+        state.disk_watch_handles.lock().await.len()
+    }
+
+    pub use super::api::system::{
+        create_profile, delete_profile, rename_profile, CreateProfileBody, RenameProfileBody,
+    };
+
+    pub async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
+        super::add_profile_disk_watch(state, profile).await
+    }
+
+    pub async fn remove_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
+        super::remove_profile_disk_watch(state, profile).await
+    }
+
+    pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &str) {
+        super::rename_profile_disk_watch(state, old, new).await
+    }
+
+    /// Replace the `Arc<FileWatchService>` on a unique-Arc'd `AppState`.
+    /// Tests build state with a `noop` service, then swap to live before
+    /// exercising propagation paths. Crate-internal field access is
+    /// hidden behind this helper so the field can stay `pub(crate)`.
+    pub fn replace_file_watch(state: &mut AppState, fw: Arc<crate::file_watch::FileWatchService>) {
+        state.file_watch = fw;
+    }
+
+    /// Read the current `Arc<FileWatchService>` for tests asserting on
+    /// `subscriber_count`. The Arc clone is cheap.
+    pub fn file_watch(state: &AppState) -> Arc<crate::file_watch::FileWatchService> {
+        state.file_watch.clone()
+    }
+
+    pub async fn reload_disk_only_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
+        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::DiskOnly).await
+    }
+
+    pub async fn reload_tmux_applied_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
+        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::TmuxApplied)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_web_build_id_finds_entry_bundle() {
+        let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
+<link rel="modulepreload" crossorigin href="/assets/vendor-Bx91yz.js"></head>"#;
+        assert_eq!(
+            extract_web_build_id(html).as_deref(),
+            Some("index-DKenwdW0.js")
+        );
+    }
+
+    #[test]
+    fn extract_web_build_id_none_without_entry() {
+        assert_eq!(extract_web_build_id("<html><body>hi</body></html>"), None);
+    }
+
+    #[test]
+    fn cache_control_immutable_only_for_hashed_assets() {
+        assert_eq!(
+            cache_control_for("assets/index-DKenwdW0.js"),
+            "public, max-age=31536000, immutable"
+        );
+        // Rollup hashes draw from the base64url alphabet (`_` and `-`
+        // included), and chunk base names can themselves contain `-`.
+        assert_eq!(
+            cache_control_for("assets/StructuredView-DM_xphSL.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for("assets/theme-bootstrap-Ab12Cd34.css"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control_for("index.html"), "no-cache");
+        assert_eq!(cache_control_for("sw.js"), "no-cache");
+        assert_eq!(
+            cache_control_for("fonts/GeistMono-Regular.woff2"),
+            "no-cache"
+        );
+        // Un-hashed files under assets/ must NOT be pinned for a year.
+        assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
+        assert_eq!(cache_control_for("assets/readme"), "no-cache");
+        assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
+    }
+
+    #[test]
+    fn merge_runtime_fields_preserves_last_error_while_still_in_error() {
+        // Cascade-Err preservation: prior held the error string, fresh re-derived
+        // Error from a still-dead pane without re-attaching the message. Carry it.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Error;
+        prior.last_error = Some("recovery cascade: foo".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Error;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_stale_last_error_on_healthy_transition() {
+        // Issue #1271: prior errored in-memory, the session recovered to Idle
+        // through a path that never nulled `last_error`. The fresh poll must not
+        // re-stick the stale string on a now-green session.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Error;
+        prior.last_error = Some("recovery cascade: foo".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Idle;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error, None);
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_stale_last_error_idle_to_idle() {
+        // Both ends healthy but prior still carried a stale string: don't propagate.
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.status = Status::Idle;
+        prior.last_error = Some("stale".to_string());
+
+        let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.status = Status::Idle;
+        fresh.last_error = None;
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert_eq!(merged.last_error, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_disk_watch_subscriptions_bootstraps_one_reload_after_wiring() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let storage = crate::session::Storage::new_unwatched("startup-gap").expect("storage");
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![Instance::new("seed", "/tmp/seed")];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let live = FileWatchService::new().expect("live svc");
+        let mut state_mut = Arc::try_unwrap(state)
+            .map_err(|_| ())
+            .expect("unique state");
+        state_mut.file_watch = live;
+        let state = Arc::new(state_mut);
+
+        let wake = {
+            let signal = state.disk_changed.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), signal.notified()).await
+            })
+        };
+
+        init_disk_watch_subscriptions(state.clone()).await;
+
+        let woke = wake.await.expect("join");
+        assert!(
+            woke.is_ok(),
+            "startup wiring must bootstrap one disk_changed wake after subscriptions are installed"
+        );
+        assert_eq!(
+            state.file_watch.subscriber_count(),
+            1,
+            "startup wiring must leave exactly one live subscription for the single profile"
+        );
+    }
+
+    // Concurrent same-profile rewires must converge to a single
+    // consistent map entry and matching live subscription count. The
+    // unified helper holds `disk_watch_handles` through the full
+    // teardown-then-install transition, so the lock-acquisition order
+    // alone decides which call wins; an interleaved unsubscribe and
+    // subscribe across two callers cannot leave a half-state where the
+    // map and the dispatcher disagree.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn add_remove_profile_disk_watch_serializes_concurrent_add_and_remove() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        let _ = crate::session::get_profile_dir("rewire-race").expect("profile dir");
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let live = FileWatchService::new().expect("live svc");
+        let mut state_mut = Arc::try_unwrap(state)
+            .map_err(|_| ())
+            .expect("unique state");
+        state_mut.file_watch = live;
+        let state = Arc::new(state_mut);
+
+        let mut joins = Vec::new();
+        for i in 0..50 {
+            let s = state.clone();
+            joins.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    add_profile_disk_watch(&s, "rewire-race").await;
+                } else {
+                    remove_profile_disk_watch(&s, "rewire-race").await;
+                }
+            }));
+        }
+        for j in joins {
+            j.await.expect("join");
+        }
+
+        let count = test_support::disk_watch_handle_count(&state).await;
+        assert!(
+            count <= 1,
+            "concurrent rewires must not leak duplicate entries (got {count})"
+        );
+        let live_subs = state.file_watch.subscriber_count();
+        assert_eq!(
+            live_subs, count,
+            "live subscriptions must equal map entries; mismatch indicates a leaked or orphaned entry"
+        );
+
+        add_profile_disk_watch(&state, "rewire-race").await;
+        assert_eq!(
+            test_support::disk_watch_handle_count(&state).await,
+            1,
+            "deterministic add must produce exactly one entry"
+        );
+        assert_eq!(state.file_watch.subscriber_count(), 1);
+
+        remove_profile_disk_watch(&state, "rewire-race").await;
+        assert_eq!(test_support::disk_watch_handle_count(&state).await, 0);
+        assert_eq!(state.file_watch.subscriber_count(), 0);
+    }
+
+    // Concurrent same-profile add and remove must converge to the
+    // last-completed call's intent. The barrier inside
+    // `build_disk_watch_entry` lets the test pin task A mid-build
+    // while A still holds `disk_watch_handles`, so B's remove blocks
+    // until A finishes installing. Once A releases the lock, B's
+    // remove wins because it ran strictly after A's install: the
+    // final map is empty. If `disk_watch_handles` were not held
+    // across the build, B could acquire the lock during A's parked
+    // window, observe an empty map, and let A install a stale entry
+    // on resume.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn add_profile_disk_watch_resists_resurrection_under_concurrent_remove() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        let _ = crate::session::get_profile_dir("race-fix").expect("profile dir");
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let live = FileWatchService::new().expect("live svc");
+        let mut state_mut = Arc::try_unwrap(state)
+            .map_err(|_| ())
+            .expect("unique state");
+        state_mut.file_watch = live;
+        let state = Arc::new(state_mut);
+
+        let barrier = Arc::new(DiskWatchBuildBarrier {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            armed: tokio::sync::Notify::new(),
+        });
+        let _barrier_guard = DiskWatchBuildBarrierGuard::install(barrier.clone());
+
+        let s_a = state.clone();
+        let task_a = tokio::spawn(async move {
+            add_profile_disk_watch(&s_a, "race-fix").await;
+        });
+
+        // Wait deterministically until A is parked inside the
+        // barrier. No fixed sleep: the `entered` notification is
+        // sent strictly after `subscribe_channel` returns and the
+        // forwarder is spawned, which is the build-vs-install
+        // boundary the test wants to exercise.
+        barrier.entered.notified().await;
+
+        let s_b = state.clone();
+        let barrier_b = barrier.clone();
+        let task_b = tokio::spawn(async move {
+            // Signal "B is about to call remove" so the test can
+            // proceed to release A without a fixed-time sleep. The
+            // notify lands one executor tick before B's `lock().await`
+            // registers as a waiter; A still holds the lock so B
+            // parks behind A regardless of relative scheduling.
+            barrier_b.armed.notify_one();
+            remove_profile_disk_watch(&s_b, "race-fix").await;
+        });
+
+        // Deterministic happens-before for B's lock attempt: replaces
+        // the prior bounded sleep that flaked on heavily-loaded CI.
+        barrier.armed.notified().await;
+        tokio::task::yield_now().await;
+
+        // Release A; it finishes building, installs the entry, and
+        // releases the lock. B then acquires and removes.
+        barrier.release.notify_one();
+
+        task_a.await.expect("join A");
+        task_b.await.expect("join B");
+
+        let count = test_support::disk_watch_handle_count(&state).await;
+        let live_subs = state.file_watch.subscriber_count();
+        assert_eq!(
+            count, 0,
+            "B's remove must observe A's installed entry and tear it down. \
+             A non-zero count here means a removed profile was resurrected by \
+             an interleaved subscribe."
+        );
+        assert_eq!(
+            live_subs, 0,
+            "live subscription count must match the empty handle map; mismatch \
+             indicates a leaked subscriber from a resurrected entry."
+        );
+    }
+
+    // Writes that land during init's per-profile iteration, before
+    // their profile has been subscribed, must still be reconciled
+    // once init returns. The hook fires after each install; the
+    // test uses it to seed a write to a profile not yet reached by
+    // the loop. The bootstrap notify at init's end wakes the
+    // consumer, which then loads from disk and surfaces both the
+    // pre-init seed and the mid-iteration seed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_disk_watch_subscriptions_reconciles_writes_landing_during_iteration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let storage_p1 = crate::session::Storage::new_unwatched("init-gap-p1").expect("p1");
+        storage_p1
+            .update(|i, _| {
+                *i = vec![Instance::new("p1-pre-init", "/tmp/p1-pre")];
+                Ok(())
+            })
+            .expect("seed p1");
+        let _ = crate::session::get_profile_dir("init-gap-p2").expect("p2 dir");
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let live = FileWatchService::new().expect("live svc");
+        let mut state_mut = Arc::try_unwrap(state)
+            .map_err(|_| ())
+            .expect("unique state");
+        state_mut.file_watch = live;
+        let state = Arc::new(state_mut);
+
+        init_disk_watch_subscriptions_with_hook(state.clone(), |profile| {
+            if profile == "init-gap-p1" {
+                // Write to P2 at the precise moment when P1 has just
+                // been subscribed but P2 has not. The watcher path
+                // cannot deliver this event for P2 (no subscription
+                // exists yet); only the bootstrap wake plus a reload
+                // can reconcile it.
+                let storage = crate::session::Storage::new_unwatched("init-gap-p2").expect("p2");
+                storage
+                    .update(|i, _| {
+                        *i = vec![Instance::new("p2-mid-init", "/tmp/p2-mid")];
+                        Ok(())
+                    })
+                    .expect("seed p2");
+            }
+        })
+        .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.disk_changed.notified(),
+        )
+        .await
+        .expect("bootstrap wake must fire after init returns");
+
+        let file_watch = state.file_watch.clone();
+        let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
+            .await
+            .expect("join")
+            .expect("load");
+        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+
+        let instances = state.instances.read().await;
+        let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+        assert!(
+            titles.contains(&"p1-pre-init"),
+            "writes BEFORE init started must be reconciled; titles: {:?}",
+            titles
+        );
+        assert!(
+            titles.contains(&"p2-mid-init"),
+            "writes DURING init's iteration (the gap window) must be reconciled by the bootstrap wake; titles: {:?}",
+            titles
+        );
+    }
+
+    // Bootstrap correctness here has two requirements: subscriptions must be
+    // installed before the first wake, and writes that land before init
+    // returns must still be visible after the consumer reloads disk state.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bootstrap_wake_makes_pre_init_writes_reachable_via_reload() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let storage = crate::session::Storage::new_unwatched("startup-reload").expect("storage");
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![Instance::new("pre-init", "/tmp/pre-init")];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let live = FileWatchService::new().expect("live svc");
+        let mut state_mut = Arc::try_unwrap(state)
+            .map_err(|_| ())
+            .expect("unique state");
+        state_mut.file_watch = live;
+        let state = Arc::new(state_mut);
+
+        init_disk_watch_subscriptions(state.clone()).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.disk_changed.notified(),
+        )
+        .await
+        .expect("bootstrap wake must fire after init returns");
+
+        let file_watch = state.file_watch.clone();
+        let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
+            .await
+            .expect("join")
+            .expect("load");
+        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+
+        let instances = state.instances.read().await;
+        assert!(
+            instances.iter().any(|i| i.title == "pre-init"),
+            "bootstrap wake plus reload must surface writes that landed before init returned"
+        );
+    }
 
     // #1874 / #1875: a confirmed snapshot clears a reported telemetry counter
     // (the create counter and the web/acp open counts all share this path)
