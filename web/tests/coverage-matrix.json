@@ -1090,6 +1090,17 @@
       "components": []
     },
     {
+      "id": "acp.composer-ios-keyboard-reservation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-composer-keyboard.spec.ts",
+        "src/components/acp/StructuredView.layout.test.ts",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+      ],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
