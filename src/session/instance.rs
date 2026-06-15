@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::containers::{self, ContainerRuntimeInterface, DockerContainer};
+use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
 use super::container_config;
@@ -1291,10 +1291,6 @@ impl Instance {
 
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()
-    }
-
-    pub fn is_workspace(&self) -> bool {
-        self.workspace_info.is_some()
     }
 
     pub fn is_sandboxed(&self) -> bool {
