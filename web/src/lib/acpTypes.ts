@@ -594,6 +594,12 @@ export interface AcpState {
    *  reconnect-replay can deliver the same frames again without
    *  double-applying them to state. */
   lastSeq: number;
+  /** Lowest seq whose rows are currently in `activity`, i.e. the
+   *  recent-first load watermark. 0 means nothing loaded yet (or the
+   *  whole history is loaded down to the start). The client pages older
+   *  history by requesting `?before=<oldestSeq>`; the reducer's `prepend`
+   *  action lowers it. See #2236. */
+  oldestSeq: number;
   /** True if the most recent broadcast told us we lagged. Cleared
    *  the next time the client successfully resyncs via the snapshot
    *  endpoint. */
@@ -898,6 +904,7 @@ export function emptyAcpState(): AcpState {
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
+    oldestSeq: 0,
     lagged: false,
     startupError: null,
     incompatibleAgent: null,
@@ -1809,6 +1816,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   return next;
 }
 
+/** Fold a self-contained run of frames from an empty state. Used by the
+ *  recent-first load to reduce an OLDER history page in isolation (so the
+ *  page's activity rows can be prepended without disturbing the live
+ *  reducer's optimistic / queue / approval state, which is not a pure
+ *  fold of the frame log), and to project the handshake snapshot. The
+ *  caller is responsible for the frames being a clean unit; backward
+ *  paging guarantees each page starts at a user-turn boundary. See #2236. */
+export function reduceFrames(frames: AcpFrame[]): AcpState {
+  return frames.reduce(applyEvent, emptyAcpState());
+}
+
 /** True when `rows` already carries a `tool_start` row for this id. */
 function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
   return rows.some((r) => r.kind === "tool_start" && r.toolCallId === toolCallId);
@@ -1972,6 +1990,7 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
  *  fully retired) and re-derive `turnActive` from the counters. */
 export function normaliseTurnCounters(
   state: AcpState & {
+    oldestSeq?: number;
     pendingUserPromptSeq?: number;
     lastStoppedSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
@@ -2007,8 +2026,16 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
+  // older loaded) so the recent-first `before=<oldestSeq>` paging contract
+  // never sees undefined on a warm hydrate.
+  const oldestSeq =
+    typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
+      ? Math.max(0, Math.floor(state.oldestSeq))
+      : 0;
   return {
     ...state,
+    oldestSeq,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,
