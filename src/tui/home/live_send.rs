@@ -496,14 +496,12 @@ impl LiveSendWorker {
 /// It free-runs at roughly this cadence (a fork is ~3-13ms on macOS, so
 /// the real cycle is interval + fork time), keeping the preview fresh on
 /// a background thread so the render loop never forks capture-pane
-/// itself. Sits just under the 33ms render ticker so a frame almost
-/// always finds content that postdates the last keystroke, while keeping
-/// the steady-state fork rate close to the old render-driven ~30/s (a
-/// tighter value buys little perceived freshness for a lot more idle
-/// forks, since the render only paints every ~33ms anyway).
-/// Capture cadence while live-send is attached to the displayed pane: tight
-/// so typed echo and agent output appear with near-attach latency.
-const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 25;
+/// itself. Input nudges are coalesced below so fast typing does not force one
+/// full preview redraw per key; the steady cadence keeps streaming agent output
+/// fresh without repainting faster than non-sync-update terminals can present
+/// cleanly. Capture cadence while live-send is attached to the displayed pane.
+const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 35;
+const LIVE_CAPTURE_WAKE_MIN_MS: u64 = 25;
 /// Capture cadence when the worker is just keeping the home-list preview warm
 /// (no live-send). Matches the old render-driven `PREVIEW_REFRESH_MS` throttle
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
@@ -517,14 +515,41 @@ const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 #[derive(Clone)]
 pub(in crate::tui) struct LiveCaptureWake {
     nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    last_wake: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl LiveCaptureWake {
     fn wake(&self) {
-        if let Ok(_guard) = self.nudge.0.lock() {
-            self.nudge.1.notify_one();
+        let now = std::time::Instant::now();
+        let should_notify = self
+            .last_wake
+            .lock()
+            .map(|mut last| {
+                should_notify_capture_wake(
+                    &mut last,
+                    now,
+                    std::time::Duration::from_millis(LIVE_CAPTURE_WAKE_MIN_MS),
+                )
+            })
+            .unwrap_or(true);
+        if should_notify {
+            if let Ok(_guard) = self.nudge.0.lock() {
+                self.nudge.1.notify_one();
+            }
         }
     }
+}
+
+fn should_notify_capture_wake(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_gap: std::time::Duration,
+) -> bool {
+    if last.is_some_and(|previous| now.duration_since(previous) < min_gap) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 /// Off-thread preview capture. One long-lived thread forks `tmux
@@ -573,6 +598,7 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// 250ms idle) sleep. Without this, entering live-send mid-idle-sleep
     /// would lag the first fast capture by ~250ms.
     nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    last_input_wake: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether the displayed pane is the live-send target. Only then does the
     /// worker pay for the cursor query (a one-line `display-message` folded
@@ -605,6 +631,7 @@ impl LiveCaptureWorker {
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+        let last_input_wake = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let live = Arc::new(AtomicBool::new(false));
         let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
@@ -620,6 +647,7 @@ impl LiveCaptureWorker {
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
+            let mut last_cursor: Option<crate::tmux::PaneCursor> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
@@ -635,6 +663,7 @@ impl LiveCaptureWorker {
                 if name != last_target {
                     last_target = name.clone();
                     last_captured = None;
+                    last_cursor = None;
                 }
                 if lines > 0 && !name.is_empty() {
                     let session = crate::tmux::Session::from_name(&name);
@@ -664,9 +693,12 @@ impl LiveCaptureWorker {
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
                         // Empties are skipped too unless this pane forwards
-                        // them; only changed captures reach (and wake) the
-                        // render loop, so an idle pane never repaints.
+                        // them. Cursor-only changes still wake in live-send:
+                        // they need a repaint, and this lets the main loop stop
+                        // free-running full-frame draws just to catch cursor
+                        // movement.
                         let changed = last_captured.as_deref() != Some(content.as_str());
+                        let cursor_changed = is_live && last_cursor != cursor_now;
                         // Recheck the target once for both publishes: a retarget
                         // mid-fork means these bytes (and this cursor) belong to
                         // the old pane and must not land under the new view.
@@ -683,11 +715,15 @@ impl LiveCaptureWorker {
                             if let Ok(mut guard) = cursor_cell.lock() {
                                 *guard = cursor_now;
                             }
-                            if (forward_empty || !content.is_empty()) && changed {
-                                if let Ok(mut guard) = slot.lock() {
-                                    *guard = Some(content.clone());
+                            if (forward_empty || !content.is_empty()) && (changed || cursor_changed)
+                            {
+                                if changed {
+                                    if let Ok(mut guard) = slot.lock() {
+                                        *guard = Some(content.clone());
+                                    }
+                                    last_captured = Some(content);
                                 }
-                                last_captured = Some(content);
+                                last_cursor = cursor_now;
                                 wake.notify_one();
                             }
                         }
@@ -712,6 +748,7 @@ impl LiveCaptureWorker {
             interval_ms,
             forward_empty,
             nudge,
+            last_input_wake,
             stop,
             live,
             cursor,
@@ -725,6 +762,7 @@ impl LiveCaptureWorker {
     pub(in crate::tui) fn waker(&self) -> LiveCaptureWake {
         LiveCaptureWake {
             nudge: self.nudge.clone(),
+            last_wake: self.last_input_wake.clone(),
         }
     }
 
@@ -1611,6 +1649,25 @@ mod tests {
         assert_eq!(peel_trailing_semicolons(";a"), (";a", 0));
         assert_eq!(peel_trailing_semicolons("hello"), ("hello", 0));
         assert_eq!(peel_trailing_semicolons(""), ("", 0));
+    }
+
+    #[test]
+    fn live_capture_wake_coalesces_fast_repeats() {
+        let start = std::time::Instant::now();
+        let min_gap = std::time::Duration::from_millis(50);
+        let mut last = None;
+
+        assert!(should_notify_capture_wake(&mut last, start, min_gap));
+        assert!(!should_notify_capture_wake(
+            &mut last,
+            start + std::time::Duration::from_millis(25),
+            min_gap
+        ));
+        assert!(should_notify_capture_wake(
+            &mut last,
+            start + std::time::Duration::from_millis(50),
+            min_gap
+        ));
     }
 
     #[test]

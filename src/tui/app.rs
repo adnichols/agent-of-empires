@@ -591,34 +591,12 @@ impl App {
             (hup.ok(), term.ok())
         };
 
-        // 33ms ticker (~30fps) is the steady-state refresh in live-send.
-        // 16ms (60fps) was tried but produced visible tearing on
-        // terminals that don't support synchronized-update escapes
-        // (notably macOS Terminal.app); back-to-back ticker + post-key
-        // wakes within ~1ms also doubled-up frame writes. 33ms gives
-        // each frame's writes enough time to land before the next
-        // frame starts, while remaining responsive enough that
-        // animation looks fluid. The post-key wake below covers the
-        // typing-echo case where 33ms would feel laggy.
+        // 33ms ticker (~30fps) drives ordinary periodic TUI work. Live-send
+        // content itself is event-driven by the capture worker: repainting the
+        // whole UI on every tick, even when the pane bytes did not change, is
+        // visible as right-pane flicker on some terminals.
         let mut refresh_interval = tokio::time::interval(Duration::from_millis(33));
         refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // After any keystroke routed to live-send, schedule one extra
-        // refresh ~15ms later (roughly the `tmux send-keys` fork plus
-        // agent-echo time) so the resulting capture catches the echo
-        // deterministically instead of waiting up to one full ticker
-        // interval. Cleared when the wake fires; re-armed by each
-        // subsequent key.
-        let mut last_live_key_at: Option<std::time::Instant> = None;
-        const POST_KEY_WAKE_DELAY: Duration = Duration::from_millis(15);
-        // Track when the last refresh fired so the ticker arm can
-        // back off if a post-key wake just ran. Without this, a key
-        // pressed ~10ms before a ticker tick produces two refreshes
-        // back-to-back (post-key wake at +15ms, ticker at +16ms),
-        // which on a non-sync-update terminal looks like tearing:
-        // the first frame's per-cell writes are still landing when
-        // the second frame starts overwriting them.
-        let mut last_refresh_at: Option<std::time::Instant> = None;
-        const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
@@ -676,11 +654,6 @@ impl App {
                 self.needs_redraw = false;
             }
 
-            // Compute the post-key wake deadline once per iteration so
-            // the select! arm doesn't have to dance with the Option.
-            // `None` here becomes `pending` inside the arm.
-            let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
-            let mut woke_via_post_key = false;
             // The capture worker notifies this when it has fresh, changed
             // pane content; the arm below wakes the loop so the new preview
             // paints without busy-polling. Cloned per iteration so the
@@ -857,18 +830,7 @@ impl App {
                             self.handle_key(key, terminal).await?;
                             self.sync_mouse_capture(terminal)?;
 
-                            // Arm the post-key wake when the key was
-                            // routed into live-send. We don't have an
-                            // explicit signal from handle_key for that
-                            // (it returns ()), but `live_send.is_some()`
-                            // after the call is a good proxy: a key
-                            // that EXITS live-send won't arm a wake,
-                            // and keys outside live-send leave it None
-                            // anyway since we never set it.
                             let live_after = self.home.live_send.is_some();
-                            if live_after {
-                                last_live_key_at = Some(std::time::Instant::now());
-                            }
 
                             // Skip the immediate draw when:
                             //   - We're returning from tmux attach
@@ -880,15 +842,12 @@ impl App {
                             //     queued to the worker but has NOT been
                             //     dispatched to tmux yet, so the home
                             //     view's preview cache is still stale.
-                            //     Drawing now produces a frame
-                            //     identical to the previous one
-                            //     (ratatui's diff is empty) and then
-                            //     the post-key wake fires ~15ms later
-                            //     with fresh post-echo content.
-                            //     Skipping the immediate draw avoids a
-                            //     no-op paint that on non-sync-update
-                            //     terminals can still emit cursor-move
-                            //     bytes mid-frame.
+                            //     The capture worker wakes the loop when
+                            //     it observes the echoed content or cursor
+                            //     movement. Skipping the immediate draw
+                            //     avoids a no-op paint that on non-sync-
+                            //     update terminals can still emit cursor-
+                            //     move bytes mid-frame.
                             if !self.needs_redraw && !live_after {
                                 self.draw(terminal)?;
                             }
@@ -1128,17 +1087,6 @@ impl App {
                     woke_via_preview = true;
                 }
                 _ = async {
-                    match post_key_deadline {
-                        Some(at) => tokio::time::sleep_until(at.into()).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    // Targeted refresh ~15ms after a live-send key,
-                    // catching the agent's echo before the next ticker.
-                    woke_via_post_key = true;
-                    last_live_key_at = None;
-                }
-                _ = async {
                     #[cfg(unix)]
                     match sighup {
                         Some(ref mut s) => { s.recv().await; }
@@ -1174,7 +1122,6 @@ impl App {
             // the loop is bypassed so deterministic signals (status
             // updates, dialog ticks) get painted right away.
             let mut refresh_needed = false;
-            let mut needs_full_refresh = false;
 
             // Continuous edge auto-scroll for a preview drag-select. The
             // mouse-event arm `continue`s above, so this runs on the
@@ -1191,7 +1138,6 @@ impl App {
             // draw at the bottom of the loop repaints smoothly.
             if self.home.tick_preview_autoscroll() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             // Update-check / install-status polls can flip the
@@ -1206,12 +1152,10 @@ impl App {
             if self.poll_update_check() {
                 self.needs_redraw = true;
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
             if self.poll_update_status() {
                 self.needs_redraw = true;
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
             // The sandbox-image banner and its pull toast share the same
             // bottom-row layout slot, so treat their changes as full-refresh
@@ -1219,12 +1163,10 @@ impl App {
             if self.poll_image_update_check() {
                 self.needs_redraw = true;
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
             if self.poll_image_pull_status() {
                 self.needs_redraw = true;
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
@@ -1234,51 +1176,42 @@ impl App {
 
             if self.home.apply_status_updates() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if self.home.apply_deletion_results() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if self.home.apply_stop_results() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
                 last_session_idle_reap = std::time::Instant::now();
                 if self.reap_idle_sessions() {
                     refresh_needed = true;
-                    needs_full_refresh = true;
                 }
             }
 
             if self.home.apply_session_id_updates() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if self.home.apply_recovery_updates() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if self.home.apply_restart_results() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if self.home.tick_dialog() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             // Fade the settings "Settings saved" toast once its window passes,
@@ -1286,7 +1219,6 @@ impl App {
             // so a full refresh here is free.
             if self.home.tick_settings_status() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             // Disk reload: heartbeat (defense-in-depth) plus the
@@ -1312,7 +1244,6 @@ impl App {
                     self.set_theme(&theme_name);
                 }
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
@@ -1346,25 +1277,21 @@ impl App {
                     }
                     last_disk_refresh = std::time::Instant::now();
                     refresh_needed = true;
-                    needs_full_refresh = true;
                 }
                 DiskRefreshDecision::Watcher => {
                     let reload_result = self.home.reload_storage_only();
                     handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
                     refresh_needed = true;
-                    needs_full_refresh = true;
                 }
                 DiskRefreshDecision::None => {}
             }
 
             if self.home.try_present_reload_failure_dialog() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if self.home.try_clear_recovered_reload_dialog() {
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
@@ -1419,46 +1346,14 @@ impl App {
             {
                 last_spinner_redraw = std::time::Instant::now();
                 refresh_needed = true;
-                needs_full_refresh = true;
             }
 
-            // In live-send, the 33ms ticker is the steady-state
-            // refresh source; treat every tick as a refresh. The
-            // post-key wake (`woke_via_post_key`) is the same signal
-            // but on a deterministic ~15ms delay after each keystroke
-            // so typing-echo latency doesn't have to wait for ticker
-            // phase. Outside live-send, only the periodic checks
-            // above and the capture-worker wake (`woke_via_preview`,
-            // fired only when pane content actually changed) trigger a
-            // refresh.
-            if self.home.live_send.is_some() || woke_via_post_key || woke_via_preview {
+            // Live-send content is capture-worker driven. Do not repaint just
+            // because the 33ms ticker fired: idle full-frame paints were the
+            // remaining visible flicker source. `woke_via_preview` fires when
+            // the worker observed changed pane content or cursor state.
+            if woke_via_preview {
                 refresh_needed = true;
-            }
-
-            // Cool-down guard against double-painting in live-send.
-            // The post-key wake and the ticker can fire within 1ms of
-            // each other (key pressed 14ms before a ticker tick: post-
-            // key wake fires at +15ms, ticker tick fires at +16ms),
-            // which doubles up frame writes and produces visible
-            // tearing on terminals without synchronized-update
-            // support. Skip ticker-driven refreshes inside the
-            // cool-down window unless this refresh was specifically
-            // requested by something else (status update, post-key
-            // wake, or the capture-worker wake). Preview wakes carry
-            // genuinely new pane content (the worker dedups and only
-            // fires on change), so they're a real frame to paint, not a
-            // redundant repaint, and must bypass the cool-down like the
-            // post-key wake does or live-send echo stalls to the ticker.
-            if refresh_needed
-                && self.home.live_send.is_some()
-                && !woke_via_post_key
-                && !woke_via_preview
-                && !needs_full_refresh
-                && last_refresh_at
-                    .map(|t| t.elapsed() < REFRESH_COOLDOWN)
-                    .unwrap_or(false)
-            {
-                refresh_needed = false;
             }
 
             if refresh_needed {
@@ -1478,7 +1373,6 @@ impl App {
                 // when `refresh_needed`, so this is just collapsing
                 // the conditional branch.
                 self.draw(terminal)?;
-                last_refresh_at = Some(std::time::Instant::now());
             }
 
             if self.should_quit {

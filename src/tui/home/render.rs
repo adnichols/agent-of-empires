@@ -2251,18 +2251,12 @@ impl HomeView {
             }
         }
 
-        // In live-send mode, place a real terminal cursor over the preview at
-        // the target pane's cursor cell. `capture-pane` carries only cell text
-        // (plus SGR color), not the cursor, so without this the
-        // "feels-attached" preview shows no cursor for programs that rely on
-        // the hardware cursor (shells, codex, anything using DECTCEM) even
-        // though a direct tmux attach would. Programs that paint their own
-        // caret into the cells (e.g. Claude Code's reverse-video block) hide
-        // the hardware cursor, so `cursor_flag` is 0 and this paints nothing
-        // over them, avoiding a double cursor.
-        if let Some(pos) = self.live_preview_cursor_pos() {
-            frame.set_cursor_position(pos);
-        }
+        // In live-send mode, paint the target pane's cursor directly into the
+        // preview buffer instead of moving/showing the terminal's hardware
+        // cursor. The hardware cursor visibly blinks and jumps while ratatui is
+        // flushing changed cells on terminals without synchronized-update
+        // support; a painted cell is part of the same diff as the text.
+        self.paint_live_preview_cursor(frame, theme);
 
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers
@@ -2270,6 +2264,23 @@ impl HomeView {
         // finalized highlight is showing, so this branch is a no-op
         // otherwise.
         self.paint_preview_selection(frame, theme);
+    }
+
+    /// Paint the live-send cursor directly into the preview buffer.
+    fn paint_live_preview_cursor(&self, frame: &mut Frame, theme: &Theme) {
+        let Some(pos) = self.live_preview_cursor_pos() else {
+            return;
+        };
+        let buf = frame.buffer_mut();
+        if !buf.area.contains(pos) {
+            return;
+        }
+        let cell = &mut buf[(pos.x, pos.y)];
+        cell.set_bg(theme.text);
+        cell.set_fg(theme.background);
+        if cell.symbol().trim().is_empty() {
+            cell.set_symbol(" ");
+        }
     }
 
     /// Where to paint the live-send cursor this frame, or `None` to paint no

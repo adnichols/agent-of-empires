@@ -97,6 +97,8 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   // "this terminal was opened", not "the socket reconnected N times". Ported
   // from the removed xterm useTerminal hook.
   const telemetrySeenRef = useRef(false);
+  const pendingFrameRef = useRef<{ frame: LiveFrame; retryCount: number } | null>(null);
+  const pendingFrameFlushRef = useRef<{ id: number; kind: "raf" | "timeout" } | null>(null);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -110,6 +112,46 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     store.snapshot = fn(store.snapshot);
     store.listeners.forEach((l) => l());
   }, []);
+  const cancelPendingFrameFlush = useCallback(() => {
+    const pending = pendingFrameFlushRef.current;
+    if (!pending) return;
+    if (pending.kind === "raf" && typeof globalThis.cancelAnimationFrame === "function") {
+      globalThis.cancelAnimationFrame(pending.id);
+    } else {
+      globalThis.clearTimeout(pending.id);
+    }
+    pendingFrameFlushRef.current = null;
+  }, []);
+  const flushPendingFrame = useCallback(() => {
+    pendingFrameFlushRef.current = null;
+    const pending = pendingFrameRef.current;
+    pendingFrameRef.current = null;
+    if (!pending) return;
+    setState((prev) => ({
+      ...prev,
+      retryCount: pending.retryCount,
+      retryCountdown: 0,
+      frame: pending.frame,
+    }));
+  }, [setState]);
+  const scheduleFrame = useCallback(
+    (frame: LiveFrame) => {
+      pendingFrameRef.current = { frame, retryCount: retryCountRef.current };
+      if (pendingFrameFlushRef.current) return;
+      if (typeof globalThis.requestAnimationFrame === "function") {
+        pendingFrameFlushRef.current = {
+          id: globalThis.requestAnimationFrame(() => flushPendingFrame()),
+          kind: "raf",
+        };
+      } else {
+        pendingFrameFlushRef.current = {
+          id: globalThis.setTimeout(() => flushPendingFrame(), 16),
+          kind: "timeout",
+        };
+      }
+    },
+    [flushPendingFrame],
+  );
   const subscribe = useCallback((listener: () => void) => {
     storeRef.current!.listeners.add(listener);
     return () => {
@@ -229,16 +271,15 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           const full = Math.min(4000, incoming.rows + incoming.history);
           if (full > (desiredRef.current.window ?? 0)) setWindowInternal(full);
         }
-        // Always render the freshest frame. While reading scrollback the
-        // window is wider, but the component's spacer model keeps the
-        // user's position stable as the agent streams (above-viewport
-        // pixels are invariant), so no freeze is needed.
-        setState((prev) => ({
-          ...prev,
-          retryCount: retryCountRef.current,
-          retryCountdown: 0,
-          frame: incoming,
-        }));
+        // Always render the freshest frame, but coalesce bursts to the next
+        // browser paint. Live capture can deliver a nudge frame and a cadence
+        // frame inside one display interval while typing or while an agent is
+        // repainting; committing both forces the DOM terminal to redraw twice
+        // for one visible frame and reads as flicker. While reading scrollback
+        // the window is wider, but the component's spacer model keeps the
+        // user's position stable as the agent streams (above-viewport pixels
+        // are invariant), so no freeze is needed.
+        scheduleFrame(incoming);
       };
 
       ws.onclose = (event: CloseEvent) => {
@@ -306,6 +347,8 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
       window.removeEventListener("pageshow", tryAutoReconnect);
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       if (countdownRef.current) clearInterval(countdownRef.current);
+      cancelPendingFrameFlush();
+      pendingFrameRef.current = null;
       const ws = wsRef.current;
       if (ws) {
         ws.onopen = null;
@@ -316,7 +359,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, wsPath, setState]);
+  }, [sessionId, wsPath, setState, scheduleFrame, cancelPendingFrameFlush]);
 
   const sendData = useCallback((data: string) => {
     // Only the size owner may type; the server drops a non-owner's input

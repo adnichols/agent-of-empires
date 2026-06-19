@@ -72,6 +72,51 @@ afterEach(() => {
 });
 
 describe("useLiveTerminal size-owner", () => {
+  it("coalesces bursty frame messages to the next browser paint", () => {
+    const originalRaf = globalThis.requestAnimationFrame;
+    const originalCancelRaf = globalThis.cancelAnimationFrame;
+    const callbacks: FrameRequestCallback[] = [];
+    Object.defineProperty(globalThis, "requestAnimationFrame", {
+      configurable: true,
+      writable: true,
+      value: (cb: FrameRequestCallback) => {
+        callbacks.push(cb);
+        return callbacks.length;
+      },
+    });
+    Object.defineProperty(globalThis, "cancelAnimationFrame", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(),
+    });
+
+    try {
+      const { result } = renderHook(() => useLiveTerminal("s1"));
+      const socket = sockets[0];
+      open(socket);
+
+      deliver(socket, { type: "frame", content: "first", rows: 1, history: 0, cursor: null });
+      deliver(socket, { type: "frame", content: "second", rows: 1, history: 0, cursor: null });
+
+      expect(result.current.state.frame).toBeNull();
+      expect(callbacks).toHaveLength(1);
+
+      act(() => callbacks.shift()?.(16));
+      expect(result.current.state.frame?.content).toBe("second");
+    } finally {
+      Object.defineProperty(globalThis, "requestAnimationFrame", {
+        configurable: true,
+        writable: true,
+        value: originalRaf,
+      });
+      Object.defineProperty(globalThis, "cancelAnimationFrame", {
+        configurable: true,
+        writable: true,
+        value: originalCancelRaf,
+      });
+    }
+  });
+
   it("defaults to owner before any size_owner frame", () => {
     const { result } = renderHook(() => useLiveTerminal("s1"));
     open(sockets[0]);
