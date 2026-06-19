@@ -3,7 +3,7 @@
 //! This module provides shared logic for building new session instances,
 //! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -66,6 +66,34 @@ pub struct BuildResult {
 pub struct CreatedWorktree {
     pub path: PathBuf,
     pub main_repo_path: PathBuf,
+}
+
+/// Detect a session path that already points at a linked git worktree created
+/// outside this launch flow. AoE still treats it as externally managed, but
+/// recording the main repo keeps project grouping anchored to the repository
+/// instead of the worktree directory leaf.
+pub(crate) fn detect_existing_worktree_info(path: &Path) -> Option<WorktreeInfo> {
+    let repo = git2::Repository::discover(path).ok()?;
+    let worktree_root = repo.workdir()?.canonicalize().ok()?;
+    let main_repo_raw = GitWorktree::find_main_repo(&worktree_root).ok()?;
+    let main_repo_path = main_repo_raw.canonicalize().unwrap_or(main_repo_raw);
+
+    if main_repo_path == worktree_root {
+        return None;
+    }
+
+    let branch = repo.head().ok()?.shorthand().ok()?.trim().to_string();
+    if branch.is_empty() {
+        return None;
+    }
+
+    Some(WorktreeInfo {
+        branch,
+        main_repo_path: main_repo_path.to_string_lossy().to_string(),
+        managed_by_aoe: false,
+        created_at: Utc::now(),
+        base_branch: None,
+    })
 }
 
 /// Result of creating a multi-repo workspace.
@@ -636,6 +664,10 @@ pub fn build_instance(
         if !final_path_buf.is_dir() {
             bail!("Project path is not a directory: {}", final_path);
         }
+    }
+
+    if worktree_info.is_none() && workspace_info.is_none() && !params.scratch {
+        worktree_info = detect_existing_worktree_info(Path::new(&final_path));
     }
 
     let mut instance = Instance::new(&final_title, &final_path);

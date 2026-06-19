@@ -4868,6 +4868,29 @@ fn test_project_group_name_handles_trailing_slash() {
 }
 
 #[test]
+fn test_project_group_name_uses_saved_group_for_missing_legacy_path() {
+    use super::project_group_name;
+
+    let temp = tempfile::tempdir().unwrap();
+    let missing_path = temp.path().join("missing-worktree");
+    let mut inst = Instance::new("test", &missing_path.to_string_lossy());
+    inst.group_path = "heddle".to_string();
+    assert_eq!(project_group_name(&inst), "heddle");
+}
+
+#[test]
+fn test_project_group_name_ignores_saved_group_when_path_exists() {
+    use super::project_group_name;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path().join("my-project");
+    std::fs::create_dir(&project_path).unwrap();
+    let mut inst = Instance::new("test", &project_path.to_string_lossy());
+    inst.group_path = "manual-group".to_string();
+    assert_eq!(project_group_name(&inst), "my-project");
+}
+
+#[test]
 fn test_project_group_name_groups_scratch_under_scratch() {
     use super::project_group_name;
 

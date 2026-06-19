@@ -433,6 +433,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Ok(());
     }
 
+    if worktree_info_opt.is_none() && workspace_info_opt.is_none() && !args.scratch {
+        worktree_info_opt = builder::detect_existing_worktree_info(&path);
+    }
+
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
 

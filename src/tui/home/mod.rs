@@ -49,13 +49,21 @@ use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
 
 /// Extract a project group name from a session instance.
-/// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
-/// same repo group together), otherwise uses `project_path`. Returns the last path segment.
+/// Uses `worktree_info.main_repo_path` for worktree sessions, so all branches of the
+/// same repo group together. Missing legacy paths fall back to their saved group.
+/// Otherwise, uses `project_path`. Returns the last path segment for real paths.
 fn project_group_name(inst: &Instance) -> String {
     // Scratch sessions live under `<app_dir>/scratch/<instance-id>/`, so the last
     // path segment is the opaque instance id. Group them under a readable label.
     if inst.scratch {
         return "scratch".to_string();
+    }
+
+    if inst.worktree_info.is_none()
+        && !inst.group_path.is_empty()
+        && !std::path::Path::new(&inst.project_path).exists()
+    {
+        return inst.group_path.clone();
     }
 
     crate::session::projects::repo_label(inst.repo_path())
