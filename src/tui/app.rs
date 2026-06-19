@@ -220,11 +220,16 @@ impl App {
     /// Printable ASCII Char or Enter, with no modifiers (or shift only).
     /// Burst detection ignores Ctrl/Alt-modified chords because those
     /// are genuine intentional shortcuts and never come from a paste-burst.
+    /// It also ignores terminal auto-repeat events, so a held navigation key
+    /// cannot be mistaken for pasted text and routed into the compose dialog.
     /// Enter is included so embedded CR/LF inside a Mosh-stripped paste
     /// (voice/dictation often inserts sentence-break newlines) gets
     /// captured into the burst as \n instead of breaking it in two and
     /// firing Submit/select on the deferred Enter.
     fn is_burst_candidate(key: &KeyEvent) -> bool {
+        if matches!(key.kind, KeyEventKind::Repeat) {
+            return false;
+        }
         let mods = key.modifiers;
         let mods_ok = mods.is_empty() || mods == KeyModifiers::SHIFT;
         if !mods_ok {
@@ -245,6 +250,20 @@ impl App {
             KeyCode::Enter => Some('\n'),
             _ => None,
         }
+    }
+
+    fn is_repeated_home_navigation_burst(keys: &[KeyEvent]) -> bool {
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        if !matches!(first.code, KeyCode::Char('j' | 'k' | 'h' | 'l')) {
+            return false;
+        }
+        keys.iter().all(|key| {
+            key.code == first.code
+                && key.modifiers == first.modifiers
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        })
     }
 
     /// Peel a trailing Enter off a paste burst so plain-Enter Submit
@@ -761,23 +780,34 @@ impl App {
                                     }
                                 }
                                 if burst_keys.len() >= PASTE_BURST_MIN_LEN {
-                                    // Peel a trailing Enter so the dialog's
-                                    // plain-Enter Submit branch still fires.
-                                    // Embedded mid-burst Enters stay as '\n'
-                                    // in the paste text (the original reason
-                                    // Enter is a burst candidate).
-                                    let (paste_text, trailing_enter) =
-                                        Self::split_trailing_enter(&burst_str, &burst_keys);
-                                    if !paste_text.is_empty() {
-                                        tracing::debug!(target: "tui.input",
-                                            "paste-burst: routed {} chars via handle_paste (chars={:?})",
-                                            paste_text.len(), paste_text
-                                        );
-                                        self.home.handle_paste(&paste_text);
-                                    }
-                                    if let Some(enter) = trailing_enter {
-                                        if !self.should_quit {
-                                            self.handle_key(enter, terminal).await?;
+                                    if !self.home.has_dialog()
+                                        && Self::is_repeated_home_navigation_burst(&burst_keys)
+                                    {
+                                        for k in burst_keys {
+                                            self.handle_key(k, terminal).await?;
+                                            if self.should_quit {
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        // Peel a trailing Enter so the dialog's
+                                        // plain-Enter Submit branch still fires.
+                                        // Embedded mid-burst Enters stay as '\n'
+                                        // in the paste text (the original reason
+                                        // Enter is a burst candidate).
+                                        let (paste_text, trailing_enter) =
+                                            Self::split_trailing_enter(&burst_str, &burst_keys);
+                                        if !paste_text.is_empty() {
+                                            tracing::debug!(target: "tui.input",
+                                                "paste-burst: routed {} chars via handle_paste (chars={:?})",
+                                                paste_text.len(), paste_text
+                                            );
+                                            self.home.handle_paste(&paste_text);
+                                        }
+                                        if let Some(enter) = trailing_enter {
+                                            if !self.should_quit {
+                                                self.handle_key(enter, terminal).await?;
+                                            }
                                         }
                                     }
                                 } else {
@@ -3418,6 +3448,10 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    fn repeat_key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(code, mods, KeyEventKind::Repeat)
+    }
+
     #[test]
     fn burst_candidate_accepts_printable_chars_and_enter() {
         assert!(App::is_burst_candidate(&key(
@@ -3466,6 +3500,45 @@ mod tests {
             KeyCode::Backspace,
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn burst_candidate_rejects_auto_repeat_keys() {
+        assert!(!App::is_burst_candidate(&repeat_key(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE
+        )));
+        assert!(!App::is_burst_candidate(&repeat_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn repeated_home_navigation_burst_detects_held_vim_keys() {
+        let keys = [
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+        ];
+        assert!(App::is_repeated_home_navigation_burst(&keys));
+    }
+
+    #[test]
+    fn repeated_home_navigation_burst_rejects_mixed_or_non_nav_keys() {
+        let mixed = [
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+            key(KeyCode::Char('k'), KeyModifiers::NONE),
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+        ];
+        assert!(!App::is_repeated_home_navigation_burst(&mixed));
+
+        let message_key = [
+            key(KeyCode::Char('m'), KeyModifiers::NONE),
+            key(KeyCode::Char('m'), KeyModifiers::NONE),
+            key(KeyCode::Char('m'), KeyModifiers::NONE),
+        ];
+        assert!(!App::is_repeated_home_navigation_burst(&message_key));
     }
 
     #[test]
