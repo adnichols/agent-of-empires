@@ -769,11 +769,9 @@ pub fn stdio_redirect_path() -> Result<PathBuf> {
     Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
 }
 
-fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
-    use std::process::{Command, Stdio};
-
+fn build_daemon_command(profile: &str, args: &ServeArgs) -> Result<std::process::Command> {
     let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = std::process::Command::new(exe);
     cmd.args([
         "serve",
         "--daemon-child",
@@ -808,13 +806,24 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         cmd.arg("--no-tailscale");
     }
     if let Some(ref passphrase) = args.passphrase {
-        // Pass via env var to avoid exposing the passphrase in the process list
+        // Pass via env var to avoid exposing the passphrase in the process list.
         cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
     }
     if !profile.is_empty() {
         cmd.args(["--profile", profile]);
     }
 
+    cmd.env_remove("TMUX");
+    cmd.env_remove("TMUX_PANE");
+    cmd.env_remove("TMUX_TMPDIR");
+
+    Ok(cmd)
+}
+
+fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
+    use std::process::Stdio;
+
+    let mut cmd = build_daemon_command(profile, args)?;
     cmd.stdin(Stdio::null());
 
     // Create a new session so the daemon is not killed by SIGHUP when the
@@ -1377,6 +1386,33 @@ mod tests {
         assert!(!args.restart);
         assert!(!args.stop);
         assert_eq!(args.passphrase.as_deref(), Some("hunter2"));
+    }
+
+    fn command_env_value<'a>(
+        cmd: &'a std::process::Command,
+        key: &str,
+    ) -> Option<Option<&'a std::ffi::OsStr>> {
+        for (name, value) in cmd.get_envs() {
+            if name == std::ffi::OsStr::new(key) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn daemon_command_clears_inherited_tmux_client_env() {
+        let launch = sample_launch();
+        let args = launch.to_serve_args(Some("hunter2".to_string()));
+        let cmd = build_daemon_command(&launch.profile, &args).expect("build daemon command");
+
+        assert_eq!(command_env_value(&cmd, "TMUX"), Some(None));
+        assert_eq!(command_env_value(&cmd, "TMUX_PANE"), Some(None));
+        assert_eq!(command_env_value(&cmd, "TMUX_TMPDIR"), Some(None));
+        assert_eq!(
+            command_env_value(&cmd, "AOE_SERVE_PASSPHRASE"),
+            Some(Some(std::ffi::OsStr::new("hunter2")))
+        );
     }
 
     #[test]

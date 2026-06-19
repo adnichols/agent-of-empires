@@ -1006,7 +1006,7 @@ fn test_cli_rename_preserves_tmux_session() {
     );
 
     // Create a real tmux session with that name (simulates a running session)
-    let create = Command::new("tmux")
+    let create = agent_of_empires::tmux::tmux_command()
         .args([
             "new-session",
             "-d",
@@ -1036,7 +1036,7 @@ fn test_cli_rename_preserves_tmux_session() {
     );
 
     // 5. The old tmux session name should be gone
-    let old_exists = Command::new("tmux")
+    let old_exists = agent_of_empires::tmux::tmux_command()
         .args(["has-session", "-t", &old_tmux_name])
         .output()
         .map(|o| o.status.success())
@@ -1053,7 +1053,7 @@ fn test_cli_rename_preserves_tmux_session() {
         agent_of_empires::tmux::SESSION_PREFIX,
         truncated_id
     );
-    let new_exists = Command::new("tmux")
+    let new_exists = agent_of_empires::tmux::tmux_command()
         .args(["has-session", "-t", &new_tmux_name])
         .output()
         .map(|o| o.status.success())
@@ -1065,7 +1065,7 @@ fn test_cli_rename_preserves_tmux_session() {
     );
 
     // Cleanup
-    let _ = Command::new("tmux")
+    let _ = agent_of_empires::tmux::tmux_command()
         .args(["kill-session", "-t", &new_tmux_name])
         .output();
 }
@@ -1098,7 +1098,7 @@ fn test_cli_rm_kills_agent_tmux_session() {
         truncated_id
     );
 
-    let create = Command::new("tmux")
+    let create = agent_of_empires::tmux::tmux_command()
         .args([
             "new-session",
             "-d",
@@ -1126,7 +1126,7 @@ fn test_cli_rm_kills_agent_tmux_session() {
         String::from_utf8_lossy(&rm_output.stderr)
     );
 
-    let still_alive = Command::new("tmux")
+    let still_alive = agent_of_empires::tmux::tmux_command()
         .args(["has-session", "-t", &tmux_name])
         .output()
         .map(|o| o.status.success())
@@ -1138,7 +1138,7 @@ fn test_cli_rm_kills_agent_tmux_session() {
     );
 
     // Cleanup
-    let _ = Command::new("tmux")
+    let _ = agent_of_empires::tmux::tmux_command()
         .args(["kill-session", "-t", &tmux_name])
         .output();
 }

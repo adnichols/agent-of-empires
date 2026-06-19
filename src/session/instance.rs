@@ -4609,10 +4609,10 @@ mod tests {
 
         let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
         let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
-        let created = std::process::Command::new("tmux")
+        let created = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -4641,7 +4641,7 @@ mod tests {
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
 
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
     }
@@ -5777,7 +5777,7 @@ mod tests {
         /// the dead-pane state without going through `start_terminal`, which
         /// would also apply unrelated tmux options.
         fn spawn_remain_on_exit(name: &str, cmd: &str) {
-            let output = Command::new("tmux")
+            let output = crate::tmux::tmux_command()
                 .args([
                     "new-session",
                     "-d",
@@ -5807,7 +5807,7 @@ mod tests {
         }
 
         fn cleanup(name: &str) {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", name])
                 .output();
             crate::tmux::refresh_session_cache();
@@ -7012,7 +7012,7 @@ mod tests {
             let id = inst.id.clone();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -7027,7 +7027,7 @@ mod tests {
 
             let outcome = inst.start_with_resume_fallback(None, true);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -7099,13 +7099,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
             let outcome = inst.start_with_resume_fallback(None, true);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -7168,13 +7168,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
             let outcome = inst.start_with_resume_fallback(None, true);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -7212,10 +7212,10 @@ mod tests {
         impl TmuxSession {
             fn create(id: &str, title: &str) -> Self {
                 let name = crate::tmux::Session::generate_name(id, title);
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &name])
                     .output();
-                let status = Command::new("tmux")
+                let status = crate::tmux::tmux_command()
                     .args(["new-session", "-d", "-s", &name])
                     .status()
                     .expect("failed to spawn tmux");
@@ -7229,7 +7229,7 @@ mod tests {
 
         impl Drop for TmuxSession {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &self.0])
                     .output();
             }
@@ -7498,7 +7498,7 @@ mod tests {
     struct KillTmuxOnDrop(String);
     impl Drop for KillTmuxOnDrop {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &self.0])
                 .output();
         }
@@ -7571,7 +7571,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // authoritative read; a fixed sleep is flaky under parallel test load.
         let mut painted = false;
         for _ in 0..50 {
-            let cap = std::process::Command::new("tmux")
+            let cap = crate::tmux::tmux_command()
                 .args(["capture-pane", "-p", "-t", &session_name])
                 .output();
             if let Ok(out) = cap {
@@ -7651,7 +7651,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
     fn wait_for_pane_text(session_name: &str, expected: &str) {
         for _ in 0..50 {
-            let cap = std::process::Command::new("tmux")
+            let cap = crate::tmux::tmux_command()
                 .args(["capture-pane", "-p", "-t", session_name])
                 .output();
             if let Ok(out) = cap {

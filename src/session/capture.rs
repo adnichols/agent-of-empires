@@ -756,7 +756,7 @@ pub(crate) fn compose_exclusion(
 /// [`compose_exclusion`] instead, which composes this function with the
 /// per-instance exclusion list.
 fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
-    let output = match std::process::Command::new("tmux")
+    let output = match crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
     {

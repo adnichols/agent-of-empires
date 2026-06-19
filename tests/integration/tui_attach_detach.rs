@@ -3,6 +3,7 @@
 //! These tests validate that the terminal state is properly managed when
 //! attaching to and detaching from tmux sessions.
 
+use agent_of_empires::tmux;
 use std::process::Command;
 
 /// Verify tmux is available for testing
@@ -53,6 +54,38 @@ fn assert_contains_in_order(haystack: &str, needles: &[&str]) {
     }
 }
 
+#[test]
+fn test_attach_uses_aoe_tmux_server_even_inside_tmux() {
+    let source = std::fs::read_to_string("src/tmux/session.rs").expect("Failed to read session.rs");
+    let attach_body = app_method_body(&source, "attach");
+
+    assert!(
+        attach_body.contains("tmux_command()"),
+        "agent attach must target the AoE-owned tmux server"
+    );
+    assert!(
+        !attach_body.contains("current_tmux_client_command"),
+        "agent attach must not switch/attach through the caller's tmux server"
+    );
+}
+
+#[test]
+fn test_paired_and_tool_attach_use_aoe_tmux_server() {
+    for path in ["src/tmux/terminal_session.rs", "src/tmux/tool_session.rs"] {
+        let source = std::fs::read_to_string(path).expect("Failed to read tmux source");
+        let attach_body = app_method_body(&source, "attach");
+
+        assert!(
+            attach_body.contains("tmux_command()"),
+            "{path} attach must target the AoE-owned tmux server"
+        );
+        assert!(
+            !attach_body.contains("current_tmux_client_command"),
+            "{path} attach must not switch/attach through the caller's tmux server"
+        );
+    }
+}
+
 /// Test that tmux sessions can be created and killed
 #[test]
 fn test_tmux_session_lifecycle() {
@@ -64,7 +97,7 @@ fn test_tmux_session_lifecycle() {
     let session_name = "aoe_test_lifecycle_12345678";
 
     // Create a detached session
-    let create = Command::new("tmux")
+    let create = tmux::tmux_command()
         .args(["new-session", "-d", "-s", session_name])
         .output()
         .expect("Failed to create tmux session");
@@ -72,7 +105,7 @@ fn test_tmux_session_lifecycle() {
     assert!(create.status.success(), "Failed to create test session");
 
     // Verify session exists
-    let check = Command::new("tmux")
+    let check = tmux::tmux_command()
         .args(["has-session", "-t", session_name])
         .output()
         .expect("Failed to check session");
@@ -83,7 +116,7 @@ fn test_tmux_session_lifecycle() {
     );
 
     // Kill session
-    let kill = Command::new("tmux")
+    let kill = tmux::tmux_command()
         .args(["kill-session", "-t", session_name])
         .output()
         .expect("Failed to kill session");
@@ -91,7 +124,7 @@ fn test_tmux_session_lifecycle() {
     assert!(kill.status.success(), "Failed to kill test session");
 
     // Verify session no longer exists
-    let check_after = Command::new("tmux")
+    let check_after = tmux::tmux_command()
         .args(["has-session", "-t", session_name])
         .output()
         .expect("Failed to check session");

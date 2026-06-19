@@ -4,12 +4,10 @@
 //! implementation lives in [`PairedTerminal`] and the public types are thin
 //! wrappers that fix the tmux name prefix and the log-message label.
 
-use anyhow::{bail, Result};
-use std::process::Command;
-
 use super::utils::{
     append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-    append_remain_on_exit_args, append_window_size_args, is_pane_dead, sanitize_session_name,
+    append_remain_on_exit_args, append_window_size_args, ensure_aoe_server_stays_alive,
+    is_pane_dead, sanitize_session_name, tmux_command,
 };
 use super::{
     refresh_session_cache, session_exists_from_cache, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX,
@@ -17,6 +15,7 @@ use super::{
 use crate::cli::truncate_id;
 use crate::process;
 use crate::session::config::should_apply_tmux_clipboard;
+use anyhow::{bail, Result};
 
 /// Classifies a paired terminal: adjusts the tmux session prefix and the
 /// human-readable label used in error messages.
@@ -68,7 +67,7 @@ impl PairedTerminal {
             return exists;
         }
 
-        Command::new("tmux")
+        tmux_command()
             .args(["has-session", "-t", &self.name])
             .output()
             .map(|o| o.status.success())
@@ -85,6 +84,8 @@ impl PairedTerminal {
         command: Option<&str>,
         size: Option<(u16, u16)>,
     ) -> Result<()> {
+        ensure_aoe_server_stays_alive()?;
+
         if self.exists() {
             return Ok(());
         }
@@ -98,7 +99,15 @@ impl PairedTerminal {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        if super::utils::legacy_default_session_exists(&self.name) {
+            bail!(
+                "{} '{}' exists in the legacy default tmux server; restart or stop that pre-upgrade session before creating it on the AOE tmux server",
+                self.kind.label(),
+                self.name
+            );
+        }
+
+        let output = tmux_command().args(&args).output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -142,28 +151,12 @@ impl PairedTerminal {
             bail!("{} does not exist: {}", self.kind.label(), self.name);
         }
 
-        if std::env::var("TMUX").is_ok() {
-            let status = Command::new("tmux")
-                .args(["switch-client", "-t", &self.name])
-                .status()?;
+        let status = tmux_command()
+            .args(["attach-session", "-t", &self.name])
+            .status()?;
 
-            if !status.success() {
-                let status = Command::new("tmux")
-                    .args(["attach-session", "-t", &self.name])
-                    .status()?;
-
-                if !status.success() {
-                    bail!("Failed to attach to {}", self.kind.label());
-                }
-            }
-        } else {
-            let status = Command::new("tmux")
-                .args(["attach-session", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                bail!("Failed to attach to {}", self.kind.label());
-            }
+        if !status.success() {
+            bail!("Failed to attach to {}", self.kind.label());
         }
 
         Ok(())
@@ -321,7 +314,7 @@ mod tests {
     }
 
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -345,7 +338,7 @@ mod tests {
             },
         };
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -393,7 +386,7 @@ mod tests {
             },
         };
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",

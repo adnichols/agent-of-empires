@@ -14,7 +14,7 @@ struct TmuxCleanup<'a>(&'a str);
 
 impl Drop for TmuxCleanup<'_> {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
+        let _ = tmux::tmux_command()
             .args(["kill-session", "-t", self.0])
             .output();
     }
@@ -43,7 +43,7 @@ fn start_with_size_opts_returns_skipped_when_pane_preexists() {
     inst.agent_session_id = Some(VALID_CLAUDE_UUID.to_string());
     let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
 
-    let status = Command::new("tmux")
+    let status = tmux::tmux_command()
         .args(["new-session", "-d", "-s", &session_name])
         .status()
         .expect("tmux new-session");

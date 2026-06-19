@@ -151,7 +151,18 @@ fn test_right_click_on_session_row_opens_rename_delete_menu() {
     let mut h = TuiTestHarness::new("session_rclick");
     // Seed a session before launching the TUI.
     let project = h.project_path();
-    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "RClickRow"]);
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "RClickRow",
+        "-c",
+        "claude",
+        "--cmd-override",
+        "sleep",
+        "--extra-args",
+        "600",
+    ]);
     assert!(
         add.status.success(),
         "aoe add failed: {}",

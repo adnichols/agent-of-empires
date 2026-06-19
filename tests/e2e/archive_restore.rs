@@ -1,5 +1,4 @@
 use serial_test::serial;
-use std::process::Command;
 use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
@@ -15,13 +14,13 @@ fn read_sessions_json(h: &TuiTestHarness) -> serde_json::Value {
 
 /// Best-effort cleanup so failures don't leak into the next `#[serial]` test.
 fn kill_tmux(name: &str) {
-    let _ = Command::new("tmux")
+    let _ = agent_of_empires::tmux::tmux_command()
         .args(["kill-session", "-t", name])
         .output();
 }
 
 fn tmux_has_session(name: &str) -> bool {
-    Command::new("tmux")
+    agent_of_empires::tmux::tmux_command()
         .args(["has-session", "-t", name])
         .output()
         .map(|o| o.status.success())
@@ -205,7 +204,7 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
         &tool_tmux_name,
     ];
     for name in names {
-        let create = Command::new("tmux")
+        let create = agent_of_empires::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -301,7 +300,7 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
         &tool_tmux_name,
     ];
     for name in names {
-        let create = Command::new("tmux")
+        let create = agent_of_empires::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",

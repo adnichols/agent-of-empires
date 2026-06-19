@@ -9,6 +9,8 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::utils::tmux_command;
+
 /// RAII guard that runs `tmux kill-session -t <name>` on drop. The guard
 /// owns the session name; tests call `guard.name()` wherever they need
 /// `&str`.
@@ -37,7 +39,7 @@ impl Drop for TmuxTestSession {
     fn drop(&mut self) {
         // Best-effort, idempotent. Drop must not panic, so the Result is
         // discarded: a missing tmux server or already-dead session is fine.
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", &self.name])
             .output();
     }
@@ -66,7 +68,7 @@ mod tests {
         {
             let guard = TmuxTestSession::new("aoe_test_guard_self");
             captured_name = guard.name().to_string();
-            let output = Command::new("tmux")
+            let output = tmux_command()
                 .args([
                     "new-session",
                     "-d",
@@ -81,7 +83,7 @@ mod tests {
                 .output()
                 .expect("tmux new-session");
             assert!(output.status.success());
-            let exists = Command::new("tmux")
+            let exists = tmux_command()
                 .args(["has-session", "-t", guard.name()])
                 .output()
                 .expect("tmux has-session")
@@ -89,7 +91,7 @@ mod tests {
                 .success();
             assert!(exists, "session should exist while guard is alive");
         }
-        let exists = Command::new("tmux")
+        let exists = tmux_command()
             .args(["has-session", "-t", &captured_name])
             .output()
             .expect("tmux has-session")

@@ -2,11 +2,11 @@
 //! run in persistent tmux sessions tied to an agent session's working directory.
 
 use anyhow::{bail, Result};
-use std::process::Command;
 
 use super::utils::{
     append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-    append_remain_on_exit_args, append_window_size_args, is_pane_dead, sanitize_session_name,
+    append_remain_on_exit_args, append_window_size_args, ensure_aoe_server_stays_alive,
+    is_pane_dead, sanitize_session_name, tmux_command,
 };
 use super::{refresh_session_cache, session_exists_from_cache, TOOL_PREFIX};
 use crate::cli::truncate_id;
@@ -40,7 +40,7 @@ impl ToolSession {
             return exists;
         }
 
-        Command::new("tmux")
+        tmux_command()
             .args(["has-session", "-t", &self.name])
             .output()
             .map(|o| o.status.success())
@@ -57,6 +57,8 @@ impl ToolSession {
         command: &str,
         size: Option<(u16, u16)>,
     ) -> Result<()> {
+        ensure_aoe_server_stays_alive()?;
+
         if self.exists() {
             return Ok(());
         }
@@ -87,7 +89,14 @@ impl ToolSession {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        if super::utils::legacy_default_session_exists(&self.name) {
+            bail!(
+                "tool session '{}' exists in the legacy default tmux server; restart or stop that pre-upgrade session before creating it on the AOE tmux server",
+                self.name
+            );
+        }
+
+        let output = tmux_command().args(&args).output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -122,28 +131,12 @@ impl ToolSession {
             bail!("Tool session does not exist: {}", self.name);
         }
 
-        if std::env::var("TMUX").is_ok() {
-            let status = Command::new("tmux")
-                .args(["switch-client", "-t", &self.name])
-                .status()?;
+        let status = tmux_command()
+            .args(["attach-session", "-t", &self.name])
+            .status()?;
 
-            if !status.success() {
-                let status = Command::new("tmux")
-                    .args(["attach-session", "-t", &self.name])
-                    .status()?;
-
-                if !status.success() {
-                    bail!("Failed to attach to tool session '{}'", self.name);
-                }
-            }
-        } else {
-            let status = Command::new("tmux")
-                .args(["attach-session", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                bail!("Failed to attach to tool session '{}'", self.name);
-            }
+        if !status.success() {
+            bail!("Failed to attach to tool session '{}'", self.name);
         }
 
         Ok(())
@@ -164,7 +157,7 @@ impl ToolSession {
 pub fn kill_all_tool_sessions_for_id(session_id: &str) {
     let id_suffix = format!("_{}", truncate_id(session_id, 8));
 
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
 
@@ -176,9 +169,7 @@ pub fn kill_all_tool_sessions_for_id(session_id: &str) {
                     if let Some(pid) = process::get_pane_pid(line) {
                         process::kill_process_tree(pid);
                     }
-                    let _ = Command::new("tmux")
-                        .args(["kill-session", "-t", line])
-                        .output();
+                    let _ = tmux_command().args(["kill-session", "-t", line]).output();
                 }
             }
         }

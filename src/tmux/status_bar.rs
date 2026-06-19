@@ -2,8 +2,9 @@
 
 use anyhow::Result;
 use ratatui::style::Color;
-use std::process::Command;
 
+use crate::tmux::tmux_command;
+use crate::tmux::utils::current_tmux_client_command;
 use crate::tui::styles::Theme;
 
 /// Information about a sandboxed session for status bar display.
@@ -84,7 +85,7 @@ pub fn apply_status_bar(
 /// Set a tmux option for a specific session.
 /// Remove a session-scoped option override so the global value applies.
 fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
-    let output = std::process::Command::new("tmux")
+    let output = tmux_command()
         .args(["set-option", "-u", "-t", session_name, option])
         .output()?;
     if !output.status.success() {
@@ -98,7 +99,7 @@ fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
 }
 
 fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(["set-option", "-t", session_name, option, value])
         .output()?;
 
@@ -183,8 +184,8 @@ pub fn get_session_info_for_current() -> Option<SessionInfo> {
         return None;
     }
 
-    // Try to get the aoe title from tmux user option
-    let title = get_session_option(&session_name, "@aoe_title").unwrap_or_else(|| {
+    // Try to get the aoe title from the caller's current tmux context.
+    let title = get_current_session_option(&session_name, "@aoe_title").unwrap_or_else(|| {
         // Fallback: extract title from session name
         // Session names are: aoe_<title>_<id>
         let name_without_prefix = session_name
@@ -197,8 +198,8 @@ pub fn get_session_info_for_current() -> Option<SessionInfo> {
         }
     });
 
-    let branch = get_session_option(&session_name, "@aoe_branch");
-    let sandbox = get_session_option(&session_name, "@aoe_sandbox");
+    let branch = get_current_session_option(&session_name, "@aoe_branch");
+    let sandbox = get_current_session_option(&session_name, "@aoe_sandbox");
 
     Some(SessionInfo {
         title,
@@ -228,9 +229,17 @@ pub fn get_status_for_current_session() -> Option<String> {
     Some(result)
 }
 
-/// Get a tmux option value for a session.
-fn get_session_option(session_name: &str, option: &str) -> Option<String> {
-    let output = Command::new("tmux")
+/// Get a tmux option value for the caller's current tmux context.
+fn get_current_session_option(session_name: &str, option: &str) -> Option<String> {
+    read_session_option(current_tmux_client_command(), session_name, option)
+}
+
+fn read_session_option(
+    mut cmd: std::process::Command,
+    session_name: &str,
+    option: &str,
+) -> Option<String> {
+    let output = cmd
         .args(["show-options", "-t", session_name, "-v", option])
         .output()
         .ok()?;

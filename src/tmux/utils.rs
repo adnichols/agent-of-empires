@@ -4,6 +4,60 @@ use anyhow::{bail, Result};
 use std::process::Command;
 use std::sync::OnceLock;
 
+pub const SERVER_NAME: &str = if cfg!(debug_assertions) {
+    "aoe_dev"
+} else {
+    "aoe"
+};
+
+pub fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    cmd.args(["-L", SERVER_NAME]);
+    cmd.env_remove("TMUX");
+    cmd.env_remove("TMUX_PANE");
+    match std::env::var_os("AOE_TMUX_TMPDIR") {
+        Some(tmpdir) => {
+            cmd.env("TMUX_TMPDIR", tmpdir);
+        }
+        None => {
+            cmd.env_remove("TMUX_TMPDIR");
+        }
+    }
+    cmd
+}
+
+pub(crate) fn current_tmux_client_command() -> Command {
+    Command::new("tmux")
+}
+
+pub(crate) fn ensure_aoe_server_stays_alive() -> Result<()> {
+    let output = tmux_command()
+        .args(["start-server", ";", "set-option", "-s", "exit-empty", "off"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to configure tmux server lifetime: {stderr}");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn default_tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    cmd.env_remove("TMUX");
+    cmd.env_remove("TMUX_PANE");
+    cmd
+}
+
+pub(crate) fn legacy_default_session_exists(name: &str) -> bool {
+    default_tmux_command()
+        .args(["has-session", "-t", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn strip_ansi(content: &str) -> String {
     let mut result = strip_osc_st(content);
 
@@ -189,7 +243,7 @@ pub fn is_pane_dead(session_name: &str) -> bool {
     // agent's pane even when the user has created additional tmux windows
     // or split panes.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    Command::new("tmux")
+    tmux_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
         .output()
         .ok()
@@ -202,7 +256,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
     // Use `^.0` to target the first window's first pane regardless of
     // base-index or which pane is active.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    Command::new("tmux")
+    tmux_command()
         .args([
             "display-message",
             "-t",
@@ -242,7 +296,7 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
 pub fn tmux_prefix_display() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let raw = Command::new("tmux")
+        let raw = tmux_command()
             .args(["show-option", "-gv", "prefix"])
             .output()
             .ok()
@@ -262,7 +316,7 @@ pub fn tmux_prefix_display() -> &'static str {
 /// `Err`. Caller is responsible for `refresh_session_cache` after a
 /// successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .env("LC_ALL", "C")
         .args(["kill-session", "-t", name])
         .output()?;
@@ -525,6 +579,184 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn command_env_value<'a>(cmd: &'a Command, key: &str) -> Option<Option<&'a std::ffi::OsStr>> {
+        for (name, value) in cmd.get_envs() {
+            if name == std::ffi::OsStr::new(key) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn tmux_command_uses_aoe_owned_server_and_clears_tmux_client_env() {
+        let cmd = tmux_command();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["-L".to_string(), SERVER_NAME.to_string()]);
+        assert_eq!(command_env_value(&cmd, "TMUX"), Some(None));
+        assert_eq!(command_env_value(&cmd, "TMUX_PANE"), Some(None));
+        assert_eq!(command_env_value(&cmd, "TMUX_TMPDIR"), Some(None));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_aoe_server_stays_alive_disables_exit_empty() {
+        if !tmux_available() {
+            return;
+        }
+        let tmpdir = tempfile::tempdir().expect("tmux tmpdir");
+        let _tmux_tmpdir = EnvVarGuard::set("AOE_TMUX_TMPDIR", tmpdir.path());
+
+        ensure_aoe_server_stays_alive().expect("configure aoe tmux server");
+
+        let exit_empty = tmux_command()
+            .args(["show-options", "-gsv", "exit-empty"])
+            .output()
+            .expect("read exit-empty");
+        assert!(exit_empty.status.success(), "show exit-empty failed");
+        assert_eq!(String::from_utf8_lossy(&exit_empty.stdout).trim(), "off");
+
+        let server_pid = tmux_command()
+            .args(["display-message", "-p", "#{pid}"])
+            .output()
+            .expect("read server pid");
+        let server_pid = String::from_utf8_lossy(&server_pid.stdout)
+            .trim()
+            .to_string();
+        assert!(
+            !server_pid.is_empty(),
+            "server should stay alive without sessions"
+        );
+
+        let _ = tmux_command().arg("kill-server").status();
+    }
+
+    fn isolated_default_tmux_command(tmpdir: &std::path::Path) -> Command {
+        let mut cmd = Command::new("tmux");
+        cmd.env("TMUX_TMPDIR", tmpdir);
+        cmd.env_remove("TMUX");
+        cmd.env_remove("TMUX_PANE");
+        cmd
+    }
+
+    fn isolated_aoe_tmux_command(tmpdir: &std::path::Path) -> Command {
+        let mut cmd = tmux_command();
+        cmd.env("TMUX_TMPDIR", tmpdir);
+        cmd
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aoe_server_survives_isolated_default_tmux_server_kill() {
+        if !tmux_available() {
+            return;
+        }
+        let tmpdir = tempfile::tempdir().expect("tmux tmpdir");
+        let aoe_name = format!("aoe_test_owned_server_{}", std::process::id());
+        let user_name = format!("user_test_default_server_{}", std::process::id());
+
+        let user_created = isolated_default_tmux_command(tmpdir.path())
+            .args(["new-session", "-d", "-s", &user_name, "sleep", "60"])
+            .status()
+            .expect("spawn isolated default tmux session");
+        assert!(user_created.success(), "isolated default session starts");
+
+        let aoe_created = isolated_aoe_tmux_command(tmpdir.path())
+            .args(["new-session", "-d", "-s", &aoe_name, "sleep", "60"])
+            .status()
+            .expect("spawn isolated aoe tmux session");
+        assert!(aoe_created.success(), "isolated aoe session starts");
+
+        let killed_default = isolated_default_tmux_command(tmpdir.path())
+            .arg("kill-server")
+            .status()
+            .expect("kill isolated default tmux server");
+        assert!(killed_default.success(), "isolated default server killed");
+
+        let aoe_exists = isolated_aoe_tmux_command(tmpdir.path())
+            .args(["has-session", "-t", &aoe_name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = isolated_aoe_tmux_command(tmpdir.path())
+            .arg("kill-server")
+            .status();
+
+        assert!(
+            aoe_exists,
+            "AOE-managed sessions must not live in or die with the default tmux server"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_refuses_duplicate_legacy_default_server_session() {
+        if !tmux_available() {
+            return;
+        }
+        let tmpdir = tempfile::tempdir().expect("tmux tmpdir");
+        let name = format!("aoe_test_legacy_default_{}", std::process::id());
+        let legacy_created = isolated_default_tmux_command(tmpdir.path())
+            .args(["new-session", "-d", "-s", &name, "sleep", "60"])
+            .status()
+            .expect("spawn isolated legacy default tmux session");
+        assert!(legacy_created.success(), "legacy default session starts");
+
+        let err = {
+            let _aoe_tmux_tmpdir = EnvVarGuard::set("AOE_TMUX_TMPDIR", tmpdir.path());
+            let _tmux_tmpdir = EnvVarGuard::set("TMUX_TMPDIR", tmpdir.path());
+            crate::tmux::Session::from_name(&name)
+                .create_with_size("/tmp", Some("sleep 60"), Some((80, 24)))
+                .expect_err("must not duplicate a same-name legacy default-server session")
+        };
+        let duplicate_created = isolated_aoe_tmux_command(tmpdir.path())
+            .args(["has-session", "-t", &name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = isolated_default_tmux_command(tmpdir.path())
+            .arg("kill-server")
+            .status();
+        let _ = isolated_aoe_tmux_command(tmpdir.path())
+            .arg("kill-server")
+            .status();
+
+        assert!(
+            err.to_string().contains("legacy default tmux server"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !duplicate_created,
+            "refusal must not create a duplicate AOE-server session"
+        );
+    }
+
     // Serialized like every test that talks to the shared tmux server: a
     // non-serial test that kills the server's last session makes the server
     // exit, and a `#[serial]` peer whose `new-session` connects inside that
@@ -537,9 +769,7 @@ mod tests {
             return;
         }
         let name = "aoe_test_kill_if_present_missing";
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", name])
-            .output();
+        let _ = tmux_command().args(["kill-session", "-t", name]).output();
         assert!(kill_session_if_present(name).is_ok());
     }
 
@@ -550,17 +780,15 @@ mod tests {
             return;
         }
         let name = "aoe_test_kill_if_present_alive";
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", name])
-            .output();
-        let spawn = Command::new("tmux")
+        let _ = tmux_command().args(["kill-session", "-t", name]).output();
+        let spawn = tmux_command()
             .args(["new-session", "-d", "-s", name])
             .status();
         if !spawn.map(|s| s.success()).unwrap_or(false) {
             return;
         }
         assert!(kill_session_if_present(name).is_ok());
-        let exists = Command::new("tmux")
+        let exists = tmux_command()
             .args(["has-session", "-t", name])
             .status()
             .map(|s| s.success())

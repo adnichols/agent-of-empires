@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -10,7 +10,8 @@ use super::{
     refresh_session_cache, session_exists_from_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-        append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_remain_on_exit_args, append_window_size_args, ensure_aoe_server_stays_alive,
+        is_pane_dead, is_pane_running_shell, tmux_command,
     },
     SESSION_PREFIX,
 };
@@ -149,7 +150,7 @@ impl Session {
             return exists;
         }
 
-        Command::new("tmux")
+        tmux_command()
             .args(["has-session", "-t", &self.name])
             .output()
             .map(|o| o.status.success())
@@ -166,6 +167,8 @@ impl Session {
         command: Option<&str>,
         size: Option<(u16, u16)>,
     ) -> Result<()> {
+        ensure_aoe_server_stays_alive()?;
+
         if self.exists() {
             return Ok(());
         }
@@ -179,7 +182,14 @@ impl Session {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        if super::utils::legacy_default_session_exists(&self.name) {
+            bail!(
+                "tmux session '{}' exists in the legacy default tmux server; restart or stop that pre-upgrade session before creating it on the AOE tmux server",
+                self.name
+            );
+        }
+
+        let output = tmux_command().args(&args).output()?;
 
         // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
         // Log args at debug level for troubleshooting.
@@ -249,7 +259,7 @@ impl Session {
             args.push(cmd.to_string());
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        let output = tmux_command().args(&args).output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -284,7 +294,7 @@ impl Session {
             return Ok(());
         }
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["rename-session", "-t", &self.name, new_name])
             .output()?;
 
@@ -301,44 +311,18 @@ impl Session {
             bail!("Session does not exist: {}", self.name);
         }
 
-        if std::env::var("TMUX").is_ok() {
-            let status = Command::new("tmux")
-                .args(["switch-client", "-t", &self.name])
-                .status()?;
+        let status = tmux_command()
+            .args(["attach-session", "-t", &self.name])
+            .status()?;
 
-            if !status.success() {
-                // Fall back to attach-session if switch-client fails.
-                // This handles cases where TMUX env var is inherited but we're
-                // not actually inside a tmux client (e.g., terminal spawned
-                // from within tmux via `open -a Terminal`).
-                let status = Command::new("tmux")
-                    .args(["attach-session", "-t", &self.name])
-                    .status()?;
-
-                if !status.success() {
-                    let diag = self.diagnose_attach_failure();
-                    bail!(
-                        "Failed to attach to tmux session '{}' (exit {}): {}",
-                        self.name,
-                        status.code().unwrap_or(-1),
-                        diag
-                    );
-                }
-            }
-        } else {
-            let status = Command::new("tmux")
-                .args(["attach-session", "-t", &self.name])
-                .status()?;
-
-            if !status.success() {
-                let diag = self.diagnose_attach_failure();
-                bail!(
-                    "Failed to attach to tmux session '{}' (exit {}): {}",
-                    self.name,
-                    status.code().unwrap_or(-1),
-                    diag
-                );
-            }
+        if !status.success() {
+            let diag = self.diagnose_attach_failure();
+            bail!(
+                "Failed to attach to tmux session '{}' (exit {}): {}",
+                self.name,
+                status.code().unwrap_or(-1),
+                diag
+            );
         }
 
         Ok(())
@@ -350,7 +334,7 @@ impl Session {
         info.push(format!("exists={}", self.exists()));
         info.push(format!("pane_dead={}", self.is_pane_dead()));
 
-        if let Ok(output) = Command::new("tmux")
+        if let Ok(output) = tmux_command()
             .args([
                 "display-message",
                 "-t",
@@ -382,7 +366,7 @@ impl Session {
         // Use `^.0` to target the first window's first pane regardless of
         // base-index or which pane is active.  See #435, #488.
         let target = format!("{}:^.0", self.name);
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "capture-pane",
                 "-t",
@@ -428,7 +412,7 @@ impl Session {
         let start = format!("-{}", lines);
         const HEADER_FMT: &str =
             "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}";
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "display-message",
                 "-p",
@@ -516,7 +500,7 @@ impl Session {
         // input land in a different pane than the one being captured.
         let target = format!("{}:^.0", self.name);
         for batch in raw_byte_batches(bytes) {
-            let output = Command::new("tmux")
+            let output = tmux_command()
                 .args(["send-keys", "-t", &target, "-H"])
                 .args(&batch)
                 .output()?;
@@ -634,7 +618,7 @@ impl Session {
         if !self.exists() {
             return;
         }
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["set-option", "-t", &self.name, "window-size", "latest"])
             .output();
     }
@@ -657,7 +641,7 @@ impl Session {
         if cols == 0 || rows == 0 || !self.exists() {
             return;
         }
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args([
                 "resize-window",
                 "-t",
@@ -780,7 +764,7 @@ impl Session {
     }
 
     fn show_user_option(&self, opt: &str) -> Option<String> {
-        let out = Command::new("tmux")
+        let out = tmux_command()
             .args(["show-options", "-v", "-t", &self.name, opt])
             .output()
             .ok()?;
@@ -796,13 +780,13 @@ impl Session {
     }
 
     fn set_user_option(&self, opt: &str, value: &str) {
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["set-option", "-t", &self.name, opt, value])
             .output();
     }
 
     fn unset_user_option(&self, opt: &str) {
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["set-option", "-u", "-t", &self.name, opt])
             .output();
     }
@@ -830,7 +814,7 @@ impl Session {
         let seq = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
         let buf_name = format!("aoe-send-{}-{}", std::process::id(), seq);
 
-        let mut child = Command::new("tmux")
+        let mut child = tmux_command()
             .args(["load-buffer", "-b", &buf_name, "-"])
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -843,7 +827,7 @@ impl Session {
             bail!("tmux load-buffer failed (status={:?})", status.code());
         }
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["paste-buffer", "-d", "-p", "-b", &buf_name, "-t", target])
             .output()?;
         if !output.status.success() {
@@ -851,7 +835,7 @@ impl Session {
             // paste-buffer's `-d` only deletes on success; on failure the
             // buffer survives, so clean it up explicitly. Ignore errors
             // from the cleanup so the original failure isn't masked.
-            let _ = Command::new("tmux")
+            let _ = tmux_command()
                 .args(["delete-buffer", "-b", &buf_name])
                 .output();
             bail!("tmux paste-buffer failed: {}", stderr);
@@ -861,7 +845,7 @@ impl Session {
     }
 
     fn tmux_send(target: &str, args: &[&str]) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .arg("send-keys")
             .args(["-t", target])
             .args(args)
@@ -945,7 +929,7 @@ mod tests {
 
     /// Helper: check if tmux is available for tests that need it
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -1047,7 +1031,7 @@ mod tests {
         }
         let guard = TmuxTestSession::new("aoe_test_race");
         // A pane that scrolls as fast as tmux can ingest.
-        let out = Command::new("tmux")
+        let out = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1058,6 +1042,12 @@ mod tests {
                 "-y",
                 "24",
                 "bash -c 'i=0; while true; do echo line-$((i++)); done'",
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
@@ -1089,7 +1079,7 @@ mod tests {
             return;
         }
         let guard = TmuxTestSession::new("aoe_test_owner");
-        let out = Command::new("tmux")
+        let out = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1164,7 +1154,7 @@ mod tests {
         // 5 columns, so the cursor lands at (5, 0). `sleep` keeps the pane
         // alive across the capture; generous so a test thread starved by
         // parallel suite load can't outlive the pane before capturing.
-        let status = Command::new("tmux")
+        let status = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1175,6 +1165,12 @@ mod tests {
                 "-y",
                 "10",
                 "sh -c 'printf hello; sleep 60'",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
             ])
             .status()
             .expect("tmux new-session");
@@ -1224,7 +1220,7 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_remain");
         let session_name = guard.name().to_string();
         // Chain set-option -p with new-session to avoid race condition
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1251,7 +1247,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1500));
 
         // Session should still exist (remain-on-exit keeps it)
-        let exists = Command::new("tmux")
+        let exists = tmux_command()
             .args(["has-session", "-t", &session_name])
             .output()
             .map(|o| o.status.success())
@@ -1259,7 +1255,7 @@ mod tests {
         assert!(exists, "Session should still exist due to remain-on-exit");
 
         // Pane should be dead (process exited)
-        let pane_dead = Command::new("tmux")
+        let pane_dead = tmux_command()
             .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
             .output()
             .ok()
@@ -1281,7 +1277,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create a session with a long-running command
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1307,7 +1303,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Pane should NOT be dead (sleep is still running)
-        let pane_dead = Command::new("tmux")
+        let pane_dead = tmux_command()
             .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
             .output()
             .ok()
@@ -1332,7 +1328,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session with a long-running command in window 0
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1357,19 +1353,19 @@ mod tests {
 
         // Force base-index 1 and pane-base-index 1 to simulate users who
         // have both set in their tmux.conf.
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["set-option", "-t", &session_name, "base-index", "1"])
             .output()
             .expect("tmux set-option base-index");
         assert!(output.status.success());
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["set-option", "-t", &session_name, "pane-base-index", "1"])
             .output()
             .expect("tmux set-option pane-base-index");
         assert!(output.status.success());
 
         // Create a second window with a command that exits immediately
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-window",
                 "-t",
@@ -1405,7 +1401,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session running sleep in the first window
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1424,14 +1420,14 @@ mod tests {
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
         // target using :0.0 silently fails.
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["set-option", "-t", &session_name, "base-index", "1"])
             .output()
             .expect("tmux set-option base-index");
         assert!(output.status.success());
 
         // Open a second window running a shell, and make it the active window
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["new-window", "-t", &session_name, "sh"])
             .output()
             .expect("tmux new-window");
@@ -1474,7 +1470,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session running sleep (not a shell) in the first window
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1493,14 +1489,14 @@ mod tests {
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
         // target using :0.0 silently fails.
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["set-option", "-t", &session_name, "base-index", "1"])
             .output()
             .expect("tmux set-option base-index");
         assert!(output.status.success());
 
         // Open a second window running a shell and make it active
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["new-window", "-t", &session_name, "sh"])
             .output()
             .expect("tmux new-window");
@@ -1533,7 +1529,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session with a long-running command (the "agent")
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1557,14 +1553,14 @@ mod tests {
         assert!(output.status.success());
 
         // Split the window -- this creates a new pane running a shell
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["split-window", "-t", &session_name])
             .output()
             .expect("tmux split-window");
         assert!(output.status.success());
 
         // The split pane is now active. Select it explicitly to be sure.
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["select-pane", "-t", &format!("{session_name}:.1")])
             .output()
             .expect("tmux select-pane");
@@ -1599,7 +1595,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session with pane-base-index 0 pinned (as aoe does)
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1636,7 +1632,7 @@ mod tests {
         // verify our session-level override keeps pane 0 valid.
 
         // Split the window and make the new pane active
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["split-window", "-t", &session_name])
             .output()
             .expect("tmux split-window");
@@ -1727,7 +1723,7 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_shell");
         let session_name = guard.name().to_string();
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1762,7 +1758,7 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_noshell");
         let session_name = guard.name().to_string();
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1806,7 +1802,7 @@ mod tests {
         // pane-base-index 0 to match what aoe does in production;
         // without this, users with `pane-base-index 1` in their
         // tmux.conf cause the `^.0` target to miss.
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",

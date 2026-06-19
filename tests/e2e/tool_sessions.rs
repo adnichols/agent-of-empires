@@ -16,14 +16,10 @@ fn append_tools_config(h: &TuiTestHarness, body: &str) {
     fs::write(&path, format!("{existing}\n{body}\n")).expect("write tools config");
 }
 
-/// List tmux session names on a specific socket. Tool sessions spawned by
-/// `aoe` while running inside the harness's tmux land on the harness's
-/// per-test socket (because `TMUX` env points there), so callers pass
-/// the harness's socket here to verify creation and sweep.
-fn list_tmux_sessions_on(socket: &std::path::Path) -> Vec<String> {
-    let output = Command::new("tmux")
-        .arg("-S")
-        .arg(socket)
+/// List AOE-owned tmux session names. Tool sessions spawned by `aoe` use
+/// the explicit AOE tmux server, not the harness's controlling tmux socket.
+fn list_aoe_tmux_sessions() -> Vec<String> {
+    let output = agent_of_empires::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
     match output {
@@ -37,12 +33,10 @@ fn list_tmux_sessions_on(socket: &std::path::Path) -> Vec<String> {
 
 /// Defensive teardown for any tool tmux session that survived a test
 /// (e.g., when the test panics before the cleanup assertion).
-fn kill_lingering_tool_sessions_on(socket: &std::path::Path, prefix_marker: &str) {
-    for name in list_tmux_sessions_on(socket) {
+fn kill_lingering_tool_sessions(prefix_marker: &str) {
+    for name in list_aoe_tmux_sessions() {
         if name.starts_with("aoe_dev_tool_") && name.contains(prefix_marker) {
-            let _ = Command::new("tmux")
-                .arg("-S")
-                .arg(socket)
+            let _ = agent_of_empires::tmux::tmux_command()
                 .args(["kill-session", "-t", &name])
                 .output();
         }
@@ -187,14 +181,8 @@ hotkey = "Alt+t"
         .to_string();
     let id_suffix = &session_id[..session_id.len().min(8)];
 
-    // The harness's tmux server uses a per-test socket. Tool tmux sessions
-    // spawned by aoe (running inside the harness's tmux) inherit `TMUX` and
-    // land on the *same* socket, not the system default. We inspect and
-    // clean up on that socket.
-    let harness_sock = h.home_path().join("tmux.sock");
-
     // Defensive: kill any stale tool sessions from a previous aborted run.
-    kill_lingering_tool_sessions_on(&harness_sock, id_suffix);
+    kill_lingering_tool_sessions(id_suffix);
 
     h.spawn_tui();
     h.wait_for("RoundtripSession");
@@ -225,9 +213,9 @@ hotkey = "Alt+t"
     h.send_keys("Escape");
     h.wait_for_absent("Tool: echotool", Duration::from_secs(5));
 
-    // The tool tmux session should still exist on the harness socket
+    // The tool tmux session should still exist on the AOE tmux server
     // until we remove the parent agent session.
-    let pre_remove = list_tmux_sessions_on(&harness_sock);
+    let pre_remove = list_aoe_tmux_sessions();
     assert!(
         pre_remove
             .iter()
@@ -247,18 +235,13 @@ hotkey = "Alt+t"
     h.wait_for_exit(Duration::from_secs(5));
 
     // Remove the agent session. `perform_deletion` invokes
-    // `kill_all_tool_sessions_for_id`, which runs `tmux list-sessions` /
-    // `kill-session` against the tmux socket that the calling process
-    // sees. To exercise the sweep on the harness's per-test socket we
-    // point `TMUX` at it so the subprocess routes its tmux commands
-    // there instead of the system default.
-    let tmux_env = format!("{},0,0", harness_sock.display());
+    // `kill_all_tool_sessions_for_id`, which now targets the explicit AOE
+    // tmux server regardless of the caller's `TMUX` environment.
     let aoe_binary = env!("CARGO_BIN_EXE_aoe");
     let remove = Command::new(aoe_binary)
         .args(["remove", &session_id, "--force"])
         .env("HOME", h.home_path())
         .env("XDG_CONFIG_HOME", h.home_path().join(".config"))
-        .env("TMUX", tmux_env)
         .env_remove("AGENT_OF_EMPIRES_DEBUG")
         .env_remove("AOE_LOG_LEVEL")
         .output()
@@ -270,7 +253,7 @@ hotkey = "Alt+t"
     );
 
     // Verify the sweep landed.
-    let post_remove = list_tmux_sessions_on(&harness_sock);
+    let post_remove = list_aoe_tmux_sessions();
     let leaked: Vec<_> = post_remove
         .iter()
         .filter(|s| s.starts_with("aoe_dev_tool_") && s.contains(id_suffix))
@@ -283,5 +266,5 @@ hotkey = "Alt+t"
 
     // Belt-and-suspenders: clean up anything else we created, in case
     // the assertion above passes but other state hangs around.
-    kill_lingering_tool_sessions_on(&harness_sock, id_suffix);
+    kill_lingering_tool_sessions(id_suffix);
 }
