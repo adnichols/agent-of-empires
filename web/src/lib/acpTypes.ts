@@ -187,6 +187,140 @@ export interface Approval {
   } | null;
 }
 
+/** Mirror of `ElicitationFieldKind` in src/acp/elicitations.rs. */
+export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select" | "number" | "integer" | "boolean";
+
+export interface ElicitationOption {
+  value: string;
+  label: string;
+}
+
+/** A pre-fill / submitted value. Mirror of `AnswerValue` (untagged): a
+ *  string for free-text / single-select, a list for multi-select, a number
+ *  for number / integer, a boolean for boolean. */
+export type AnswerValue = string | string[] | number | boolean;
+
+export interface ElicitationQuestion {
+  field_key: string;
+  title?: string | null;
+  description?: string | null;
+  required: boolean;
+  kind: ElicitationFieldKind;
+  options: ElicitationOption[];
+  /** Multi-select bounds. */
+  min_items?: number | null;
+  max_items?: number | null;
+  /** String bounds (free_text). */
+  min_length?: number | null;
+  max_length?: number | null;
+  /** Regex the string must match (free_text). */
+  pattern?: string | null;
+  /** Format annotation (`email` / `uri` / `date` / `date-time` / custom),
+   *  a UI hint mapped to an input type. */
+  format?: string | null;
+  /** Numeric bounds (number / integer). */
+  minimum?: number | null;
+  maximum?: number | null;
+  /** Pre-fill value, shaped to match the field kind. */
+  default?: AnswerValue | null;
+}
+
+/** Mirror of `Elicitation` in src/acp/elicitations.rs: a normalized,
+ *  form-mode elicitation the structured view renders. AskUserQuestion is
+ *  the common producer; MCP-server forms flow through the same path. */
+export interface Elicitation {
+  nonce: string;
+  message: string;
+  /** Schema-level heading (MCP forms may set one; AskUserQuestion does not). */
+  title?: string | null;
+  /** Schema-level description rendered under the message. */
+  description?: string | null;
+  tool_call_id?: string | null;
+  questions: ElicitationQuestion[];
+  requested_at: string;
+  resolved?: {
+    outcome: ElicitationOutcome;
+    resolved_at: string;
+  } | null;
+}
+
+export type ElicitationOutcome = "Accepted" | "Declined" | "Cancelled";
+
+/** Resolution payload POSTed to
+ *  `/api/sessions/{id}/acp/elicitations/{nonce}`. Mirror of
+ *  `ElicitationResolution` (tag = "action"). */
+export type ElicitationResolution =
+  | { action: "accept"; answers: Record<string, AnswerValue> }
+  | { action: "decline" }
+  | { action: "cancel" };
+
+/** One answered question rendered for the transcript. Mirror of
+ *  `ElicitationAnswer` in src/acp/elicitations.rs. Carried on
+ *  `ElicitationResolved` (server-rendered) and rebuilt locally by the
+ *  optimistic path. See #2209. */
+export interface ElicitationAnswer {
+  question: string;
+  answer: string;
+}
+
+/** Narrow a message-metadata payload to a non-empty answer list, so
+ *  UserText can pick the card over the plain-text fallback. */
+export function isElicitationAnswersPayload(value: unknown): value is ElicitationAnswer[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (x) =>
+        typeof x === "object" &&
+        x !== null &&
+        typeof (x as ElicitationAnswer).question === "string" &&
+        typeof (x as ElicitationAnswer).answer === "string",
+    )
+  );
+}
+
+/** Separator the adapter wedges between an AskUserQuestion option's label and
+ *  its description (`"<label> <sep> <description>"`). Written as an escape so
+ *  the em dash never appears literally in source. Mirrors `OPTION_DESC_SEP` in
+ *  AskUserQuestionCard and `OPTION_DESC_SEP` in src/acp/elicitations.rs. */
+const OPTION_DESC_SEP = " \u2014 ";
+
+/** Map a selected option value to its human label. A generic MCP form sends a
+ *  machine token as the value and the display text as the label; AskUserQuestion
+ *  sends the label as the value (with `label` possibly carrying a trailing
+ *  `"value <sep> description"`), so the bare value is kept there. */
+function selectLabel(question: ElicitationQuestion, raw: string): string {
+  const opt = question.options.find((o) => o.value === raw);
+  if (!opt) return raw;
+  return opt.label.startsWith(`${raw}${OPTION_DESC_SEP}`) ? raw : opt.label;
+}
+
+/** Render a submitted answer value for display, mapping select values to their
+ *  option labels. */
+function renderAnswerValue(question: ElicitationQuestion, value: AnswerValue): string {
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.map((v) => selectLabel(question, v)).join(", ");
+  if (typeof value === "string") return selectLabel(question, value);
+  return String(value);
+}
+
+/** Build display-ready answer pairs from a form and the submitted answers,
+ *  in question order, omitting unanswered questions. Mirrors
+ *  `summarize_answers` in src/acp/elicitations.rs so the optimistic local
+ *  path renders the same row the server broadcasts. */
+export function summarizeAnswers(elicitation: Elicitation, answers: Record<string, AnswerValue>): ElicitationAnswer[] {
+  const out: ElicitationAnswer[] = [];
+  for (const question of elicitation.questions) {
+    const value = answers[question.field_key];
+    if (value === undefined) continue;
+    out.push({
+      question: question.title || question.field_key,
+      answer: renderAnswerValue(question, value),
+    });
+  }
+  return out;
+}
+
 /** Mirror of `StartupErrorDetail` in src/acp/state.rs. Serde's
  *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
  *  on `kind`. Carries the structured remediation data the
@@ -198,17 +332,23 @@ export type IncompatibleAgentDetail =
       installed: string;
       required: string;
       install_command: string;
+      /** True when the daemon can `npm install -g` this agent itself, so
+       *  the web can offer "Update & restart" (gated on the
+       *  `acp.allow_agent_install` setting). See #2109. */
+      auto_install: boolean;
     }
   | {
       kind: "missing_agent_info";
       expected_package: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "mismatched_agent_name";
       expected: string;
       received: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unparseable_agent_version";
@@ -216,6 +356,7 @@ export type IncompatibleAgentDetail =
       raw_version: string;
       required: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unsupported_protocol_version";
@@ -290,6 +431,14 @@ export type AcpEvent =
     }
   | { ApprovalRequested: { approval: Approval } }
   | { ApprovalResolved: { nonce: string; decision: ApprovalDecision } }
+  | { ElicitationRequested: { elicitation: Elicitation } }
+  | {
+      ElicitationResolved: {
+        nonce: string;
+        outcome: ElicitationOutcome;
+        answers?: ElicitationAnswer[];
+      };
+    }
   | "SessionCleared"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
@@ -408,6 +557,14 @@ export interface AcpState {
   plan: Plan | null;
   inFlightTool: ToolCall | null;
   pendingApprovals: Approval[];
+  /** Pending AskUserQuestion elicitations awaiting a user answer. */
+  pendingElicitations: Elicitation[];
+  /** tool_call_ids that surfaced as an elicitation. The adapter emits an
+   *  AskUserQuestion tool call alongside the `elicitation/create`; the
+   *  elicitation card is the real UI, so its tool card is suppressed from
+   *  the transcript. Persisted across resolution so the completion frame
+   *  is dropped too. */
+  elicitationToolCallIds: string[];
   recentDiffs: DiffPreview[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
@@ -437,6 +594,12 @@ export interface AcpState {
    *  reconnect-replay can deliver the same frames again without
    *  double-applying them to state. */
   lastSeq: number;
+  /** Lowest seq whose rows are currently in `activity`, i.e. the
+   *  recent-first load watermark. 0 means nothing loaded yet (or the
+   *  whole history is loaded down to the start). The client pages older
+   *  history by requesting `?before=<oldestSeq>`; the reducer's `prepend`
+   *  action lowers it. See #2236. */
+  oldestSeq: number;
   /** True if the most recent broadcast told us we lagged. Cleared
    *  the next time the client successfully resyncs via the snapshot
    *  endpoint. */
@@ -668,6 +831,7 @@ export interface ActivityRow {
     | "thinking"
     | "user_prompt"
     | "user_diff_comments"
+    | "elicitation_answered"
     | "empty_output"
     | "context_reset"
     | "session_cleared"
@@ -697,6 +861,10 @@ export interface ActivityRow {
    *  ships them only at completion. Absent for text-only completions
    *  (those render from `text`). See #1818. */
   output?: ToolOutputBlock[];
+  /** Display-ready answers on an `elicitation_answered` row (the user's
+   *  reply to an AskUserQuestion / elicitation form). `text` holds a flat
+   *  fallback; the card renders the structured pairs. See #2209. */
+  elicitationAnswers?: ElicitationAnswer[];
   at: string; // ISO-8601
 }
 
@@ -726,6 +894,8 @@ export function emptyAcpState(): AcpState {
     plan: null,
     inFlightTool: null,
     pendingApprovals: [],
+    pendingElicitations: [],
+    elicitationToolCallIds: [],
     recentDiffs: [],
     thinking: false,
     rateLimit: null,
@@ -734,6 +904,7 @@ export function emptyAcpState(): AcpState {
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
+    oldestSeq: 0,
     lagged: false,
     startupError: null,
     incompatibleAgent: null,
@@ -887,6 +1058,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.plan = null;
       next.mode = "Default";
       next.pendingApprovals = [];
+      next.pendingElicitations = [];
+      next.elicitationToolCallIds = [];
       // Capture the agent's cumulative cost snapshot as the new
       // baseline so the next UsageUpdate reports cost-since-clear
       // instead of session-lifetime cumulative. `sessionUsage.cost`
@@ -907,6 +1080,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallStarted" in event) {
     const tc = event.ToolCallStarted.tool_call;
+    // An AskUserQuestion tool call is rendered by its elicitation card, not
+    // a transcript tool card. If the elicitation arrived first, drop the
+    // redundant start frame entirely. See ElicitationRequested.
+    if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
+      return next;
+    }
     next.inFlightTool = tc;
     // The reasoning block produced output (a tool call), so the agent is
     // no longer thinking. The adapter often skips ThinkingEnded when it
@@ -948,6 +1127,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallCompleted" in event) {
     const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
+    // The AskUserQuestion tool's completion is owned by its elicitation
+    // card; drop it so no transcript tool card materializes. Clear the
+    // in-flight pointer if it still points at this suppressed tool.
+    if (next.elicitationToolCallIds.includes(tool_call_id)) {
+      if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
+        next.inFlightTool = null;
+      }
+      return next;
+    }
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
     // tool-call part). Synthesize a minimal start row first so the card
@@ -1053,6 +1241,35 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("ApprovalResolved" in event) {
     const { nonce } = event.ApprovalResolved;
     next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
+    return next;
+  }
+  if ("ElicitationRequested" in event) {
+    const e = event.ElicitationRequested.elicitation;
+    next.pendingElicitations = [...next.pendingElicitations, e];
+    // The adapter also emits an AskUserQuestion tool call for this
+    // elicitation. The card below replaces it, so remember the
+    // tool_call_id (to drop a later start/complete frame) and strip any
+    // tool row + in-flight pointer it already produced.
+    if (e.tool_call_id) {
+      const id = e.tool_call_id;
+      if (!next.elicitationToolCallIds.includes(id)) {
+        next.elicitationToolCallIds = [...next.elicitationToolCallIds, id];
+      }
+      next.activity = next.activity.filter((r) => r.toolCallId !== id);
+      if (next.inFlightTool && next.inFlightTool.id === id) {
+        next.inFlightTool = null;
+      }
+    }
+    return next;
+  }
+  if ("ElicitationResolved" in event) {
+    const { nonce, answers } = event.ElicitationResolved;
+    next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
+    // Record the picked answer so it survives the card closing. Deduped by
+    // id, so this is a no-op if the optimistic local clear already added it
+    // (and the safety net when that clear never ran: cold replay, a second
+    // device). See #2209.
+    next.activity = appendElicitationAnswerRow(next.activity, nonce, answers ?? []);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1528,6 +1745,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     sweepOpenToolCalls(next, frame.seq);
     next.thinking = false;
     next.pendingApprovals = [];
+    next.pendingElicitations = [];
+    next.elicitationToolCallIds = [];
     next.sessionUsage = null;
     // The new backend reports its own cumulative cost starting from
     // zero, so the prior agent's per-clear baseline does not apply.
@@ -1597,6 +1816,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   return next;
 }
 
+/** Fold a self-contained run of frames from an empty state. Used by the
+ *  recent-first load to reduce an OLDER history page in isolation (so the
+ *  page's activity rows can be prepended without disturbing the live
+ *  reducer's optimistic / queue / approval state, which is not a pure
+ *  fold of the frame log), and to project the handshake snapshot. The
+ *  caller is responsible for the frames being a clean unit; backward
+ *  paging guarantees each page starts at a user-turn boundary. See #2236. */
+export function reduceFrames(frames: AcpFrame[]): AcpState {
+  return frames.reduce(applyEvent, emptyAcpState());
+}
+
 /** True when `rows` already carries a `tool_start` row for this id. */
 function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
   return rows.some((r) => r.kind === "tool_start" && r.toolCallId === toolCallId);
@@ -1659,6 +1889,29 @@ function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
     return next.slice(next.length - activityLimit);
   }
   return next;
+}
+
+/** Append an `elicitation_answered` row recording the user's answers,
+ *  keyed by `elicitation-<nonce>` and deduped by id. Shared by the
+ *  optimistic local clear (renders from the pending card) and the
+ *  server-event handler (renders from the broadcast), so whichever lands
+ *  first wins and the other is a no-op even when the broadcast survives
+ *  seq dedupe. No row for empty answers (skip / cancel / teardown). See
+ *  #2209. */
+export function appendElicitationAnswerRow(
+  rows: ActivityRow[],
+  nonce: string,
+  answers: ElicitationAnswer[],
+): ActivityRow[] {
+  const id = `elicitation-${nonce}`;
+  if (answers.length === 0 || rows.some((r) => r.id === id)) return rows;
+  return pushActivity(rows, {
+    id,
+    kind: "elicitation_answered",
+    text: answers.map((a) => `${a.question}: ${a.answer}`).join("\n"),
+    elicitationAnswers: answers,
+    at: new Date().toISOString(),
+  });
 }
 
 /** Close any `tool_start` rows that never received a matching terminal
@@ -1737,6 +1990,7 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
  *  fully retired) and re-derive `turnActive` from the counters. */
 export function normaliseTurnCounters(
   state: AcpState & {
+    oldestSeq?: number;
     pendingUserPromptSeq?: number;
     lastStoppedSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
@@ -1772,8 +2026,16 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
+  // older loaded) so the recent-first `before=<oldestSeq>` paging contract
+  // never sees undefined on a warm hydrate.
+  const oldestSeq =
+    typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
+      ? Math.max(0, Math.floor(state.oldestSeq))
+      : 0;
   return {
     ...state,
+    oldestSeq,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,

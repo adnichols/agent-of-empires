@@ -76,7 +76,15 @@ function Wrap({ children }: { children: ReactNode }) {
 // so bulk actions can share them, see #1724), so the row + hook are
 // exercised together here rather than the row owning the mutation. Returns
 // `null` while the workspace has no row to render.
-function Row({ ws, readOnly }: { ws: Workspace; readOnly?: boolean }) {
+function Row({
+  ws,
+  readOnly,
+  onCreateSession,
+}: {
+  ws: Workspace;
+  readOnly?: boolean;
+  onCreateSession?: (repoPath: string) => void;
+}) {
   const workspaces = useMemo(() => [ws], [ws]);
   const triage = useSidebarTriage(workspaces);
   return (
@@ -85,6 +93,7 @@ function Row({ ws, readOnly }: { ws: Workspace; readOnly?: boolean }) {
       isActive={false}
       isSelected={false}
       onActivate={() => {}}
+      onCreateSession={onCreateSession}
       readOnly={readOnly}
       optimistic={triage.optimisticFor(ws.id)}
       onPinToggle={triage.pinToggle}
@@ -178,8 +187,43 @@ describe("SessionRow chips", () => {
   });
 });
 
+describe("SessionRow smart-rename chip", () => {
+  it("renders the Auto-name chip when smart_rename is pending", () => {
+    const ws = workspace("w-pending", [session({ view: "structured", smart_rename: "pending" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Will auto-name")).not.toBeNull();
+    expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+
+  it("renders the Naming chip when smart_rename is running", () => {
+    const ws = workspace("w-running", [session({ view: "structured", smart_rename: "running" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Naming")).not.toBeNull();
+    expect(screen.queryByLabelText("Will auto-name")).toBeNull();
+  });
+
+  it("renders no smart-rename chip when inactive", () => {
+    const ws = workspace("w-inactive", [session({ view: "structured", smart_rename: "inactive" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Will auto-name")).toBeNull();
+    expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+});
+
 describe("SessionRow context menu", () => {
-  it("shows only the Unpin toggle when pinned", () => {
+  it("offers Unpin plus Archive and Snooze when pinned", () => {
     const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
@@ -189,9 +233,11 @@ describe("SessionRow context menu", () => {
     const row = screen.getByTestId("sidebar-session-row");
     fireEvent.contextMenu(row);
     const menu = screen.getByTestId("sidebar-context-menu");
+    // Archiving or snoozing a pinned session clears the pin on the
+    // backend, matching the TUI, so the menu must not force unpin-first.
     expect(menu.textContent).toContain("Unpin");
-    expect(menu.textContent).not.toContain("Archive");
-    expect(menu.textContent).not.toContain("Snooze");
+    expect(menu.textContent).toContain("Archive");
+    expect(menu.textContent).toContain("Snooze");
   });
 
   it("shows only the Unarchive toggle when archived", () => {
@@ -451,5 +497,34 @@ describe("SessionRow triage actions", () => {
       window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
       window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onSwitch);
     }
+  });
+
+  it("New Session click calls onCreateSession with the row's repo path", () => {
+    // main_repo_path wins over project_path, matching handleCreateSession's
+    // own project key (`main_repo_path || project_path`), so the wizard
+    // prefills from the right-clicked session's project (issue #2023).
+    const ws = workspace("w-new", [session({ id: "sess-new", project_path: "/p", main_repo_path: "/repos/work" })]);
+    const onCreateSession = vi.fn();
+    render(
+      <Wrap>
+        <Row ws={ws} onCreateSession={onCreateSession} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-new-session"));
+    expect(onCreateSession).toHaveBeenCalledWith("/repos/work");
+    // It's a client-side wizard open, not a server mutation.
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("hides New Session in read-only mode", () => {
+    const ws = workspace("w-ro", [session({ id: "sess-ro", project_path: "/p" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly onCreateSession={vi.fn()} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-new-session")).toBeNull();
   });
 });

@@ -108,6 +108,16 @@ pub struct ReplayPage {
     pub lowest_seq: Option<u64>,
 }
 
+/// A user turn begins at one of these events. Backward replay paging
+/// (`replay_page_before`) aligns each page to one so the client never
+/// seams a split turn when it prepends older history.
+fn is_user_turn_boundary(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
+    )
+}
+
 /// Highest seq stored for `session_id`, or 0 if none. Free fn so both
 /// the public [`EventStore::highest_seq`] and the single-snapshot
 /// [`EventStore::replay_page`] can share it under one held lock.
@@ -514,6 +524,158 @@ impl EventStore {
         }
     }
 
+    /// Return up to `limit` events for `session_id` with `seq < before`,
+    /// the ones sitting CLOSEST below `before`, in ascending (oldest
+    /// first) order. Backs the structured view's recent-first load: the
+    /// client renders the tail first (request `before = u64::MAX`) and
+    /// pages older history as the user scrolls up, passing the previous
+    /// page's lowest seq back as `before`.
+    ///
+    /// Mirrors [`replay_page`](Self::replay_page)'s single-snapshot lock
+    /// and `n + 1` probe, but scans `ORDER BY seq DESC` so the window is
+    /// the newest rows below `before` (a forward `ORDER BY seq ASC LIMIT`
+    /// would return the OLDEST rows and leave a gap). The DESC result is
+    /// reversed in memory before returning so callers always see ASC.
+    /// `last_scanned_seq` is the LOWEST seq consumed (the cursor for the
+    /// next-older page); it advances over rows that fail to deserialise so
+    /// a corrupt row can't stall the paging loop.
+    pub fn replay_page_before(
+        &self,
+        session_id: &str,
+        before: u64,
+        limit: Option<usize>,
+    ) -> ReplayPage {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let highest_seq = query_highest_seq(&conn, session_id);
+        let lowest_seq = query_lowest_seq(&conn, session_id);
+        // `seq` is a signed SQLite column; clamp before the cast so the
+        // tail request's `before = u64::MAX` stays positive (`seq < MAX`
+        // matches everything) instead of wrapping to a negative bound.
+        let before_i64 = i64::try_from(before).unwrap_or(i64::MAX);
+        let probe = limit.map(|n| n.saturating_add(1));
+        let sql = match probe {
+            Some(_) => {
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1 AND seq < ?2
+                 ORDER BY seq DESC LIMIT ?3"
+            }
+            None => {
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1 AND seq < ?2
+                 ORDER BY seq DESC"
+            }
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare replay_page_before for {session_id}: {e}");
+                return ReplayPage {
+                    events: Vec::new(),
+                    last_scanned_seq: None,
+                    has_more: false,
+                    highest_seq,
+                    lowest_seq,
+                };
+            }
+        };
+        let map_row = |row: &rusqlite::Row| {
+            let seq: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            Ok((seq as u64, json))
+        };
+        let rows = match probe {
+            Some(p) => stmt.query_map(params![session_id, before_i64, p as i64], map_row),
+            None => stmt.query_map(params![session_id, before_i64], map_row),
+        };
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query replay_page_before for {session_id}: {e}");
+                return ReplayPage {
+                    events: Vec::new(),
+                    last_scanned_seq: None,
+                    has_more: false,
+                    highest_seq,
+                    lowest_seq,
+                };
+            }
+        };
+        let mut out = Vec::new();
+        let mut last_scanned_seq = None;
+        let mut scanned = 0usize;
+        let mut has_more = false;
+        for row in rows {
+            match row {
+                Ok((seq, json)) => {
+                    // The probe row proves an older page exists; don't
+                    // consume it or move the cursor onto it.
+                    if let Some(n) = limit {
+                        if scanned == n {
+                            has_more = true;
+                            break;
+                        }
+                    }
+                    scanned += 1;
+                    // DESC scan, so each consumed row's seq is lower than
+                    // the last; the final one is the page's lowest, which
+                    // is the cursor for the next-older page.
+                    last_scanned_seq = Some(seq);
+                    match serde_json::from_str::<Event>(&json) {
+                        Ok(event) => out.push((seq, event)),
+                        Err(e) => warn!(
+                            target: "acp.event_store",
+                            "deserialise event {session_id}@{seq}: {e}"
+                        ),
+                    }
+                }
+                Err(e) => warn!(target: "acp.event_store", "row error: {e}"),
+            }
+        }
+        // Scanned newest-first; callers expect oldest-first.
+        out.reverse();
+        // Align the page to a user-turn boundary so the client can reduce
+        // it in isolation and prepend it without seaming a split turn onto
+        // the already-loaded head. Only when `has_more`: a leading partial
+        // turn belongs to an older turn whose start is in the next page, so
+        // drop it here and let the next `before` re-fetch it. When the page
+        // reached session start (`!has_more`) keep everything, so the very
+        // first turn and the pinned handshake snapshot (#1049) survive on a
+        // short session that loads in one page. The giant-single-turn case
+        // (no boundary in the whole window) keeps the window as-is rather
+        // than returning an empty page and trapping the client's paging loop.
+        if has_more {
+            if let Some(i) = out
+                .iter()
+                .position(|(_, ev)| is_user_turn_boundary(ev))
+                .filter(|&i| i > 0)
+            {
+                out.drain(0..i);
+            }
+        }
+        // Cursor for the next-older page is the lowest seq we kept, so a
+        // trimmed leading turn re-loads contiguously on the next request.
+        last_scanned_seq = out.first().map(|(seq, _)| *seq).or(last_scanned_seq);
+        trace!(
+            target: "acp.event_store",
+            session = %session_id,
+            before,
+            limit = ?limit,
+            returned = out.len(),
+            has_more,
+            "replayed events before cursor"
+        );
+        ReplayPage {
+            events: out,
+            last_scanned_seq,
+            has_more,
+            highest_seq,
+            lowest_seq,
+        }
+    }
+
     /// Return the latest `Event::PlanUpdated` stored for `session_id`,
     /// if any. Used by the REST sessions endpoint to surface
     /// plan-progress chrome (current step / completed / total) on the
@@ -894,6 +1056,8 @@ impl EventStore {
                    AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
                      OR json_extract(event_json, '$.Stopped') IS NOT NULL
                      OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
                      OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
@@ -949,6 +1113,47 @@ impl EventStore {
             Ok(r) => r,
             Err(e) => {
                 warn!(target: "acp.event_store", "query unresolved_approval_nonces for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Elicitation nonces from `ElicitationRequested` events on disk with
+    /// no matching `ElicitationResolved`. The elicitation parallel of
+    /// [`Self::unresolved_approval_nonces`]: lets the supervisor cancel
+    /// question cards whose responder oneshot died with the previous
+    /// daemon, so they don't reappear as dead 404 cards on replay.
+    pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
+             FROM acp_events
+             WHERE session_id = ?1
+               AND json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+               AND json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') NOT IN (
+                   SELECT json_extract(event_json, '$.ElicitationResolved.nonce')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
+               )",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_elicitation_nonces for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| {
+            let nonce: String = row.get(0)?;
+            Ok(Nonce(nonce))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_elicitation_nonces for {session_id}: {e}");
                 return Vec::new();
             }
         };
@@ -1263,6 +1468,8 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ToolCallUpdated { .. } => "tool_call_updated",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
+        Event::ElicitationRequested { .. } => "elicitation_requested",
+        Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
@@ -2482,6 +2689,107 @@ mod tests {
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
     }
 
+    fn orphan_test_elicitation(nonce: &Nonce) -> crate::acp::elicitations::Elicitation {
+        crate::acp::elicitations::Elicitation {
+            nonce: nonce.clone(),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        }
+    }
+
+    /// Elicitation parallel of `unresolved_approval_nonces`: an
+    /// `ElicitationRequested` whose nonce never saw a matching
+    /// `ElicitationResolved` is reported as orphaned on reattach.
+    #[test]
+    fn unresolved_elicitation_nonces_finds_orphaned_requests() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::ElicitationOutcome;
+
+        let (_tmp, store) = open_store(1000);
+        let nonce_a = Nonce::new();
+        let nonce_b = Nonce::new();
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation(&nonce_a),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation(&nonce_b),
+                },
+            )
+            .unwrap();
+        // Only nonce_a is resolved; nonce_b stays orphaned.
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::ElicitationResolved {
+                    nonce: nonce_a,
+                    outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), vec![nonce_b]);
+        // Unrelated session must not bleed into the query.
+        assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
+    }
+
+    /// `latest_status_event` must recognize elicitation lifecycle events,
+    /// so a session blocked on a pending elicitation re-derives to Waiting
+    /// on cold-start / attach instead of waiting for the next live event.
+    #[test]
+    fn latest_status_event_includes_elicitation_lifecycle() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::ElicitationOutcome;
+
+        let (_tmp, store) = open_store(1000);
+        let nonce_a = Nonce::new();
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation(&nonce_a),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::ElicitationRequested { .. })
+        ));
+
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ElicitationResolved {
+                    nonce: nonce_a,
+                    outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::ElicitationResolved { .. })
+        ));
+    }
+
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
             info: RateLimitInfo {
@@ -2549,5 +2857,93 @@ mod tests {
             ),
             "RateLimitAutoResumed must supersede Stopped{{rate_limited}}"
         );
+    }
+
+    #[test]
+    fn replay_page_before_returns_closest_below_in_asc_order() {
+        let (_tmp, store) = open_store(1000);
+        for seq in 1..=10 {
+            store.record("s-1", seq, &Event::ThinkingStarted).unwrap();
+        }
+        // Tail: newest page is requested with before = u64::MAX.
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(3));
+        let seqs: Vec<u64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        // The CLOSEST 3 below the cursor, ascending (not the oldest 3).
+        assert_eq!(seqs, vec![8, 9, 10]);
+        assert!(tail.has_more, "older events remain below seq 8");
+        assert_eq!(
+            tail.last_scanned_seq,
+            Some(8),
+            "cursor is the page's lowest"
+        );
+        assert_eq!(tail.highest_seq, 10);
+
+        // Next-older page pages back via before = previous lowest.
+        let older = store.replay_page_before("s-1", 8, Some(3));
+        let seqs: Vec<u64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 7]);
+        assert!(older.has_more);
+        assert_eq!(older.last_scanned_seq, Some(5));
+    }
+
+    #[test]
+    fn replay_page_before_stops_at_session_start() {
+        let (_tmp, store) = open_store(1000);
+        for seq in 1..=4 {
+            store.record("s-1", seq, &Event::ThinkingStarted).unwrap();
+        }
+        // A page that reaches the very first event clears has_more so the
+        // client knows not to keep paging older.
+        let page = store.replay_page_before("s-1", 3, Some(10));
+        let seqs: Vec<u64> = page.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert!(!page.has_more, "reached session start, nothing older");
+        // Empty when before predates everything stored.
+        let none = store.replay_page_before("s-1", 1, Some(10));
+        assert!(none.events.is_empty());
+        assert!(!none.has_more);
+    }
+
+    #[test]
+    fn replay_page_before_trims_leading_partial_turn_to_boundary() {
+        let (_tmp, store) = open_store(1000);
+        // seq 1: handshake-ish, 2: prompt A, 3-4: A's turn, 5: prompt B,
+        // 6-7: B's turn.
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::PromptCapabilities {
+                    image: true,
+                    audio: false,
+                    embedded_context: true,
+                },
+            )
+            .unwrap();
+        let prompt = |t: &str| Event::UserPromptSent {
+            text: t.into(),
+            attachments: vec![],
+        };
+        store.record("s-1", 2, &prompt("A")).unwrap();
+        store.record("s-1", 3, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 4, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 5, &prompt("B")).unwrap();
+        store.record("s-1", 6, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 7, &Event::ThinkingStarted).unwrap();
+
+        // Tail of 4 frames would be seq 4..7, but seq 4 is mid-turn A.
+        // With has_more, the page is trimmed to start at prompt B (seq 5).
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(4));
+        let seqs: Vec<u64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 7], "leading partial turn A trimmed");
+        assert!(tail.has_more);
+        assert_eq!(tail.last_scanned_seq, Some(5), "cursor is boundary B");
+
+        // Next page (before=5) reaches session start: keep everything,
+        // including the seq-1 handshake, so a one-page load isn't stripped.
+        let older = store.replay_page_before("s-1", 5, Some(10));
+        let seqs: Vec<u64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        assert!(!older.has_more);
     }
 }

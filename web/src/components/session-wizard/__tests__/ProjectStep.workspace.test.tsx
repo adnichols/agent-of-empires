@@ -19,6 +19,8 @@ import type { SessionResponse, WorkspaceRepoSummary } from "../../../lib/types";
 
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
+  fetchRecentProjects: vi.fn(),
+  fetchProjects: vi.fn().mockResolvedValue([]),
   cloneRepo: vi.fn(),
 }));
 

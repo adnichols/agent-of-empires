@@ -5,7 +5,7 @@ use clap::Args;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::containers::{self, ContainerRuntimeInterface};
+use crate::containers;
 use crate::session::builder;
 use crate::session::repo_config;
 use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
@@ -293,7 +293,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         } else {
             // Single worktree mode (existing logic)
             if !GitWorktree::is_git_repo(&path) {
-                bail!("Path is not in a git repository\nTip: Navigate to a git repository first");
+                bail!(
+                    "Worktree mode requires a git repository, but this path is not one: {}\n\
+                     Tip: omit --worktree-branch to start an in-place session here, \
+                     or point at a git repository.",
+                    path.display()
+                );
             }
 
             let main_repo_path = GitWorktree::find_main_repo(&path)?;
@@ -723,6 +728,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 container_name,
                 extra_env: None,
                 custom_instruction: config.sandbox.custom_instruction.clone(),
+                before_start_env: Vec::new(),
             });
         }
     }

@@ -1,7 +1,7 @@
 //! User configuration management
 
 use super::get_app_dir;
-use super::repo_config::HooksConfig;
+use super::repo_config::{HooksConfig, HostHooksConfig};
 use anyhow::Result;
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,11 @@ pub struct Config {
 
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// Host-side lifecycle hooks. Profile/global only; never honored from a
+    /// repo's `.agent-of-empires/config.toml` (these run commands on the host).
+    #[serde(default)]
+    pub host_hooks: HostHooksConfig,
 
     #[serde(default)]
     pub sound: crate::sound::SoundConfig,
@@ -439,6 +444,23 @@ pub struct AcpConfig {
     #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
     #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
     pub rate_limit_auto_resume_grace_secs: u32,
+    /// Allow the web dashboard's "Update & restart" control to run the
+    /// agent's `npm install -g <pkg>` on the host and respawn the worker.
+    /// Off by default: the daemon executing a global package install is a
+    /// host-level capability (it runs arbitrary npm lifecycle scripts as the
+    /// daemon user), so it stays opt-in, is always blocked in read-only mode,
+    /// and is `local_only` so a remote dashboard client cannot flip it on.
+    /// Only npm-installable agents are eligible; others keep the manual
+    /// install hint. See #2109.
+    #[serde(default)]
+    #[setting(
+        label = "Allow agent install from web",
+        widget = "toggle",
+        web = "local_only:runs npm install on the host as the daemon user",
+        global_only,
+        advanced
+    )]
+    pub allow_agent_install: bool,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -515,6 +537,7 @@ impl Default for AcpConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
+            allow_agent_install: false,
         }
     }
 }
@@ -663,6 +686,12 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
 
+    /// Latches once the user has been warned (when adding a project in the TUI)
+    /// that the directory is not a git repository, so the one-time notice about
+    /// git features being unavailable does not repeat on every non-git add.
+    #[serde(default)]
+    pub has_seen_non_git_project_warning: bool,
+
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
 
@@ -693,6 +722,17 @@ pub struct AppStateConfig {
     /// shelved session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
+
+    /// Server-side mirror of the web dashboard's syncable UI state, keyed by
+    /// the frontend's localStorage key (the value is the opaque string the
+    /// browser stored). Single-tenant: there is one user, so these prefs
+    /// (sidebar sort/axis, tool density, repo appearance/order, group collapse,
+    /// last-used tool, welcome-seen, etc.) live here so they follow the user
+    /// across browsers and devices instead of being trapped in per-browser
+    /// localStorage. The server never interprets the values; the web owns the
+    /// shape. See `GET`/`PATCH /api/app-state/web-ui-state`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
 /// Session-related configuration defaults
@@ -743,6 +783,17 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
+
+    /// Auto-rename a new structured-view (ACP) session from its first message,
+    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
+    /// applies while the session still carries its auto-generated name; a
+    /// manually named session is never touched. Title only: the worktree
+    /// directory is not moved (the running agent holds it). Agents without a
+    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
+    /// the generated name.
+    #[serde(default = "default_true")]
+    #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
+    pub smart_rename: bool,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -1072,6 +1123,7 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            smart_rename: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -2056,12 +2108,12 @@ impl Config {
     }
 
     /// Effective theme name to paint, mapping the empty default to the
-    /// `default` builtin. Theme is a global preference (see
+    /// `zinc` builtin (the default theme). Theme is a global preference (see
     /// [`resolve_theme_name`]); callers read it from the global config, never
     /// the profile-merged config.
     pub fn effective_theme_name(&self) -> String {
         if self.theme.name.is_empty() {
-            "default".to_string()
+            "zinc".to_string()
         } else {
             self.theme.name.clone()
         }
@@ -2097,7 +2149,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 /// the global theme on others let a per-profile override (which the web theme
 /// picker used to write) shadow the global pick on every Settings open/close,
 /// flipping the theme until the next restart. An empty name maps to the
-/// `default` builtin, matching the web dashboard's empty-name fallback.
+/// `zinc` builtin, matching the web dashboard's empty-name fallback.
 pub fn resolve_theme_name() -> String {
     Config::load_or_warn().effective_theme_name()
 }

@@ -13,6 +13,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::approvals::Nonce;
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::event_store::AttachmentBlob;
 use crate::acp::protocol::{
     ApprovalDecisionWire, ContextPrimerQuery, ContextPrimerResponse, DiffCommentsPromptRequest,
@@ -361,6 +362,198 @@ pub async fn spawn_acp(
         )
             .into_response(),
     }
+}
+
+/// Process-wide guard so concurrent `npm install -g` runs (across any
+/// sessions) never race the daemon user's shared global npm prefix. See #2109.
+static INSTALL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Cap per stream on the npm output echoed back to the web. `npm install -g`
+/// runs arbitrary lifecycle scripts; a verbose or hostile package could emit
+/// huge output, so truncate what we serialize and mark it. See #2109.
+const MAX_INSTALL_LOG_BYTES: usize = 64 * 1024;
+
+fn truncate_install_log(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    if text.len() <= MAX_INSTALL_LOG_BYTES {
+        return text.into_owned();
+    }
+    let mut cut = MAX_INSTALL_LOG_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n... [truncated, output exceeded {MAX_INSTALL_LOG_BYTES} bytes]",
+        &text[..cut]
+    )
+}
+
+/// Result of a server-run agent install. The "& restart" half is the
+/// client's job: on `success` the web re-POSTs `/acp/spawn` (the same
+/// respawn path the Restart button uses), so this endpoint stays a pure
+/// install with no server-side respawn duplication. See #2109.
+#[derive(Serialize)]
+pub struct InstallAgentResponse {
+    pub session_id: String,
+    pub package: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// `POST /api/sessions/{id}/acp/install-agent`: run `npm install -g <pkg>`
+/// for the session's agent on the host, then let the client respawn.
+///
+/// Hardened, opt-in (Tier 2 of #2109): blocked in read-only mode; gated on
+/// the `acp.allow_agent_install` setting (default off, `local_only`); the
+/// package is resolved server-side from the session's agent via a static
+/// npm-only table, never from client input; npm runs with fixed argv and no
+/// shell; the per-session instance lock serializes installs so a
+/// double-click cannot race the global npm prefix. Sandbox sessions are
+/// refused because a host install never reaches the containerized agent.
+pub async fn install_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if !crate::session::Config::load_or_warn()
+        .acp
+        .allow_agent_install
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "install_disabled",
+                "message": "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
+            })),
+        )
+            .into_response();
+    }
+
+    let instances = state.instances.read().await;
+    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    drop(instances);
+
+    if instance.is_sandboxed() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "sandboxed",
+                "message": "This session runs in a sandbox container; a host install would not reach the agent. Install it inside the container or rebuild its image.",
+            })),
+        )
+            .into_response();
+    }
+
+    // Resolve the binary the session would spawn, then its npm package.
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.agent_name.as_deref(),
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await;
+    let binary = match state.acp_supervisor.resolve_agent(&agent).await {
+        Ok(spec) => spec.command,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "agent_resolve_failed",
+                    "message": format!("could not resolve agent `{agent}`: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(package) = crate::acp::install_hints::npm_package_for(&binary) else {
+        let hint =
+            crate::acp::install_hints::install_hint_for(&binary).unwrap_or("(see project docs)");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "not_npm_installable",
+                "message": format!("`{binary}` cannot be installed via npm from the daemon. Install it manually: {hint}"),
+                "install_command": hint,
+            })),
+        )
+            .into_response();
+    };
+
+    // `npm install -g` mutates the daemon user's shared global prefix, so two
+    // *different* sessions installing at once would race. Serialize all
+    // installs process-wide, and also hold the per-session lock so a same-
+    // session spawn cannot run mid-install. `instance_lock` returns the lock
+    // handle; hold the guard across the install.
+    let _install_guard = INSTALL_LOCK.lock().await;
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
+    let Ok(npm) = which::which("npm") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "npm_missing",
+                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
+            })),
+        )
+            .into_response();
+    };
+
+    // Bound the install so a network stall or a wedged lifecycle script
+    // cannot hang the request (and the held lock) forever. kill_on_drop
+    // reaps the child if the timeout fires.
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        tokio::process::Command::new(&npm)
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "npm_start_failed",
+                    "message": format!("npm install failed to start: {e}"),
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "install_timeout",
+                    "message": "`npm install -g` did not finish within 180s.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(InstallAgentResponse {
+        session_id: id,
+        package: package.to_string(),
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: truncate_install_log(&output.stdout),
+        stderr: truncate_install_log(&output.stderr),
+    })
+    .into_response()
 }
 
 pub async fn shutdown_acp(
@@ -747,14 +940,22 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Idle-dormant wake: the worker was auto-stopped for inactivity
-    // (#1689) and the reconciler will not respawn it until its next ~2s
-    // tick. Reserve the resume slot synchronously and drive a fresh spawn
-    // in a detached task NOW, so the `send_prompt` below blocks on
+    // Resume a worker that is not currently live. Two cases:
+    //   - Idle-dormant wake: the worker was auto-stopped for inactivity
+    //     (#1689) and the reconciler will not respawn it until its next
+    //     ~2s tick.
+    //   - Dead worker: the worker exited for another reason (e.g. the
+    //     silent-orphan watchdog escalated a monitor / `/loop` turn) and
+    //     is neither dormant nor mid-respawn, so a send would otherwise
+    //     404 and force a manual `aoe acp restart`.
+    // Either way, reserve the resume slot synchronously and drive a fresh
+    // spawn in a detached task NOW so the `send_prompt` below blocks on
     // `wait_for_worker` until the worker is live instead of racing ahead
     // to a 404. The detached task survives this request being cancelled on
-    // client disconnect. See #1748.
-    if woke_idle_dormant {
+    // client disconnect. `is_running` is true for a live or mid-respawn
+    // worker, so a healthy session never double-spawns. See #1748.
+    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
+    if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
         match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
             Ok(ResumeTrigger::NotFound) => {
@@ -789,6 +990,14 @@ pub async fn acp_prompt(
         .acp_supervisor
         .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
+    // Best-effort: auto-rename a still-default-named session from this first
+    // message via the agent's one-shot mode. Detached so it never blocks or
+    // fails the prompt; all gating lives inside. See session::smart_rename.
+    tokio::spawn(crate::session::smart_rename::try_smart_rename(
+        state.clone(),
+        id.clone(),
+        req.text.clone(),
+    ));
     match state
         .acp_supervisor
         .send_prompt(&id, &req.text, &attachments)
@@ -796,7 +1005,7 @@ pub async fn acp_prompt(
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
-            if woke_idle_dormant {
+            if needs_resume {
                 // The respawn we kicked above did not finish within
                 // `send_prompt`'s wait window (slow sandbox / spawn). The
                 // worker is still coming; signal a retryable typed status
@@ -1691,6 +1900,53 @@ pub async fn resolve_approval(
     }
 }
 
+/// Resolve a pending `AskUserQuestion` elicitation. The body is an
+/// `ElicitationResolution` (`{"action":"accept","answers":{...}}`,
+/// `{"action":"decline"}`, or `{"action":"cancel"}`); answers are
+/// validated server-side before they reach the agent. Mirrors
+/// `resolve_approval`: 204 on success, 404 for an unknown session or
+/// nonce.
+pub async fn resolve_elicitation(
+    State(state): State<Arc<AppState>>,
+    Path((id, nonce_str)): Path<(String, String)>,
+    req: Result<Json<ElicitationResolution>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(resolution) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let nonce = Nonce(nonce_str.clone());
+    match state
+        .acp_supervisor
+        .resolve_elicitation(&id, nonce, resolution)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(SupervisorError::UnknownSession(_)) => {
+            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
+        }
+        Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => (
+            StatusCode::NOT_FOUND,
+            format!("no pending elicitation with nonce {nonce_str}"),
+        )
+            .into_response(),
+        // A failed server-side validation leaves the elicitation pending,
+        // so 422 (not 404): the client can correct the answer and resubmit
+        // the same nonce.
+        Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::InvalidAnswer(msg))) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("resolve failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Tally a user-resolved approval for the opt-in telemetry snapshot. Only the
 /// three real user decisions are counted; the synthetic daemon-restart
 /// `Cancelled` decision is not a user choice and never reaches this endpoint,
@@ -1767,7 +2023,16 @@ pub async fn acp_replay(
     // One store call returns the page and its `highest_seq`/`lowest_seq`
     // under a single lock, so the response is a consistent snapshot and a
     // concurrent `record()` can't desync the cap from the page rows.
-    let page = state.acp_event_store.replay_page(&id, q.since, Some(limit));
+    // `before` switches to backward (older-first) paging for recent-first
+    // load; absent it stays on the forward `since` contract WS catch-up
+    // and existing clients rely on.
+    let backward = q.before.is_some();
+    let page = match q.before {
+        Some(before) => state
+            .acp_event_store
+            .replay_page_before(&id, before, Some(limit)),
+        None => state.acp_event_store.replay_page(&id, q.since, Some(limit)),
+    };
     let highest_seq = page.highest_seq;
     let lowest_seq = page.lowest_seq;
     let next_cursor = page.last_scanned_seq;
@@ -1787,9 +2052,12 @@ pub async fn acp_replay(
     // full reload. With no events on disk yet, nothing is lost. Computed
     // per request so a mid-loop prune is caught on whatever page first
     // sees the gap, not only the first.
-    let lost = match lowest_seq {
-        Some(lo) => q.since < lo.saturating_sub(1),
-        None => false,
+    // Backward paging walks down only within what's stored, so the
+    // truncation signal doesn't apply; the client stops when `has_more`
+    // clears. `lost` stays a forward-replay concern.
+    let lost = match (backward, lowest_seq) {
+        (false, Some(lo)) => q.since < lo.saturating_sub(1),
+        _ => false,
     };
     Json(ReplayResponse {
         frames,

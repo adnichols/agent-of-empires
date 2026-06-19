@@ -14,6 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
+* [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
@@ -109,6 +110,7 @@ Run without arguments to launch the TUI dashboard.
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
+* `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
 * `profile` — Manage profiles (separate workspaces)
@@ -289,6 +291,21 @@ Show session status summary
 
 
 
+## `aoe killall`
+
+Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
+
+**Usage:** `aoe killall [OPTIONS]`
+
+###### **Options:**
+
+* `--timeout-secs <TIMEOUT_SECS>` — Grace period in seconds before force-killing agent workers. tmux sessions and the daemon use their own built-in grace
+
+  Default value: `5`
+* `--keep-daemon` — Leave the `aoe serve` daemon running; stop only workers and tmux sessions
+
+
+
 ## `aoe session`
 
 Manage session lifecycle (start, stop, attach, etc.)
@@ -312,7 +329,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unsnooze` — Wake a snoozed session immediately
 * `favorite` — Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
 * `unfavorite` — Clear the favorite flag on a session
-* `archive` — Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+* `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 
 
@@ -540,7 +557,7 @@ Clear the favorite flag on a session
 
 ## `aoe session archive`
 
-Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 
 **Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
 
@@ -550,7 +567,7 @@ Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux
 
 ###### **Options:**
 
-* `--no-kill` — Skip killing the tmux pane. By default archiving stops the running agent so the row renders as truly parked; pass this to keep the pane alive while still marking the session archived
+* `--no-kill` — Skip tmux teardown on archive
 
 
 
@@ -751,7 +768,7 @@ Add a project to the registry
 
 ###### **Arguments:**
 
-* `<PATH>` — Path to the git repository
+* `<PATH>` — Path to the project directory: a git repository, or any directory to run sessions in place
 
 ###### **Options:**
 

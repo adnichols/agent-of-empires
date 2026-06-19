@@ -33,6 +33,7 @@ use crate::acp::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
     WsMessage, REPLAY_PAGE_SIZE,
 };
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -369,8 +370,12 @@ async fn handle_terminal_event(
     let has_pending = !state.transcript.pending_approvals.is_empty();
     let ctx = InputContext {
         has_pending_approval: has_pending,
+        has_pending_elicitation: !state.transcript.pending_elicitations.is_empty(),
         slash_picker_open: state.slash_picker_open(),
         mention_picker_open: state.mention.is_some(),
+        caret_at_origin: state.caret_at_origin(),
+        browsing_queue: state.browsing_queue(),
+        queue_len: state.queue.len(),
     };
     let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
@@ -384,6 +389,11 @@ async fn handle_terminal_event(
             } else {
                 focus
             };
+            // Leaving the composer ends any queue-recall browse; the
+            // in-progress text stays put as a draft.
+            if state.focus != Focus::Composer {
+                state.cancel_recall();
+            }
             state.reconcile_selection();
             Ok(false)
         }
@@ -434,7 +444,28 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::SubmitPrompt => {
+            // Capture the browse target before take_composer_text resets
+            // the recall state.
+            let recall = state.recall.take();
             let text = state.take_composer_text();
+            // Submitting while browsing edits that queued entry in place,
+            // preserving its position rather than enqueuing a duplicate.
+            // If the entry drained between recall and now, the index is
+            // stale; fall through to the normal send / queue path so the
+            // edited text is never lost.
+            if !text.is_empty() {
+                if let Some(r) = recall {
+                    if state.queue.replace(r.index, text.clone()) {
+                        set_toast(
+                            state,
+                            toast_deadline,
+                            format!("edited queued prompt ({} waiting)", state.queue.len()),
+                            ToastKind::Info,
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             if text.is_empty() {
                 // Empty Enter is a manual flush: if the agent is idle and
                 // prompts are stuck in the queue (e.g. a drain POST failed
@@ -478,12 +509,23 @@ async fn handle_terminal_event(
                 return Ok(false);
             }
             state.queue.clear();
+            // The browsed entry no longer exists; end the browse but keep
+            // whatever text is in the composer as a draft.
+            state.cancel_recall();
             set_toast(
                 state,
                 toast_deadline,
                 "queue cleared".into(),
                 ToastKind::Info,
             );
+            Ok(false)
+        }
+        Intent::RecallQueued(delta) => {
+            state.recall_step(delta);
+            Ok(false)
+        }
+        Intent::RecallCancel => {
+            state.recall_cancel_restore();
             Ok(false)
         }
         Intent::Scroll(delta) => {
@@ -546,6 +588,37 @@ async fn handle_terminal_event(
                         state,
                         toast_deadline,
                         format!("approval failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+            Ok(false)
+        }
+        Intent::SkipElicitation | Intent::CancelElicitation => {
+            let Some(pending) = state.transcript.pending_elicitations.first().cloned() else {
+                return Ok(false);
+            };
+            let (resolution, label) = if matches!(intent, Intent::SkipElicitation) {
+                (ElicitationResolution::Decline, "question skipped")
+            } else {
+                (ElicitationResolution::Cancel, "question cancelled")
+            };
+            match state
+                .http
+                .resolve_elicitation(&state.session_id, &pending.nonce, &resolution)
+                .await
+            {
+                Ok(()) | Err(HttpError::ApprovalGone) => {
+                    // Clear locally now; the ElicitationResolved broadcast
+                    // also clears it, but the seq dedupe can swallow that.
+                    state.transcript.resolve_elicitation_locally(&pending.nonce);
+                    set_toast(state, toast_deadline, label.into(), ToastKind::Info);
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("elicitation resolve failed: {e}"),
                         ToastKind::Error,
                     );
                 }
@@ -805,6 +878,9 @@ async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Optio
     };
     if send_prompt_now(state, toast_deadline, &text).await {
         state.queue.drop_front(count);
+        // Keep an in-progress ArrowUp/ArrowDown browse pointing at the
+        // right entry now that the front of the queue shifted.
+        state.reconcile_recall_after_drain(count);
         let remaining = state.queue.len();
         let msg = if remaining == 0 {
             "queue drained".to_string()

@@ -286,6 +286,31 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(parsed._aoe_parent_tool_call_id).toBe("task-parent-1");
   });
 
+  it("smuggles memory_recall through args_preview as _aoe_memory_recall (#2142)", () => {
+    const memTool: ToolCall = {
+      id: "mem-1",
+      name: "Recalled synthesized memory",
+      kind: "read",
+      args_preview: "{}",
+      started_at: "2026-05-12T00:00:00Z",
+      memory_recall: { mode: "synthesize", synthesized_text: "remembered" },
+    };
+    const row: ActivityRow = {
+      id: "start-mem-1",
+      kind: "tool_start",
+      text: "Recalled synthesized memory",
+      toolCallId: "mem-1",
+      tool: memTool,
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), row], false);
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{ type: string; argsText?: string }>;
+    const part = parts.find((p) => p.type === "tool-call")!;
+    const parsed = JSON.parse(part.argsText!);
+    expect(parsed._aoe_memory_recall).toEqual({ mode: "synthesize", synthesized_text: "remembered" });
+  });
+
   it("collapses a parent Task + its children into a _aoe_subagent_task part (#1041)", () => {
     const parent: ToolCall = {
       id: "task-1",
@@ -477,6 +502,37 @@ describe("activityToThreadMessages; diff-comments user card (#1123)", () => {
       id: "user-seq-2",
       kind: "user_diff_comments",
       text: "plain body\n",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    expect(user.metadata).toBeUndefined();
+  });
+});
+
+describe("activityToThreadMessages; elicitation answer (#2209)", () => {
+  it("emits a user message with the answers on metadata.custom", () => {
+    const row: ActivityRow = {
+      id: "elicitation-el-1",
+      kind: "elicitation_answered",
+      text: "Proceed?: Yes",
+      elicitationAnswers: [{ question: "Proceed?", answer: "Yes" }],
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    const parts = user.content as Array<{ type: string; text?: string }>;
+    expect(parts[0]!.type).toBe("text");
+    expect(parts[0]!.text).toBe("Proceed?: Yes");
+    const custom = (user.metadata as { custom?: { elicitationAnswers?: unknown[] } } | undefined)?.custom;
+    expect(custom?.elicitationAnswers).toHaveLength(1);
+  });
+
+  it("omits metadata when the structured answers are absent", () => {
+    const row: ActivityRow = {
+      id: "elicitation-el-2",
+      kind: "elicitation_answered",
+      text: "Q: A",
       at: "2026-05-12T00:00:00Z",
     };
     const messages = activityToThreadMessages([row], false);

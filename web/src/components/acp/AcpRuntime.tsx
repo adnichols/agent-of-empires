@@ -28,12 +28,26 @@
 // component-injection points.
 
 import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
-import type { ActivityRow, ApprovalDecision, AcpState, PromptAttachmentInput, ToolCall } from "../../lib/acpTypes";
+import type {
+  ActivityRow,
+  ApprovalDecision,
+  AcpState,
+  ElicitationResolution,
+  PromptAttachmentInput,
+  ToolCall,
+} from "../../lib/acpTypes";
 import { hasTodoItemsArgsText, parseJsonObject } from "../../lib/acpArgs";
+import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useCancelEscalation } from "./useCancelEscalation";
+
+// Re-exported for existing tests that import it from this module; the
+// implementation now lives alongside the escalation hook. See #2237.
+export { nextCancelAction } from "./useCancelEscalation";
 
 interface Props {
   sessionId: string;
@@ -72,6 +86,7 @@ export interface AcpContext {
   maxRetries: number;
   manualReconnect: () => void;
   resolveApproval: (nonce: string, decision: ApprovalDecision) => Promise<void>;
+  resolveElicitation: (nonce: string, resolution: ElicitationResolution) => Promise<void>;
   sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
   /** Attachments the composer has staged for the next send. Owned here
    *  (above the assistant-ui runtime) so `onNew` can attach them when
@@ -90,6 +105,16 @@ export interface AcpContext {
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   dismissConfigOptionSwitchFailed: () => void;
+  /** True when older rows exist above the rendered window, either already
+   *  in the reducer (client window) or still on the server (recent-first
+   *  paging), so the view can offer a "Load earlier" control. See #2236. */
+  canLoadEarlierHistory: boolean;
+  /** Reveal more older history: first already-loaded rows, then fetch the
+   *  next-older page from the server once those run out. See #2236. */
+  loadEarlierHistory: () => void;
+  /** True while an older-history page fetch is in flight, for a spinner
+   *  on the "Load earlier" affordance. See #2236. */
+  loadingEarlierHistory: boolean;
 }
 
 /**
@@ -116,21 +141,52 @@ export function AcpRuntime({
   useEffect(() => {
     pendingAttachmentsRef.current = pendingAttachments;
   }, [pendingAttachments]);
+  // Stop-button escalation: a second press always force-ends, even when the
+  // server never confirms the first cancel (no in-flight prompt on the
+  // daemon). Owns its own reset-on-turn-end and reset-on-session-switch
+  // lifecycle. See #2237.
+  const onCancel = useCancelEscalation(
+    sessionId,
+    acp.state.pendingUserPromptSeq,
+    acp.state.cancelling,
+    acp.cancelPrompt,
+    acp.forceEndTurn,
+  );
+  // Render only the most recent slice of the transcript so a long
+  // session does not block first paint on mobile; older rows stay in
+  // reducer state and are revealed via "Load earlier". See #2144.
+  const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(
+    sessionId,
+    acp.state.activity,
+    showClearedTurns,
+  );
+  // "Load earlier" is two-stage: first reveal rows already loaded into
+  // the reducer (client window), then, once those are exhausted, fetch
+  // the next-older page from the server (recent-first paging). One
+  // affordance, no competing mechanisms. See #2236.
+  const { loadOlder, hasMoreOlder, loadingOlder } = acp;
+  const canLoadEarlierHistory = canOfferEarlier(canLoadEarlier, hasMoreOlder);
+  const loadEarlierHistory = useCallback(() => {
+    const action = earlierAction(canLoadEarlier, hasMoreOlder);
+    if (action === "reveal") loadEarlier();
+    else if (action === "fetch") void loadOlder();
+  }, [canLoadEarlier, hasMoreOlder, loadEarlier, loadOlder]);
+
   // Memoise the activity → ThreadMessageLike conversion. The function
-  // walks the entire activity array, allocates a new AssistantBuilder
+  // walks the activity array, allocates a new AssistantBuilder
   // per turn, and produces brand-new message objects. Without
   // useMemo, every parent re-render (e.g. WS heartbeat, hover state)
-  // re-builds the entire transcript and assistant-ui treats every
+  // re-builds the transcript and assistant-ui treats every
   // message as changed. Memo on the inputs the function reads.
   const messages = useMemo(
     () =>
       activityToThreadMessages(
-        acp.state.activity,
+        windowedActivity,
         acp.state.turnActive,
         showClearedTurns,
         agentProfile.capabilities.todos,
       ),
-    [acp.state.activity, acp.state.turnActive, showClearedTurns, agentProfile.capabilities.todos],
+    [windowedActivity, acp.state.turnActive, showClearedTurns, agentProfile.capabilities.todos],
   );
 
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
@@ -153,18 +209,7 @@ export function AcpRuntime({
       await acp.sendPrompt(text, attachments);
       setPendingAttachments([]);
     },
-    onCancel: async () => {
-      // First Stop sends a graceful cancel. If a cancel is already in
-      // flight (the agent is ignoring session/cancel on a stuck loop),
-      // a second Stop escalates to a force-stop instead of resending a
-      // no-op notification, so the user's instinct to click again
-      // actually ends the turn. See #1727.
-      if (acp.state.cancelling) {
-        await acp.forceEndTurn();
-      } else {
-        await acp.cancelPrompt();
-      }
-    },
+    onCancel,
   });
 
   return (
@@ -179,6 +224,7 @@ export function AcpRuntime({
         maxRetries: acp.maxRetries,
         manualReconnect: acp.manualReconnect,
         resolveApproval: acp.resolveApproval,
+        resolveElicitation: acp.resolveElicitation,
         sendPrompt: acp.sendPrompt,
         pendingAttachments,
         setPendingAttachments,
@@ -193,6 +239,9 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
+        canLoadEarlierHistory,
+        loadEarlierHistory,
+        loadingEarlierHistory: loadingOlder,
       })}
     </AssistantRuntimeProvider>
   );
@@ -280,6 +329,23 @@ export function activityToThreadMessages(
         id: row.id,
         role: "user",
         content: parts.length > 0 ? parts : [{ type: "text", text: "" }],
+        createdAt: parseDate(row.at),
+      });
+      continue;
+    }
+
+    if (row.kind === "elicitation_answered") {
+      // The user's answer to an AskUserQuestion / elicitation form. Render
+      // as a user-authored message so the picked answer reads like the
+      // user's turn (mirrors how Claude Code shows it), but keep it a
+      // distinct row kind so it never folds into prompt grouping. The
+      // structured pairs ride on metadata for richer rendering. See #2209.
+      flushAssistant();
+      messages.push({
+        id: row.id,
+        role: "user",
+        content: [{ type: "text", text: row.text }],
+        metadata: row.elicitationAnswers ? { custom: { elicitationAnswers: row.elicitationAnswers } } : undefined,
         createdAt: parseDate(row.at),
       });
       continue;
@@ -463,6 +529,13 @@ class AssistantBuilder {
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;
     if (tool.parent_tool_call_id) {
       argsObj._aoe_parent_tool_call_id = tool.parent_tool_call_id;
+    }
+    // Smuggle the structured memory-recall payload so StructuredView can
+    // rebuild it onto the reconstructed ToolCall; without this the
+    // synthesize/recall card is unreachable through the assistant-ui
+    // part shape and falls back to a generic read card. See #2142.
+    if (tool.memory_recall) {
+      argsObj._aoe_memory_recall = tool.memory_recall;
     }
     this.parts.push({
       type: "tool-call",

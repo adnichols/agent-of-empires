@@ -1,9 +1,10 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
-use crate::session::{list_profiles, GroupTree, Status, Storage};
+use crate::session::{list_profiles, GroupTree, Item, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, NewSessionData};
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
+use crate::tui::restart_poller::RestartRequest;
 
 use super::HomeView;
 
@@ -21,17 +22,54 @@ fn humanize_minutes(m: u32) -> String {
     }
 }
 
+/// Why a tied-worktree rename must refuse to move the worktree directory.
+///
+/// `git worktree move` does a `rename(2)` on the worktree dir, which the
+/// kernel refuses while anything holds it. Two distinct holders matter and
+/// they need different wording: an active agent (the session's `status`),
+/// and a sandbox session's container, which bind-mounts the worktree dir and
+/// stays alive on `sleep infinity` even while the agent is Idle. Both are
+/// cleared by stopping the session.
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreeRenameBlock {
+    /// The session's agent is busy (running, starting, etc.).
+    ActiveAgent,
+    /// A sandbox container is running and mounting the worktree dir.
+    SandboxContainer,
+}
+
+/// Decide whether a tied-worktree rename must be blocked, and why. Status
+/// takes precedence so a busy agent reports as `ActiveAgent` rather than
+/// reaching for the container reason. Returns `None` when the move is safe.
+fn worktree_rename_block(
+    status: Status,
+    is_sandboxed: bool,
+    container_running: bool,
+) -> Option<WorktreeRenameBlock> {
+    if status.blocks_worktree_edit() {
+        Some(WorktreeRenameBlock::ActiveAgent)
+    } else if is_sandboxed && container_running {
+        Some(WorktreeRenameBlock::SandboxContainer)
+    } else {
+        None
+    }
+}
+
 impl HomeView {
     /// Pin or unpin the project header under the cursor (project view only).
     ///
-    /// Pinning registers the repo in the global project registry (the same
-    /// store the WebUI writes), so the project keeps its header in project
-    /// view even after its last session is deleted. Unpinning removes the
-    /// registry entry; a project with no remaining sessions then disappears.
+    /// Pinning keeps the repo's header in project view even after its last
+    /// session is gone: it registers the repo if needed (the same global
+    /// registry the WebUI writes) and sets its `pinned` flag. Unpinning clears
+    /// the flag but KEEPS the registry entry, so the project stays a saved
+    /// project (still in the Projects view and the new-session wizard); its
+    /// header just drops once it has no sessions. Only an explicit remove (the
+    /// projects dialog) deletes the entry. See #2208.
     ///
-    /// The registry is the shared persistence layer: this goes through the
-    /// same `projects::add` / `projects::remove` the web API and the projects
-    /// dialog use, so canonicalization and conflict rules stay in one place.
+    /// The registry is the shared persistence layer, so this goes through the
+    /// same `projects::add` / `projects::set_pinned` the web API and the
+    /// projects dialog use; canonicalization and conflict rules stay in one
+    /// place.
     pub(super) fn toggle_project_pin_at_cursor(&mut self) {
         use crate::session::{projects, Project, ProjectScope};
         use crate::tui::dialogs::InfoDialog;
@@ -48,7 +86,7 @@ impl HomeView {
         if self.is_project_label_pinned(&label) {
             // Unpin. Prefer the registry entry whose canonical path matches the
             // header's own repo. An empty header has no session path, so fall
-            // back to the basename match (it exists only because a registered
+            // back to the basename match (it exists only because a pinned
             // project carries that basename; two such empties share one header
             // and clear one per press).
             let existing = match &header_path {
@@ -65,50 +103,13 @@ impl HomeView {
             let Some(existing) = existing else {
                 return;
             };
-            // Unpin means "this repo is no longer pinned anywhere", so clear
-            // every registry entry for its canonical path rather than just the
-            // one `load_merged` happened to surface. A path can sit in more than
-            // one scope at once (`--allow-override` lets a profile entry shadow
-            // a global one); removing only the visible entry would re-surface
-            // the shadowed one and leave the header pinned after a "success"
-            // dialog. `registered_projects` also drops which profile each entry
-            // came from in all-profiles mode, and `config_profile()` is only
-            // the default, so sweep the global file plus every loaded profile.
             let target = existing.path.clone();
-            let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
-            if !profiles.contains(&profile) {
-                profiles.push(profile.clone());
-            }
-            // Global lives in one shared file, so the profile arg is irrelevant.
-            let mut removals = vec![projects::remove(&profile, ProjectScope::Global, &target)];
-            for p in &profiles {
-                removals.push(projects::remove(p, ProjectScope::Profile, &target));
-            }
-            let mut removed_any = false;
-            let mut hard_err: Option<projects::RegistryError> = None;
-            for res in removals {
-                match res {
-                    Ok(_) => removed_any = true,
-                    Err(projects::RegistryError::NotFound(_)) => {}
-                    Err(e) => hard_err = Some(e),
-                }
-            }
-            // Surface a real I/O/parse failure even if some entry was removed;
-            // a partial unpin the user can't see is worse than a visible error.
-            let result: Result<(), projects::RegistryError> = match (hard_err, removed_any) {
-                (Some(e), _) => Err(e),
-                (None, true) => Ok(()),
-                (None, false) => Err(projects::RegistryError::NotFound(format!(
-                    "No pinned project '{}' found in any loaded scope",
-                    label
-                ))),
-            };
-            match result {
+            match self.set_project_pinned_all_scopes(&target, &profile, false) {
                 Ok(_) => {
                     self.info_dialog = Some(InfoDialog::new(
                         "Project Unpinned",
                         &format!(
-                            "'{}' is no longer pinned. It will drop from project view once it has no sessions.",
+                            "'{}' is no longer pinned. It stays a saved project; its header drops from project view once it has no sessions.",
                             label
                         ),
                     ));
@@ -123,12 +124,28 @@ impl HomeView {
         } else {
             // Pin the repo backing this header. An unpinned header always has at
             // least one live session (an empty header is pinned by
-            // construction), so its repo path is known.
+            // construction), so its repo path is known. If the repo is already
+            // saved (registered but not pinned), flip its flag; otherwise
+            // register it pinned.
             let Some(repo_path) = header_path else {
                 return;
             };
-            let project = Project::new(label.clone(), repo_path, ProjectScope::Global);
-            match projects::add(&profile, ProjectScope::Global, project, false) {
+            let already_registered = self
+                .registered_projects
+                .iter()
+                .any(|p| projects::canonical_key(&p.path) == repo_path);
+            let result = if already_registered {
+                self.set_project_pinned_all_scopes(&repo_path, &profile, true)
+            } else {
+                projects::add(
+                    &profile,
+                    ProjectScope::Global,
+                    Project::new(label.clone(), repo_path, ProjectScope::Global).with_pinned(true),
+                    false,
+                )
+                .map(|_| ())
+            };
+            match result {
                 Ok(_) => {
                     self.info_dialog = Some(InfoDialog::new(
                         "Project Pinned",
@@ -150,6 +167,60 @@ impl HomeView {
         self.refresh_registered_projects();
         self.flat_items = self.build_flat_items();
         self.update_selected();
+    }
+
+    /// Set the `pinned` flag on every registry entry for `target_path`'s
+    /// canonical path, across the global file and every loaded profile (plus
+    /// the default profile). A path can be registered in more than one scope at
+    /// once (`--allow-override` lets a profile entry shadow a global one), and
+    /// `registered_projects` drops which profile each entry came from in
+    /// all-profiles mode, so a single visible entry is not enough. `NotFound`
+    /// per scope is ignored; a real I/O/parse failure is surfaced even if
+    /// another scope updated, since a partial toggle the user can't see is
+    /// worse than a visible error; no match anywhere is `NotFound`. See #2208.
+    fn set_project_pinned_all_scopes(
+        &self,
+        target_path: &str,
+        profile: &str,
+        pinned: bool,
+    ) -> Result<(), crate::session::projects::RegistryError> {
+        use crate::session::{projects, ProjectScope};
+        let mut profiles: Vec<String> = self.storages.keys().cloned().collect();
+        if !profiles.iter().any(|p| p == profile) {
+            profiles.push(profile.to_string());
+        }
+        // Global lives in one shared file, so the profile arg is irrelevant.
+        let mut updates = vec![projects::set_pinned(
+            profile,
+            ProjectScope::Global,
+            target_path,
+            pinned,
+        )];
+        for p in &profiles {
+            updates.push(projects::set_pinned(
+                p,
+                ProjectScope::Profile,
+                target_path,
+                pinned,
+            ));
+        }
+        let mut updated_any = false;
+        let mut hard_err: Option<projects::RegistryError> = None;
+        for res in updates {
+            match res {
+                Ok(_) => updated_any = true,
+                Err(projects::RegistryError::NotFound(_)) => {}
+                Err(e) => hard_err = Some(e),
+            }
+        }
+        match (hard_err, updated_any) {
+            (Some(e), _) => Err(e),
+            (None, true) => Ok(()),
+            (None, false) => Err(projects::RegistryError::NotFound(format!(
+                "No project for path '{}' found in any loaded scope",
+                target_path
+            ))),
+        }
     }
 
     pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
@@ -256,17 +327,16 @@ impl HomeView {
     /// the field is updated before respawn so the new agent binary starts
     /// on the next launch.
     ///
-    /// Restart goes through `try_mutate_instance_writeback_on_err` so all
-    /// of `restart_with_size`'s mutations (cleared stale `agent_session_id`
-    /// on Tier-2 resume fallback, `last_accessed_at` bumps, etc.) are
-    /// preserved on the live instance.
+    /// The start cascade itself runs on the `RestartPoller` worker thread (it
+    /// shells out to docker and runs the before_start host hook, which can
+    /// block for seconds), so the TUI event loop never blocks. The post-cascade
+    /// `Instance` (with `restart_with_size`'s mutations: `resume_probe_failed_sid`,
+    /// `last_error`, container id, etc.) is written back via
+    /// `apply_restart_results`.
     ///
     /// The wake-up message is read from the resolved config
     /// (`session.restart_wake_message`); an empty value disables the
     /// wake-up entirely while still running the restart.
-    ///
-    /// The readiness probe + send-keys runs on a background OS thread so
-    /// the TUI event loop never blocks.
     pub(super) fn restart_selected_session(
         &mut self,
         new_profile: Option<&str>,
@@ -279,12 +349,20 @@ impl HomeView {
             None => return Ok(()),
         };
 
-        // Skip transient + sunk rows. Pull the snapshot details we need on
-        // the worker thread in the same borrow so we don't re-look up the
-        // instance under different conditions later. Snoozed rows only
-        // skip when the user is in Attention sort; see method doc.
+        // A restart cascade for this row is already running on the poller
+        // worker. The cascade is off the event loop now, so the 1.5s
+        // keyboard-repeat debounce below does not cover a deliberate second
+        // press during a multi-second pull. Without this guard the worker would
+        // enqueue a duplicate request and, running serially, restart the row a
+        // second time, tearing down the container the first restart just built.
+        if self.restart_in_flight.contains(&id) {
+            return Ok(());
+        }
+
+        // Skip transient + sunk rows. Snoozed rows only skip when the user is
+        // in Attention sort; see method doc.
         let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
-        let (skip, wake_snooze, title, tool) = match self.get_instance(&id) {
+        let (skip, wake_snooze) = match self.get_instance(&id) {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
@@ -292,7 +370,7 @@ impl HomeView {
                     || (snoozed && in_attention)
                     || inst.pane_dead_observed;
                 let wake_snooze = snoozed && !in_attention;
-                (skip, wake_snooze, inst.title.clone(), inst.tool.clone())
+                (skip, wake_snooze)
             }
             None => return Ok(()),
         };
@@ -398,85 +476,63 @@ impl HomeView {
             }
         }
 
-        // Restart the live instance (not a detached clone) so all
-        // non-status fields restart_with_size touches are kept.
+        // The start cascade shells out to docker (image pull, container
+        // create/start) and runs the before_start host hook, any of which can
+        // block for seconds. Running it inline froze the TUI
+        // event loop, so mirror the recovery/stop paths: flip the row to
+        // Starting for immediate feedback, then run the cascade on the restart
+        // poller's worker thread. The post-cascade snapshot (and the wake-up)
+        // are handled via `apply_restart_results`.
         let size = crate::terminal::get_size();
-        self.try_mutate_instance_writeback_on_err(&id, |inst| {
-            inst.restart_with_size(size).map(|_| ())
-        })?;
 
-        // Stamp touch_last_accessed on the user's gesture (the row should
-        // visibly bump immediately). save() pushes both the restart-side
-        // mutations and the touch.
-        self.mutate_instance(&id, |inst| inst.touch_last_accessed());
+        // Status::Starting + a fresh last_start_time keeps the StatusPoller from
+        // flipping the row to Error before the worker finishes (the same grace
+        // startup recovery relies on); touch bumps the row on the user gesture.
+        self.mutate_instance(&id, |inst| {
+            inst.status = Status::Starting;
+            inst.last_error = None;
+            inst.last_start_time = Some(std::time::Instant::now());
+            inst.touch_last_accessed();
+        });
         self.save()?;
 
-        // Resolve the wake message via the moved session's profile config
-        // (already merges global + profile overrides). Empty string is the
-        // documented opt-out.
-        let profile = self
-            .get_instance(&id)
-            .map(|i| i.source_profile.clone())
-            .unwrap_or_else(|| {
-                self.active_profile
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string())
-            });
-        let wake_msg = crate::session::resolve_config(&profile)
+        let Some(instance) = self.get_instance(&id).cloned() else {
+            return Ok(());
+        };
+
+        // Resolve the wake message on the main thread (config access). Empty is
+        // the documented opt-out; the worker skips the wake-up then.
+        let wake_message = crate::session::resolve_config(&instance.source_profile)
             .map(|c| c.session.restart_wake_message.clone())
             .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-        if wake_msg.is_empty() {
-            return Ok(());
-        }
 
-        // Background worker: wait for the pane to be live + past the boot
-        // shell, then send the wake-up keys. Failure to even spawn is
-        // logged so the user can correlate a missing wake-up with a real
-        // OS-level failure rather than silent loss.
-        let worker_session_id = id.clone();
-        let worker_title = title;
-        let worker_tool = tool;
-        let spawn_result = std::thread::Builder::new()
-            .name(format!("aoe-restart-wake/{}", id))
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                let Ok(tmux_session) = crate::tmux::Session::new(&worker_session_id, &worker_title)
-                else {
-                    return;
-                };
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-                loop {
-                    if !tmux_session.exists() {
-                        return;
-                    }
-                    let pane_alive = !tmux_session.is_pane_dead();
-                    let hook_active = crate::hooks::read_hook_status(&worker_session_id).is_some();
-                    if pane_alive && (hook_active || !tmux_session.is_pane_running_shell()) {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-
-                if !tmux_session.exists() {
-                    return;
-                }
-                let delay = crate::agents::send_keys_enter_delay(&worker_tool);
-                if let Err(e) = tmux_session.send_keys_with_delay(&wake_msg, delay) {
-                    tracing::warn!("failed to send wake-up message after restart: {}", e);
-                }
-            });
-        if let Err(err) = spawn_result {
-            tracing::warn!(?err, "failed to spawn restart wake-up worker");
-        }
+        self.restart_in_flight.insert(id.clone());
+        self.restart_poller.request_restart(RestartRequest {
+            session_id: id,
+            instance,
+            size,
+            wake_message,
+        });
         Ok(())
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
+
+            // Refuse to delete a row whose restart cascade is still running on
+            // the worker: deletion would fire docker commands against the same
+            // container the restart worker is mid-creating, orphaning resources
+            // non-deterministically. The old synchronous cascade made this race
+            // impossible (the UI thread could not accept a delete mid-restart);
+            // off-threading the cascade removed that implicit lock.
+            if self.restart_in_flight.contains(&id) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart in progress",
+                    "This session is still restarting. Wait for it to finish before deleting.",
+                ));
+                return Ok(());
+            }
 
             self.set_instance_status(&id, Status::Deleting);
 
@@ -551,6 +607,22 @@ impl HomeView {
                 })
                 .map(|i| i.id.clone())
                 .collect();
+
+            // Refuse the whole group delete if any member is mid-restart (same
+            // concurrent-docker race as delete_selected). Restore the selection
+            // we `take()`'d above so the group stays put.
+            if sessions_to_delete
+                .iter()
+                .any(|sid| self.restart_in_flight.contains(sid))
+            {
+                self.selected_group = Some(group_path);
+                self.selected_group_profile = owning_profile;
+                self.info_dialog = Some(InfoDialog::new(
+                    "Restart in progress",
+                    "A session in this group is still restarting. Wait for it to finish before deleting the group.",
+                ));
+                return Ok(());
+            }
 
             self.bulk_apply_user_action(&sessions_to_delete, |inst| {
                 inst.status = Status::Deleting;
@@ -849,6 +921,7 @@ impl HomeView {
         new_title: &str,
         new_group: Option<&str>,
         new_profile: Option<&str>,
+        rename_branch: bool,
     ) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
@@ -878,15 +951,47 @@ impl HomeView {
             // session surfaces a warning and nothing is renamed. Applied below
             // in both the profile-move and the standard persist paths.
             let mut new_path: Option<String> = None;
-            if current_title != effective_title && self.tie_workdir_applies_for(&id) {
-                let snapshot = self
-                    .get_instance(&id)
-                    .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
-                if let Some((Some(worktree_info), status, project_path)) = snapshot {
-                    if status.blocks_worktree_edit() {
+            let mut new_branch: Option<String> = None;
+            // Fire when the title changed (dir follows it) OR the user opted to
+            // rename the branch (which may be requested even with the title
+            // unchanged, to bring a drifted branch back in line with the dir).
+            if (current_title != effective_title || rename_branch)
+                && self.tie_workdir_applies_for(&id)
+            {
+                let snapshot = self.get_instance(&id).map(|i| {
+                    (
+                        i.worktree_info.clone(),
+                        i.status,
+                        i.project_path.clone(),
+                        i.is_sandboxed(),
+                    )
+                });
+                if let Some((Some(worktree_info), status, project_path, is_sandboxed)) = snapshot {
+                    // A sandbox session keeps its container alive (running
+                    // `sleep infinity`) even while the agent is Idle, and that
+                    // container bind-mounts the worktree directory. The move
+                    // below `git worktree move`s that dir, which the kernel
+                    // refuses while it is an active mount source (EBUSY ->
+                    // "fatal: failed to move"). Stopping the session tears the
+                    // container down and releases the mount. We only inspect
+                    // the container when the status check hasn't already
+                    // blocked, so the common non-sandbox path spawns no
+                    // `docker inspect`. See #1927 follow-up.
+                    let container_running = !status.blocks_worktree_edit()
+                        && crate::session::worktree_edit::sandbox_container_holds_worktree(
+                            &id,
+                            is_sandboxed,
+                        );
+                    if let Some(reason) =
+                        worktree_rename_block(status, is_sandboxed, container_running)
+                    {
+                        let body = match reason {
+                            WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                            WorktreeRenameBlock::SandboxContainer => "This sandbox session's container is mounting the worktree directory, so it can't be moved to match the new name. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                        };
                         self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                             "Stop the Session to Rename",
-                            "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+                            body,
                         ));
                         return Ok(());
                     }
@@ -897,14 +1002,27 @@ impl HomeView {
                             worktree_info: &worktree_info,
                             current_path: std::path::Path::new(&project_path),
                             new_name: &leaf,
-                            rename_branch: false,
+                            rename_branch,
                         },
                     ) {
                         Ok(outcome) => {
-                            new_path = Some(outcome.new_path.to_string_lossy().to_string())
+                            // Discard the stale container only when the dir
+                            // actually moved. A branch-only rename (title
+                            // unchanged, toggle armed) leaves the path, and thus
+                            // the mount and working dir, valid, so there is
+                            // nothing stale to recreate.
+                            let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
+                            new_path = Some(outcome.new_path.to_string_lossy().to_string());
+                            new_branch = outcome.new_branch;
+                            if dir_moved {
+                                crate::session::worktree_edit::discard_sandbox_container_after_move(
+                                    &id,
+                                    is_sandboxed,
+                                );
+                            }
                         }
-                        // Leaf maps to the current dir: nothing to move, just
-                        // rename the title.
+                        // Leaf maps to the current dir and no branch rename was
+                        // requested: nothing to move, just rename the title.
                         Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
                         Err(e) => {
                             self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
@@ -970,6 +1088,7 @@ impl HomeView {
                     instance.source_profile = target_profile.to_string();
                     let new_title = instance.title.clone();
                     let moved_path = new_path.clone();
+                    let moved_branch = new_branch.clone();
                     self.move_to_profile(&id, target_profile, instance.group_path.clone())?;
                     // apply_user_action (not mutate_instance + save) so a tied
                     // worktree's moved project_path actually persists; save()
@@ -978,6 +1097,11 @@ impl HomeView {
                         inst.title = new_title.clone();
                         if let Some(path) = &moved_path {
                             inst.project_path = path.clone();
+                        }
+                        if let Some(branch) = &moved_branch {
+                            if let Some(wt) = inst.worktree_info.as_mut() {
+                                wt.branch = branch.clone();
+                            }
                         }
                     })?;
 
@@ -1019,6 +1143,11 @@ impl HomeView {
                 inst.group_path = effective_group.clone();
                 if let Some(path) = &new_path {
                     inst.project_path = path.clone();
+                }
+                if let Some(branch) = &new_branch {
+                    if let Some(wt) = inst.worktree_info.as_mut() {
+                        wt.branch = branch.clone();
+                    }
                 }
             })?;
 
@@ -1128,17 +1257,43 @@ impl HomeView {
         Ok(())
     }
 
-    /// Handle the archive keybind on the cursor's session. Symmetric toggle:
-    /// archive an active row, unarchive an archived one. Killing the tmux
-    /// pane on archive matches the CLI semantics (archived means "stop
-    /// spending CPU on this") so a stale spinner can't keep advertising the
-    /// session as alive. Unarchive does NOT respawn the pane; the user
-    /// restarts explicitly if they want it back.
-    ///
-    /// Mirrors `toggle_snooze_at_cursor` but with no picker: archive is
-    /// indefinite, so there's nothing to ask the user before sinking the
-    /// row. The session reappears at its real tier on unarchive or when
-    /// the user sends a message (auto unarchive in `Instance::message_sent`).
+    /// The session the cursor should land on after the cursor's row is
+    /// archived away: the nearest non-archived session below the cursor,
+    /// else the nearest one above. `None` when no other active session is
+    /// VISIBLE (the caller falls back to an index clamp); active sessions
+    /// hidden inside collapsed groups are deliberately not candidates, so
+    /// archiving never yanks the cursor into a group the user folded away.
+    /// Scans the pre-archive flat list, so it walks the rows the
+    /// user sees; archived rows already parked under the Archived section
+    /// are skipped so the cursor never advances into it.
+    fn archive_successor_session(&self, archiving_id: &str) -> Option<String> {
+        let candidate = |item: &Item| -> Option<String> {
+            let Item::Session { id, .. } = item else {
+                return None;
+            };
+            if id == archiving_id {
+                return None;
+            }
+            let inst = self.instances.iter().find(|i| &i.id == id)?;
+            (!inst.is_archived()).then(|| id.clone())
+        };
+        for item in self.flat_items.iter().skip(self.cursor + 1) {
+            if let Some(id) = candidate(item) {
+                return Some(id);
+            }
+        }
+        for item in self.flat_items.iter().take(self.cursor).rev() {
+            if let Some(id) = candidate(item) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Toggle the cursor's session: archive or unarchive. Archive tears down
+    /// all tmux sessions (agent + ancillary); worktree, branch, container
+    /// preserved. Unarchive does NOT respawn; press `e` to restart, or send
+    /// a message to auto-unarchive. See #1868.
     pub(super) fn toggle_archive_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
@@ -1154,20 +1309,23 @@ impl HomeView {
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
             // ends up on whatever row slid into that slot. The session stays
-            // Stopped (archive killed its pane); the user restarts it with `e`
-            // when they want it back, same as any other stopped session.
+            // Stopped (archive killed its panes); the user restarts it with
+            // `e` when they want it back, same as any other stopped session.
             self.select_session_by_id(&id);
             return Ok(());
         }
 
-        // Kill the pane before flipping the archived bit. If the kill fails
-        // (tmux gone, pane already dead) we still archive: the row should
-        // sink regardless, since the user explicitly asked for it.
+        // Tear down all tmux before flipping archived. #1868.
         if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
-            if let Err(e) = inst.kill() {
-                tracing::warn!("toggle_archive_at_cursor: kill failed (continuing): {}", e);
-            }
+            inst.kill_all_tmux_sessions();
         }
+
+        // Decide where the cursor lands BEFORE the row sinks, against the
+        // pre-archive list the user is actually looking at. Only the
+        // non-Attention branch consumes it; Attention re-picks from the top.
+        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
+            .then(|| self.archive_successor_session(&id))
+            .flatten();
 
         self.apply_user_action(&id, |inst| inst.archive())?;
         if self.sort_order == crate::session::config::SortOrder::Attention {
@@ -1177,16 +1335,39 @@ impl HomeView {
             // dead-pane/selection-swap jank the default sort did.
             self.flat_items = self.build_flat_items();
             self.select_top_attention(None);
+            // select_top_attention is a no-op when no session row is visible
+            // (the archived row sank into a collapsed Archived section and
+            // nothing else is left), which would strand `selected_session`
+            // on the now-invisible archived row and leave the cursor index
+            // past the shrunken list. Clamp and re-resolve, mirroring the
+            // non-Attention fallback below.
+            if self.selected_session.as_deref() == Some(id.as_str()) {
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
+            }
         } else {
-            // Keep the just-archived session selected instead of letting the
-            // cursor snap to whatever neighbor slid into its slot. Reveal the
-            // Archived section so the row is visible, rebuild, then re-seat the
-            // cursor onto it. The preview then renders a calm "Archived"
-            // placeholder (render_archived_preview) instead of the killed
-            // pane's "No output available", and a second `z` unarchives it.
-            self.reveal_archived_section();
+            // Advance to the next session instead of following the archived
+            // row into the Archived section: archiving reads as "I'm done
+            // with this one", so the cursor stays up in the active list and
+            // moves on. The preview retargets on its own: `render_preview`
+            // re-derives the capture target from `selected_session` every
+            // frame, the cache gates on a session-id mismatch, and the
+            // capture worker drops stale frames on retarget, so the pane
+            // tracks the new selection without the dead-pane flash that
+            // motivated the old follow-the-row behavior (#2025). The
+            // Archived section is not auto-revealed; its header already
+            // shows the updated count as feedback.
             self.flat_items = self.build_flat_items();
-            self.select_session_by_id(&id);
+            match successor {
+                Some(next) => self.select_session_by_id(&next),
+                None => {
+                    // No other active session: clamp and let
+                    // `update_selected` resolve whatever sits at the cursor
+                    // now (typically the Archived section header).
+                    self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                    self.update_selected();
+                }
+            }
         }
         Ok(())
     }
@@ -1236,21 +1417,35 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group. Mirrors the
-    /// single-row archive path in `toggle_archive_at_cursor`: kill each pane
-    /// before flipping the archived bit, then reveal the Archived section so
-    /// the rows stay visible. Triggered behind a confirmation prompt, so there
-    /// is no further guard here.
+    /// Archive every active session under the selected group: tmux teardown
+    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        for inst in self.instances.iter().filter(|i| ids.contains(&i.id)) {
-            if let Err(e) = inst.kill() {
-                tracing::warn!("archive_selected_group: kill failed (continuing): {}", e);
+        // Off-thread tmux teardown so N x 4 shellouts don't block the input
+        // thread. Mirrors `force_remove_session`.
+        let kill_targets: Vec<_> = self
+            .instances
+            .iter()
+            .filter(|i| ids.contains(&i.id))
+            .cloned()
+            .collect();
+        std::thread::spawn(move || {
+            for inst in kill_targets {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inst.kill_all_tmux_sessions()
+                })) {
+                    tracing::error!(
+                        target: "session.tmux_cleanup",
+                        session_id = %inst.id,
+                        "archive_selected_group tmux teardown panicked: {:?}",
+                        panic
+                    );
+                }
             }
-        }
+        });
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
         self.reveal_archived_section();
         self.flat_items = self.build_flat_items();
@@ -1262,5 +1457,62 @@ impl HomeView {
         }
         self.update_selected();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An Idle sandbox session whose container is still running is the #1927
+    // follow-up bug: the worktree dir is an active bind-mount source, so
+    // `git worktree move` fails with EBUSY. Before the fix this returned
+    // `None` (the rename proceeded and the move blew up with "fatal: failed
+    // to move"); it must now block with the sandbox-specific reason.
+    #[test]
+    fn idle_sandbox_with_running_container_blocks() {
+        assert_eq!(
+            worktree_rename_block(Status::Idle, true, true),
+            Some(WorktreeRenameBlock::SandboxContainer)
+        );
+    }
+
+    #[test]
+    fn idle_sandbox_with_stopped_container_is_safe() {
+        // Stopping the session tears the container down, releasing the mount.
+        assert_eq!(worktree_rename_block(Status::Idle, true, false), None);
+    }
+
+    #[test]
+    fn idle_non_sandbox_is_safe() {
+        // No container, nothing holds the dir; the move proceeds.
+        assert_eq!(worktree_rename_block(Status::Idle, false, false), None);
+    }
+
+    #[test]
+    fn active_status_blocks_as_active_agent() {
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::Starting,
+            Status::Creating,
+            Status::Deleting,
+        ] {
+            assert_eq!(
+                worktree_rename_block(status, false, false),
+                Some(WorktreeRenameBlock::ActiveAgent),
+                "{status:?} should block as ActiveAgent"
+            );
+        }
+    }
+
+    #[test]
+    fn active_status_takes_precedence_over_container() {
+        // A busy agent reports as ActiveAgent even on a sandbox session with a
+        // live container; status is checked first.
+        assert_eq!(
+            worktree_rename_block(Status::Running, true, true),
+            Some(WorktreeRenameBlock::ActiveAgent)
+        );
     }
 }

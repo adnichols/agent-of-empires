@@ -20,6 +20,7 @@
 //!   layer can offer the "paste a context primer" affordance.
 
 use crate::acp::approvals::ApprovalDecision;
+use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, ToolOutputBlock};
 
@@ -53,6 +54,11 @@ pub struct AcpTranscript {
     pub session_id: String,
     pub rows: Vec<ActivityRow>,
     pub pending_approvals: Vec<PendingApproval>,
+    /// Pending `AskUserQuestion` elicitations. The native TUI does not
+    /// render the answer form (that is web-only); it surfaces a notice and
+    /// lets the user skip/cancel so the agent's turn never hangs. See the
+    /// `ElicitationRequested` arm.
+    pub pending_elicitations: Vec<PendingElicitation>,
     /// Live status banner (e.g. "thinking…", "ended: completed").
     pub status_text: Option<String>,
     /// Latest mode id the agent reported. `None` until the agent
@@ -99,7 +105,14 @@ pub enum ActivityRow {
     ToolCall(ToolCallRow),
     Approval(ApprovalRow),
     Plan(Vec<PlanLine>),
-    Note { kind: NoteKind, text: String },
+    /// The user's answers to an AskUserQuestion / elicitation form, kept
+    /// in the transcript so the picked answer survives the card closing.
+    /// See #2209.
+    ElicitationAnswer(Vec<ElicitationAnswer>),
+    Note {
+        kind: NoteKind,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +155,11 @@ pub struct PendingApproval {
     pub nonce: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingElicitation {
+    pub nonce: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum NoteKind {
     Info,
@@ -155,6 +173,7 @@ impl AcpTranscript {
             session_id: session_id.into(),
             rows: Vec::new(),
             pending_approvals: Vec::new(),
+            pending_elicitations: Vec::new(),
             status_text: None,
             current_mode: None,
             available_commands: Vec::new(),
@@ -188,6 +207,12 @@ impl AcpTranscript {
             }
         }
         self.pending_approvals.retain(|p| p.nonce != nonce);
+    }
+
+    /// Optimistically clear a pending elicitation after the skip/cancel
+    /// POST succeeded (or 404'd), mirroring `resolve_approval_locally`.
+    pub fn resolve_elicitation_locally(&mut self, nonce: &str) {
+        self.pending_elicitations.retain(|p| p.nonce != nonce);
     }
 
     /// Mark `lagged = true`. The view layer is responsible for
@@ -371,6 +396,51 @@ impl AcpTranscript {
                     }
                 }
                 self.pending_approvals.retain(|p| p.nonce != nonce.0);
+            }
+            Event::ElicitationRequested { elicitation } => {
+                self.flush_pending_chunk();
+                // The rich answer form is web-only; the native TUI shows a
+                // notice and offers skip/cancel via the composer keys so the
+                // turn never hangs for a TUI-only user. See #web-elicitation.
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Info,
+                    text: format!(
+                        "Agent asked a question: {}\nAnswer it in the web dashboard (press o), or skip / cancel.",
+                        elicitation.message
+                    ),
+                });
+                self.pending_elicitations.push(PendingElicitation {
+                    nonce: elicitation.nonce.0.clone(),
+                });
+            }
+            Event::ElicitationResolved {
+                nonce,
+                outcome,
+                answers,
+            } => {
+                self.flush_pending_chunk();
+                // Gate on the card actually being pending: a resolved
+                // elicitation can be re-broadcast (cancel-on-teardown racing a
+                // POST; the store is lenient on the nonce), and replaying it
+                // must not append a second row. The web reducer dedupes by row
+                // id; here the pending card is the dedupe key. See #2209.
+                let was_pending = self.pending_elicitations.iter().any(|p| p.nonce == nonce.0);
+                self.pending_elicitations.retain(|p| p.nonce != nonce.0);
+                if !was_pending {
+                    return;
+                }
+                // Record what the user picked so the transcript keeps a
+                // trace after the card closes. Skip (Decline) leaves a
+                // short note; Cancel / teardown adds nothing. See #2209.
+                if !answers.is_empty() {
+                    self.rows
+                        .push(ActivityRow::ElicitationAnswer(answers.clone()));
+                } else if matches!(outcome, ElicitationOutcome::Declined) {
+                    self.rows.push(ActivityRow::Note {
+                        kind: NoteKind::Info,
+                        text: "You skipped the question.".to_string(),
+                    });
+                }
             }
             Event::PlanUpdated { plan } => {
                 self.flush_pending_chunk();
@@ -719,6 +789,82 @@ mod tests {
                 assert_eq!(row.decision, Some(ApprovalDecision::Allow));
             }
             _ => panic!("expected Approval"),
+        }
+    }
+
+    #[test]
+    fn elicitation_request_notices_and_resolution_clears() {
+        use crate::acp::elicitations::{Elicitation, ElicitationOutcome};
+        let mut t = AcpTranscript::new("s-1");
+        let elicitation = Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick one".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        t.apply(&frame(1, Event::ElicitationRequested { elicitation }));
+        assert_eq!(t.pending_elicitations.len(), 1);
+        assert_eq!(t.pending_elicitations[0].nonce, "e-1");
+        // The TUI surfaces a notice row pointing at the web dashboard.
+        assert!(matches!(
+            t.rows.last(),
+            Some(ActivityRow::Note { text, .. }) if text.contains("web dashboard")
+        ));
+        t.apply(&frame(
+            2,
+            Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: ElicitationOutcome::Declined,
+                answers: Vec::new(),
+            },
+        ));
+        assert!(t.pending_elicitations.is_empty());
+        // A skip leaves a short note so the transcript records the choice.
+        assert!(matches!(
+            t.rows.last(),
+            Some(ActivityRow::Note { text, .. }) if text.contains("skipped")
+        ));
+    }
+
+    #[test]
+    fn elicitation_accepted_records_answer_row() {
+        use crate::acp::elicitations::{Elicitation, ElicitationAnswer, ElicitationOutcome};
+        let mut t = AcpTranscript::new("s-1");
+        let elicitation = Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick one".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        t.apply(&frame(1, Event::ElicitationRequested { elicitation }));
+        t.apply(&frame(
+            2,
+            Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: ElicitationOutcome::Accepted,
+                answers: vec![ElicitationAnswer {
+                    question: "Proceed?".into(),
+                    answer: "Yes".into(),
+                }],
+            },
+        ));
+        assert!(t.pending_elicitations.is_empty());
+        // #2209: the picked answer must survive the card closing.
+        match t.rows.last() {
+            Some(ActivityRow::ElicitationAnswer(answers)) => {
+                assert_eq!(answers.len(), 1);
+                assert_eq!(answers[0].question, "Proceed?");
+                assert_eq!(answers[0].answer, "Yes");
+            }
+            other => panic!("expected ElicitationAnswer row, got {other:?}"),
         }
     }
 

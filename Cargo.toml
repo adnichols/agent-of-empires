@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive"]
 
 [package]
 name = "agent-of-empires"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -84,9 +84,6 @@ reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-f
 # Unix sockets + futures-compat for ACP byte streams
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
-# Platform detection
-cfg-if = "1.0"
-
 # Process handling
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource"] }
 
@@ -125,7 +122,7 @@ which = "8.0"
 # system libsqlite3 dependency. Used to read session state without spawning
 # `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
 # via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Web server (optional, behind "serve" feature)
 axum = { version = "0.8", features = ["ws"], optional = true }
@@ -151,8 +148,7 @@ jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # Agent Client Protocol — drives the structured view surface bundled with `serve`.
-agent-client-protocol = { version = "0.11", optional = true, features = ["unstable_session_usage", "unstable_session_model"] }
-agent-client-protocol-tokio = { version = "0.11", optional = true }
+agent-client-protocol = { version = "0.14", optional = true, features = ["unstable_end_turn_token_usage", "unstable_elicitation"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = { version = "1", optional = true }
@@ -198,7 +194,6 @@ serve = [
     # apart later is straightforward (structured view code lives entirely
     # under src/acp/).
     "agent-client-protocol",
-    "agent-client-protocol-tokio",
     "semver",
     "tar",
     "xz2",

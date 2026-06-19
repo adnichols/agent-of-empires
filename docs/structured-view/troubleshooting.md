@@ -53,15 +53,48 @@ install is incomplete. Reinstall aoe via your package manager (e.g.,
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
-aoe requires `claude-agent-acp` v0.44.0 or newer. Install the official adapter:
+aoe requires a recent `claude-agent-acp`. If your installed adapter is too old,
+aoe refuses to start the session and reports the exact required version. Install
+the official adapter:
 
 ```bash
 npm install -g @agentclientprotocol/claude-agent-acp@latest
 ```
 
 Then run `claude login` if you haven't already. If an older version is pinned by
-an internal mirror, ship 0.44.0 from the mirror or run the `@latest` install
-above before starting `aoe serve`.
+an internal mirror, ship the required floor from the mirror or run the `@latest`
+install above before starting `aoe serve`.
+
+### Recovering a missing or out-of-date agent from the web dashboard
+
+When the structured view refuses a session because the agent is missing or too
+old, the web dashboard surfaces the reason inline instead of leaving you to read
+the logs:
+
+- The compatibility screen shows the installed vs required version and the exact
+  install command to copy.
+- A missing-binary error message includes the install command for the agent it
+  could not find.
+
+Two recovery controls sit on the compatibility screen:
+
+- **Restart agent** respawns the worker and re-runs the version check at the next
+  handshake. Use it after you have installed or updated the adapter in a shell;
+  no full restart of `aoe serve` is needed.
+- **Update & restart** runs the agent's `npm install -g` on the host (as the
+  user running the daemon) and then respawns. It appears only for
+  npm-installable agents (`claude-agent-acp`, `codex-acp`, `gemini`) and only
+  when `acp.allow_agent_install` is enabled.
+
+`acp.allow_agent_install` is **off by default**: running a global package install
+from the daemon is a host-level capability that executes the package's npm
+lifecycle scripts as the daemon user. It is always blocked in `--read-only` mode,
+and the setting is `local_only` (you can only turn it on from a dashboard
+connection to localhost, not a remote one). For agents that install some other
+way (`opencode`, `vibe-acp`, `pi-acp`), the screen shows the manual command
+instead of an Update button. Inside a sandbox session, a host install would not
+reach the containerized agent, so the action is refused; install the agent in the
+container image instead.
 
 ### "Failed to start structured view agent" while the adapter is installed
 
@@ -199,14 +232,48 @@ container (rather than bind-mounting from the host).
   reconnect status if the WebSocket is degraded.
 - A repeatedly-failing worker is parked with a red "session parked" banner.
   Retry from the dashboard or run `aoe acp restart <session>`.
+- A session that was auto-stopped for inactivity and then respawned (for
+  example after a version upgrade) used to be able to keep a stale "dormant"
+  marker, which made the daemon refuse to bring the worker back after it next
+  exited; a follow-up message would then sit unsent. A worker coming online now
+  clears that marker, so this no longer strands a queued message.
+
+### "Restarting worker" banner after a turn looked done
+
+Some agents (notably `claude-agent-acp`) occasionally finish a turn, stream
+the final message and the end-of-turn usage, but never send the protocol's
+turn-complete acknowledgement. The daemon used to treat that as a wedge and
+restart the worker, showing **Agent finished but didn't notify the daemon.
+Restarting worker; your transcript will be preserved.** When the agent had
+already emitted its end-of-turn usage and was not running a background or
+scheduled task, the daemon now ends the turn cleanly instead, so a completed
+turn no longer triggers a restart. A genuine stall (no end-of-turn usage, or a
+monitor / scheduled-wake turn that overran) still restarts the worker and
+shows the banner; the transcript is preserved either way.
+
+### Diff viewer is blank (page-restyling browser extensions)
+
+If the Changes panel shows a file's header (path, `+`/`-` counts, the
+Unified/Split toggle) but the diff body below is empty, with no error and a
+clean console, a page-restyling browser extension is almost certainly
+overriding the diff styling. The diff renders into a shadow DOM, and "dark
+mode for every site" extensions (Midnight Lizard, DocsAfterDark, and similar)
+reach into it and make the rows invisible. This is most common on Firefox.
+
+To confirm it is an extension, open the dashboard in Firefox Troubleshoot Mode
+(Menu, Help, Troubleshoot Mode); if the diff renders there, an extension is
+the cause. Fix it by disabling the restyling extension for the dashboard, or
+allowlist the dashboard origin in the extension's settings.
 
 ### "Force end turn" button under the spinner
 
 If the agent finished a turn but the working spinner is still rattling, a small
 **Force end turn** button appears beneath it. Click it to clear the spinner and
 cancel the agent. It only appears for a silent model with no tool running, and
-the view auto-recovers on its own if you do nothing. During a healthy turn, or
-while a tool is in flight, the button stays hidden.
+the view auto-recovers on its own if you do nothing. During healthy streaming, or
+while a tool is in flight, the spinner keeps running but the button stays hidden.
+While a question or approval card is awaiting your input, both the spinner and the
+button are hidden, so the actionable card stands alone.
 
 ### Editing settings asks for the passphrase again
 

@@ -55,10 +55,8 @@ export interface SessionResponse {
    *  `isPinned = pinned_at != null` client-side; no separate boolean is
    *  exposed (the timestamp itself is the source of truth). See #1581. */
   pinned_at?: string | null;
-  /** RFC3339 timestamp at which the session was archived, or null /
-   *  undefined when not archived. Archived workspaces sink into the
-   *  collapsible "Snoozed & archived" footer of their repo group and
-   *  their tmux pane is killed by the archive handler. See #1581. */
+  /** RFC3339 timestamp; null when not archived. Sinks into "Snoozed &
+   *  archived"; archive tears down all tmux. See #1581, #1868. */
   archived_at?: string | null;
   /** RFC3339 timestamp at which an active snooze expires, or null /
    *  undefined when not snoozed. The server gates this on
@@ -90,6 +88,11 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** Smart-rename indicator for structured view sessions. `pending`: still
+   *  default-named and eligible, will auto-name on the next prompt; `running`:
+   *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
+   *  the sidebar auto-name chip. See session::smart_rename. */
+  smart_rename?: "inactive" | "pending" | "running";
   /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
    *  valid `agent_acp_cmd`. The terminal view's "switch to acp"
@@ -162,6 +165,13 @@ export interface ResizeMessage {
 
 export interface ActivateMessage {
   type: "activate";
+}
+
+/** Explicit take-over of the cross-surface size lock (banner click).
+ *  Separate from `activate`, which also fires on mount and must not
+ *  steal the size from a live owner on another device. */
+export interface ClaimMessage {
+  type: "claim";
 }
 
 /** Pause the pane's foreground process (SIGSTOP). Sent by mobile web
@@ -281,6 +291,12 @@ export interface RepoGroup {
   workspaces: Workspace[];
   status: WorkspaceStatus;
   collapsed: boolean;
+  /** Registry entries (the "pin") for this repo path, keyed by normalized
+   *  path. Empty when the repo is not pinned. More than one entry means the
+   *  same path is registered under multiple scopes (global + profile); the
+   *  group is rendered pinned and unpin removes every entry. A group with
+   *  entries but no workspaces is a pinned-but-empty project. See #2047. */
+  registeredProjects: ProjectInfo[];
 }
 
 /** Workspace: a group of sessions sharing the same project + branch */
@@ -376,6 +392,10 @@ export interface ProjectInfo {
   scope: "global" | "profile";
   /** Default base branch for new worktree branches against this project's repo. */
   default_base_branch?: string;
+  /** Whether the project is pinned: shown as a sessionless sidebar header. A
+   *  registry entry is the saved project; the pin is the separate decision to
+   *  keep its header visible without sessions. See #2208. */
+  pinned: boolean;
 }
 
 /** Docker status returned by /api/docker/status */

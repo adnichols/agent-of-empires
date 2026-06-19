@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 // Structured view conversation surface, built on @assistant-ui/react primitives.
 //
 // The chat shell (scroll viewport, message list, message editing, keyboard
@@ -13,13 +14,15 @@
 // AcpRuntime.tsx. We never let assistant-ui own the chat state; it
 // only renders what we feed it and surfaces user actions back.
 
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/react";
 import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, RotateCcw, X } from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
+import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
-import type { FileRef } from "../../lib/fileRef";
+import type { FileRef, FileRefSession } from "../../lib/fileRef";
+import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -33,6 +36,8 @@ import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
 import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
+import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
+import { isElicitationAnswersPayload } from "../../lib/acpTypes";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -43,8 +48,12 @@ import {
 import { useAcpPrefs } from "../../lib/acpPrefs";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
-import { useApprovalSound } from "../../hooks/useApprovalSound";
+import { AttentionChime } from "./AttentionChime";
+import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
+import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
+import { dispatchFocusTerminal } from "../../lib/terminalFocus";
+import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
   Approval,
   ActivityRow,
@@ -55,6 +64,7 @@ import type {
   RejectedPrompt,
   ToolCall,
 } from "../../lib/acpTypes";
+import { pickMemoryRecall } from "../../lib/memoryRecall";
 
 interface Props {
   sessionId: string;
@@ -84,6 +94,9 @@ interface Props {
    *  instead of navigating away. Omit to leave such links as normal
    *  anchors. See #1718. */
   onOpenFileRef?: (ref: FileRef) => void;
+  /** Repo roots for this session, forwarded to the tool cards so file
+   *  paths render repo-relative instead of absolute. See #2143. */
+  fileRefSession?: FileRefSession | null;
 }
 
 const STARTER_PROMPTS = [
@@ -92,7 +105,8 @@ const STARTER_PROMPTS = [
   "What does the build pipeline do?",
 ];
 
-export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef }: Props) {
+export function StructuredView(props: Props) {
+  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -102,7 +116,7 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
   // not reducer state and not a daemon config field. See #1767.
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
-    <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
+    <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
       <AgentProfileProvider toolKey={tool}>
         <ToolDisplayModeProvider density={toolDensity}>
           <AcpRuntime
@@ -132,6 +146,42 @@ export function StructuredView({ sessionId, acpWorkerState, tool, archivedAt, sn
   );
 }
 
+/** Inline style for the structured-view root, which is a fixed-height flex
+ *  column whose last child is the composer footer. On iOS regular Safari
+ *  neither `100dvh` nor the viewport meta's `interactive-widget=resizes-content`
+ *  shrink the layout when the soft keyboard opens, so without this reservation
+ *  the footer stays pinned to the full-height bottom edge and is occluded by
+ *  the keyboard (#2011). Reserving `keyboardHeight` at the bottom lets the
+ *  flex-1 chat viewport absorb the shrink and lifts the composer to the top of
+ *  the keyboard. `keyboardHeight` is 0 on platforms where innerHeight already
+ *  shrinks with the keyboard (iOS PWA, iOS 26 Safari, Android Chrome), so this
+ *  returns undefined there and the existing dvh / interactive-widget path is
+ *  untouched. Same value and rationale as `LiveTerminalView`'s `rootStyle`,
+ *  which reserves `keyboardHeight` for the mobile terminal surfaces; the
+ *  structured ACP view is the lone holdout that never adopted it.
+ *  Extracted as a pure helper so the layout decision can be unit-tested without
+ *  mounting the assistant-ui runtime. */
+export function structuredViewRootStyle(keyboardHeight: number): React.CSSProperties | undefined {
+  return keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
+}
+
+/** Fixed-height flex root for the structured view, owning the mobile-keyboard
+ *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
+ *  the hook-to-style wiring is testable without mounting the assistant-ui
+ *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
+export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
+  const { keyboardHeight } = useMobileKeyboard();
+  return (
+    <div
+      data-testid="structured-view-root"
+      className="flex h-full flex-col bg-surface-900 text-text-primary"
+      style={structuredViewRootStyle(keyboardHeight)}
+    >
+      {children}
+    </div>
+  );
+}
+
 function AcpChrome({
   sessionId,
   acpWorkerState,
@@ -150,6 +200,7 @@ function AcpChrome({
   maxRetries,
   manualReconnect,
   resolveApproval,
+  resolveElicitation,
   sendPrompt,
   pendingAttachments,
   setPendingAttachments,
@@ -164,6 +215,9 @@ function AcpChrome({
   dismissModeSwitchFailed,
   setConfigOption,
   dismissConfigOptionSwitchFailed,
+  canLoadEarlierHistory,
+  loadEarlierHistory,
+  loadingEarlierHistory,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -209,12 +263,6 @@ function AcpChrome({
       text,
     });
 
-  // Browser-side approval chime. Fires once on the 0 -> >=1 edge of
-  // pendingApprovals; complements the OS push (delivered via the SW
-  // when the dashboard is backgrounded) and the in-app toast (when
-  // foregrounded). See #1038.
-  useApprovalSound(state.pendingApprovals.length);
-
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
   // `autoScroll` only re-pins on message updates, not on viewport
@@ -231,20 +279,103 @@ function AcpChrome({
   // sample captures the pre-resize state; the RO callback consumes it.
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
+  const messagesContentRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+  // Stable mirrors so the [] scroll effect always sees the latest
+  // load-earlier wiring without re-subscribing. Updated in an effect
+  // (not during render) per react-hooks/refs. See #2236.
+  const canLoadEarlierRef = useRef(canLoadEarlierHistory);
+  const loadEarlierRef = useRef(loadEarlierHistory);
+  const loadingEarlierRef = useRef(loadingEarlierHistory);
+  useEffect(() => {
+    canLoadEarlierRef.current = canLoadEarlierHistory;
+    loadEarlierRef.current = loadEarlierHistory;
+    loadingEarlierRef.current = loadingEarlierHistory;
+  }, [canLoadEarlierHistory, loadEarlierHistory, loadingEarlierHistory]);
+  // Fires loadEarlier once per arrival at the top (re-armed when the user
+  // scrolls back down), capturing the pre-growth scrollHeight so the
+  // content ResizeObserver can freeze the read position after older rows
+  // land (revealed synchronously or fetched async). See #2236.
+  const autoLoadArmedRef = useRef(true);
+  const pendingScrollAnchorRef = useRef<number | null>(null);
+  const lastAutoLoadAtRef = useRef(0);
+
+  const requestEarlierHistory = useCallback(() => {
+    const vp = viewportRef.current;
+    if (!vp || !canLoadEarlierRef.current) return;
+    // Stamp every load (button or auto) so the cooldown below covers the
+    // scroll-into-view a click triggers, not just scroll-driven loads.
+    lastAutoLoadAtRef.current = performance.now();
+    const stamped = vp.scrollHeight;
+    pendingScrollAnchorRef.current = stamped;
+    loadEarlierRef.current();
+    // Drop the anchor if the request adds nothing (a synchronous reveal
+    // that produced no rows, with no async fetch in flight). Otherwise a
+    // stale anchor would be applied to the next unrelated growth (e.g. a
+    // live append while scrolled up) and jump the viewport. The async
+    // fetch case is handled by the loadingEarlier effect below. See #2236.
+    requestAnimationFrame(() => {
+      if (
+        pendingScrollAnchorRef.current === stamped &&
+        anchorIsStale(loadingEarlierRef.current, pendingScrollAnchorRef.current, vp.scrollHeight)
+      ) {
+        pendingScrollAnchorRef.current = null;
+      }
+    });
+  }, []);
+
+  // Tap anywhere in the transcript focuses the composer and brings up the soft
+  // keyboard on touch, mirroring the live terminal's tap-to-focus (#2243). The
+  // bus dispatch runs the Composer's focus listener synchronously, so iOS still
+  // sees the focus inside the user-gesture call stack. Coarse-only: desktop
+  // already auto-focuses the composer, and a fine-pointer transcript click is
+  // usually a selection. Interactive targets and live selections are skipped by
+  // the guard.
+  const isCoarse = useIsCoarsePointer();
+  const onThreadTap = (e: React.MouseEvent) => {
+    const sel = window.getSelection();
+    if (shouldFocusComposerOnThreadTap({ isCoarse, target: e.target, hasSelection: !!sel && !sel.isCollapsed })) {
+      dispatchFocusTerminal("composer");
+    }
+  };
+
+  // When an async older-history fetch settles without growing the
+  // transcript (empty page, error), clear the anchor so it can't latch
+  // onto later unrelated growth. See #2236.
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (vp && anchorIsStale(loadingEarlierHistory, pendingScrollAnchorRef.current, vp.scrollHeight)) {
+      pendingScrollAnchorRef.current = null;
+    }
+  }, [loadingEarlierHistory]);
+
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
+    const content = messagesContentRef.current;
     if (!vp || !below) return;
     // Treat "within 16px of the bottom" as pinned. assistant-ui's
     // own stick-to-bottom uses a similar slop; sub-pixel rounding
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
-    const sampleAtBottom = () => {
+    const sample = () => {
       wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
+      // Decision (overflow gate, arm, cooldown) lives in a pure helper so
+      // it's unit-tested away from the DOM. See historyScroll.ts / #2236.
+      const decision = autoLoadDecision({
+        scrollTop: vp.scrollTop,
+        clientHeight: vp.clientHeight,
+        scrollHeight: vp.scrollHeight,
+        armed: autoLoadArmedRef.current,
+        canLoadEarlier: canLoadEarlierRef.current,
+        now: performance.now(),
+        lastLoadAt: lastAutoLoadAtRef.current,
+      });
+      autoLoadArmedRef.current = decision.armed;
+      if (decision.fire) requestEarlierHistory();
     };
-    sampleAtBottom();
-    vp.addEventListener("scroll", sampleAtBottom, { passive: true });
+    sample();
+    vp.addEventListener("scroll", sample, { passive: true });
     let prevHeight = below.offsetHeight;
     const ro = new ResizeObserver(() => {
       const nextHeight = below.offsetHeight;
@@ -255,11 +386,24 @@ function AcpChrome({
       }
     });
     ro.observe(below);
+    // Freeze the read position when older rows grow the transcript at the
+    // top: add the height delta to scrollTop so the row the user was
+    // reading stays under the cursor instead of jumping. Skipped while
+    // pinned to the bottom so live appends keep their stick-to-bottom.
+    const contentRo = new ResizeObserver(() => {
+      const anchor = pendingScrollAnchorRef.current;
+      if (anchor == null) return;
+      const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
+      if (delta > 0) vp.scrollTop += delta;
+      pendingScrollAnchorRef.current = null;
+    });
+    if (content) contentRo.observe(content);
     return () => {
       ro.disconnect();
-      vp.removeEventListener("scroll", sampleAtBottom);
+      contentRo.disconnect();
+      vp.removeEventListener("scroll", sample);
     };
-  }, []);
+  }, [requestEarlierHistory]);
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so
@@ -269,12 +413,13 @@ function AcpChrome({
   if (state.incompatibleAgent) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} />
+        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} />
       </div>
     );
   }
   return (
-    <div className="flex h-full flex-col bg-surface-900 text-text-primary">
+    <StructuredViewRoot>
+      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection sessionId={sessionId} currentAgent={state.agent} onPrefill={recoveryHandoffPrefill}>
@@ -338,8 +483,9 @@ function AcpChrome({
           ref={viewportRef}
           data-testid="acp-viewport"
           className="flex-1 overflow-x-hidden overflow-y-auto"
+          onClick={onThreadTap}
         >
-          <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+          <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
             <ThreadPrimitive.Empty>
               <EmptyState onPick={sendPrompt} />
             </ThreadPrimitive.Empty>
@@ -358,6 +504,20 @@ function AcpChrome({
               />
             )}
 
+            {canLoadEarlierHistory && (
+              <div className="mb-3 flex justify-center">
+                <button
+                  type="button"
+                  onClick={requestEarlierHistory}
+                  disabled={loadingEarlierHistory}
+                  data-testid="acp-load-earlier"
+                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer disabled:cursor-default disabled:opacity-60"
+                >
+                  {loadingEarlierHistory ? "Loading…" : "Load earlier messages"}
+                </button>
+              </div>
+            )}
+
             <ThreadPrimitive.Messages
               components={{
                 UserMessage,
@@ -366,20 +526,36 @@ function AcpChrome({
             />
 
             <ThreadPrimitive.If running>
-              <div className="mt-3 ml-1">
-                <WorkingSpinner
-                  thinking={state.thinking}
-                  tool={state.inFlightTool?.name ?? null}
-                  cancelling={state.cancelling}
-                  cancelEscalatesAt={state.cancelEscalatesAt}
-                  lastActivityRef={lastActivityRef}
-                  onForceEndTurn={forceEndTurn}
-                />
-              </div>
+              {/* The turn is "running" while an elicitation or approval card is
+                  on screen, but the agent is parked on the user's answer, not
+                  stalled. Suppress the spinner (rattle verbs, "Waiting on
+                  model…", and the Force end turn watchdog) so the actionable
+                  card stands alone; it returns once the turn resumes. See
+                  #2145. */}
+              {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                <div className="mt-3 ml-1">
+                  <WorkingSpinner
+                    thinking={state.thinking}
+                    tool={state.inFlightTool?.name ?? null}
+                    cancelling={state.cancelling}
+                    cancelEscalatesAt={state.cancelEscalatesAt}
+                    lastActivityRef={lastActivityRef}
+                    onForceEndTurn={forceEndTurn}
+                  />
+                </div>
+              ) : null}
             </ThreadPrimitive.If>
 
             {state.pendingApprovals.map((approval) => (
               <PendingApproval key={approval.nonce} approval={approval} onResolve={resolveApproval} />
+            ))}
+
+            {state.pendingElicitations.map((elicitation) => (
+              <AskUserQuestionCard
+                key={elicitation.nonce}
+                elicitation={elicitation}
+                onResolve={(resolution) => resolveElicitation(elicitation.nonce, resolution)}
+              />
             ))}
           </div>
         </ThreadPrimitive.Viewport>
@@ -441,10 +617,12 @@ function AcpChrome({
             pendingAttachments={pendingAttachments}
             setPendingAttachments={setPendingAttachments}
             primerPrefill={primerPrefill}
+            queuedPrompts={state.queuedPrompts}
+            editQueuedPrompt={editQueuedPrompt}
           />
         </div>
       </ThreadPrimitive.Root>
-    </div>
+    </StructuredViewRoot>
   );
 }
 
@@ -469,8 +647,16 @@ function UserMessage() {
  *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
   const typedPayload = useMessage((m) => (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments);
+  // An answered AskUserQuestion / elicitation: render the picked answer as
+  // a tidy card from the typed payload on the message metadata. See #2209.
+  const answers = useMessage(
+    (m) => (m.metadata?.custom as { elicitationAnswers?: unknown } | undefined)?.elicitationAnswers,
+  );
   if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
+  }
+  if (isElicitationAnswersPayload(answers)) {
+    return <ElicitationAnswerCard answers={answers} />;
   }
   // Legacy fallback: older prompts carry the structured data in a
   // base64 sentinel at the top of the text body. Decode + render the
@@ -587,6 +773,7 @@ function AssistantToolCall(props: ToolCallProps) {
     kind: props.toolName,
     args_preview: props.argsText ?? safeStringify(props.args ?? null),
     started_at: startedAt,
+    memory_recall: pickMemoryRecall(props.args, props.argsText),
   };
   const resultContent =
     props.result && typeof props.result === "object" && "content" in (props.result as Record<string, unknown>)
@@ -709,6 +896,7 @@ function groupChildToItem(c: GroupChild): {
     kind: c.toolName,
     args_preview: c.argsText,
     started_at: startedAt,
+    memory_recall: pickMemoryRecall(parsedArgs, c.argsText),
   };
   const result =
     c.result !== undefined
@@ -774,6 +962,7 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
       kind: c.toolName,
       args_preview: c.argsText,
       started_at: startedAt,
+      memory_recall: pickMemoryRecall(parsedArgs, c.argsText),
     };
     const result =
       c.result !== undefined
@@ -992,7 +1181,7 @@ export function WorkingSpinner({
   const showForceEnd = !cancelling && showStalled && !toolInFlight;
 
   return (
-    <div className="flex flex-col gap-2 text-sm italic text-text-muted">
+    <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">
       <div className="flex items-center gap-2">
         <span className="inline-block w-3 text-center font-mono text-brand-500" aria-hidden="true">
           {SPINNER_FRAMES[frame]}
@@ -1396,32 +1585,9 @@ function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reason: str
 }
 
 function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
-  const [retryState, setRetryState] = useState<"idle" | "retrying" | "ok" | "failed">("idle");
-  const [retryError, setRetryError] = useState<string | null>(null);
-
-  const handleReconnect = async () => {
-    setRetryState("retrying");
-    setRetryError(null);
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (res.ok) {
-        // The next AcpSessionAssigned (or UserPromptSent) clears
-        // workerStopped on the reducer side and this banner unmounts.
-        setRetryState("ok");
-      } else {
-        const detail = (await res.text().catch(() => "")).slice(0, 200);
-        setRetryState("failed");
-        setRetryError(`Server returned ${res.status}. ${detail}`.trim());
-      }
-    } catch (e) {
-      setRetryState("failed");
-      setRetryError(e instanceof Error ? e.message : String(e));
-    }
-  };
+  // The next AcpSessionAssigned (or UserPromptSent) clears workerStopped on
+  // the reducer side and this banner unmounts.
+  const { state: retryState, error: retryError, respawn: handleReconnect } = useRespawnSession(sessionId);
 
   return (
     <div className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200">
@@ -1514,33 +1680,10 @@ export function StartupErrorBanner({ sessionId, message }: { sessionId: string; 
   // node_modules whose binary doesn't match the container arch. See
   // #1449.
   const isNativeBinaryLaunchFail = /native binary at .* exists but failed to launch/i.test(message);
-  const [retryState, setRetryState] = useState<"idle" | "retrying" | "ok" | "failed">("idle");
-  const [retryError, setRetryError] = useState<string | null>(null);
-
-  const handleRetry = async () => {
-    setRetryState("retrying");
-    setRetryError(null);
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/spawn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (res.ok) {
-        // The supervisor's drain task will start emitting events
-        // shortly; the banner will disappear when the next user
-        // prompt clears `startupError`.
-        setRetryState("ok");
-      } else {
-        const detail = (await res.text().catch(() => "")).slice(0, 200);
-        setRetryState("failed");
-        setRetryError(`Server returned ${res.status}. ${detail}`.trim());
-      }
-    } catch (e) {
-      setRetryState("failed");
-      setRetryError(e instanceof Error ? e.message : String(e));
-    }
-  };
+  // The supervisor's drain task starts emitting events shortly after a
+  // successful respawn; the banner disappears when the next user prompt
+  // clears `startupError`.
+  const { state: retryState, error: retryError, respawn: handleRetry } = useRespawnSession(sessionId);
 
   return (
     <div className="border-b border-rose-900/60 bg-rose-950/40 px-4 py-3 text-rose-200">

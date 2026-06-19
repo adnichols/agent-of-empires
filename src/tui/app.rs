@@ -50,6 +50,56 @@ const PASTE_BURST_INTER_KEY_MS: u64 = 5;
 /// individual key events so genuine typing isn't mistaken for a paste.
 const PASTE_BURST_MIN_LEN: usize = 3;
 
+/// Process-local session-create trend counter for the TUI surface, mirroring the
+/// serve daemon's `telemetry_session_creates` (#1897). A long-lived TUI creates
+/// sessions over its lifetime; this monotonic accumulator carries that count
+/// into the opt-in `usage_snapshot.session_creates_since_last_snapshot` field.
+/// It is incremented on each create in [`record_session_create`], read
+/// without reset when a snapshot is built, and decremented by exactly the
+/// reported value only after a confirmed send so a create that lands during an
+/// in-flight send rolls into the next snapshot rather than being double-counted
+/// or dropped. A no-op for opted-out installs (no snapshot is ever sent).
+static TUI_SESSION_CREATES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Point-in-time read of the create counter, so a snapshot can later be cleared
+/// by exactly the value it reported.
+fn reported_session_creates() -> u32 {
+    TUI_SESSION_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decrement the create counter by exactly `reported` after a confirmed send,
+/// mirroring serve's `decrement_reported_count`. Subtracting the reported amount
+/// rather than zeroing preserves any create that landed between the snapshot
+/// build and the confirmed send. A no-op when nothing was reported or the send
+/// was not confirmed (`Deduped`/`Failed` retain the count for the next snapshot).
+/// The subtraction saturates rather than underflow-wrapping the `AtomicU32`.
+fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::SendOutcome) {
+    if reported == 0 || outcome != crate::telemetry::SendOutcome::Sent {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let _ = TUI_SESSION_CREATES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(reported))
+    });
+}
+
+/// Count one TUI session create for the opt-in telemetry trend counter. Bounded
+/// accumulator, read-and-decremented by the snapshot paths; a no-op for
+/// opted-out installs (the snapshot is never built / sent). Called from
+/// `HomeView::add_instance`, the single funnel every TUI create passes through.
+pub(super) fn record_session_create() {
+    TUI_SESSION_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only read of the process-local create counter, so the `home` module's
+/// `add_instance` gating test can assert real creates count and `Creating`
+/// stubs do not. Tests sharing the counter use the `telemetry_creates` serial
+/// group to avoid racing on this global.
+#[cfg(test)]
+pub(crate) fn session_create_count_for_test() -> u32 {
+    reported_session_creates()
+}
+
 struct UpdateStatus {
     text: String,
     expires_at: Option<std::time::Instant>,
@@ -416,10 +466,6 @@ impl App {
 
         let result = f();
 
-        // Recreate the event stream with a fresh reader before re-entering
-        // the event loop.
-        self.event_stream = Some(EventStream::new());
-
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
             terminal.backend_mut(),
@@ -434,7 +480,12 @@ impl App {
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
-        terminal.clear()?;
+        // Recreate the event stream with a fresh reader before re-entering the
+        // event loop, then force a full redraw of the home screen. The stream is
+        // recreated after raw mode and the alternate screen are restored so it is
+        // born into raw mode rather than attached to a briefly-cooked tty.
+        self.event_stream = Some(EventStream::new());
+        crate::tui::clear_terminal(terminal)?;
 
         Ok(result)
     }
@@ -489,7 +540,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Initial render
-        terminal.clear()?;
+        crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
         // surface that wants native drag-to-select (intro Welcome page,
         // changelog, info dialog) gets capture turned off on frame 1.
@@ -621,7 +672,7 @@ impl App {
             // with_raw_mode_disabled drops and recreates the EventStream, so
             // there are no stale events to drain.
             if self.needs_redraw {
-                terminal.clear()?;
+                crate::tui::clear_terminal(terminal)?;
                 self.needs_redraw = false;
             }
 
@@ -1134,7 +1185,7 @@ impl App {
             // and the pointer sits at the edge.
             //
             // Request a normal (diffed) redraw via `refresh_needed`, NOT
-            // `needs_redraw`: the latter forces a `terminal.clear()` at the
+            // `needs_redraw`: the latter forces a `clear_terminal` at the
             // top of the loop, and clearing every ticker frame while the
             // scroll runs strobes the screen blank-then-repaint. The diffed
             // draw at the bottom of the loop repaints smoothly.
@@ -1214,6 +1265,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_restart_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 refresh_needed = true;
@@ -1242,7 +1298,23 @@ impl App {
             // `reload_storage_only` (storage + profile rediscovery only);
             // the heartbeat path calls full `reload()` to refresh the
             // status-hook config cache and mouse-capture toggle.
+            //
+            // Config kick runs before the storage-mirror block:
+            // `refresh_from_config` invalidates profile-derived state that
+            // the block reads. Same `live_idle` gate; recomputing
+            // `tool_hotkey_cache` mid live-send disrupts input.
             let live_idle = self.home.live_send.is_none();
+            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_dirty);
+            if config_kick {
+                let result = self.home.try_refresh_from_config_watcher();
+                handle_tick_reload_config(result, &mut self.home.reload_failure_state);
+                if let Some(theme_name) = self.home.take_pending_watcher_theme() {
+                    self.set_theme(&theme_name);
+                }
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
             // Only consume the dirty latch when we're eligible to act on
             // it (`live_idle`). When live-send is on, the latch must
@@ -1285,15 +1357,12 @@ impl App {
                 DiskRefreshDecision::None => {}
             }
 
-            if self.home.reload_failure_state.has_unacknowledged_failure()
-                && self.home.info_dialog.is_none()
-            {
-                let body = self.home.reload_failure_state.build_dialog_body();
-                self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Watcher Warning",
-                    &body,
-                ));
-                self.home.reload_failure_state.acknowledge_dialog();
+            if self.home.try_present_reload_failure_dialog() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.try_clear_recovered_reload_dialog() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1418,6 +1487,10 @@ impl App {
         }
 
         self.home.apply_session_id_updates();
+        // Drain any restart result that completed since the last tick so the
+        // post-cascade snapshot (cleared stale sid, container id, final status)
+        // is persisted instead of the stale `Starting` row.
+        self.home.apply_restart_results();
         self.home.cleanup_pending_creation();
 
         if let Err(e) = self.home.save() {
@@ -1429,7 +1502,9 @@ impl App {
         // so a launch-then-quit with unchanged sessions doesn't post the same
         // counts twice within seconds.
         if let Some(snapshot) = self.build_telemetry_snapshot() {
-            crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+            let reported = snapshot.session_creates_since_last_snapshot;
+            let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+            clear_reported_session_creates(reported, outcome);
         }
 
         Ok(())
@@ -1438,15 +1513,18 @@ impl App {
     /// Build a `usage_snapshot` from the current session list, or `None` when
     /// telemetry is not opted in. The TUI never hosts the web dashboard, so the
     /// `usage_seen` map is reported zeroed (a stable full key set), the
-    /// per-client form-factor maps stay empty (and so omitted), the create-trend
-    /// counter is left at 0, and the structured-interaction counts are empty (the
-    /// `aoe serve` daemon is the surface that tracks all of those).
+    /// per-client form-factor maps stay empty (and so omitted), and the
+    /// structured-interaction counts are empty (the `aoe serve` daemon is the
+    /// surface that tracks all of those). The create-trend counter carries the
+    /// process-local `TUI_SESSION_CREATES` total, read *without reset* so a
+    /// failed send retains it; the value is consumed only after a confirmed send
+    /// (mirroring the serve deferred-clear).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
             self.home.instances(),
             crate::telemetry::usage_signals::zeroed(),
-            0,
+            reported_session_creates(),
             // The TUI hosts no server, so it has no auth or exposure mode.
             None,
             None,
@@ -1454,10 +1532,21 @@ impl App {
         )
     }
 
-    /// Build and send a snapshot, detached. No-op when not opted in.
+    /// Build and send a snapshot, detached. No-op when not opted in. The send is
+    /// awaited inside the spawned task only so the reported create count can be
+    /// cleared after a confirmed send (the same await-and-clear discipline the
+    /// serve periodic loop uses); the caller never blocks.
     fn emit_telemetry_snapshot(&self) {
         if let Some(snapshot) = self.build_telemetry_snapshot() {
-            crate::telemetry::spawn_snapshot(snapshot);
+            let reported = snapshot.session_creates_since_last_snapshot;
+            tokio::spawn(async move {
+                let outcome = if crate::telemetry::send_snapshot(snapshot).await {
+                    crate::telemetry::SendOutcome::Sent
+                } else {
+                    crate::telemetry::SendOutcome::Failed
+                };
+                clear_reported_session_creates(reported, outcome);
+            });
         }
     }
 
@@ -1690,7 +1779,6 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_pull_rx = Some(rx);
         std::thread::spawn(move || {
-            use crate::containers::ContainerRuntimeInterface;
             let result = crate::containers::get_container_runtime()
                 .pull_image(&image)
                 .map_err(anyhow::Error::from);
@@ -1995,6 +2083,10 @@ enum DiskRefreshDecision {
     None,
 }
 
+fn take_config_refresh_kick(live_idle: bool, config_dirty: &std::sync::atomic::AtomicBool) -> bool {
+    live_idle && config_dirty.swap(false, std::sync::atomic::Ordering::Acquire)
+}
+
 /// Pure refresh-policy decision. Inputs are plain values so this helper
 /// is side-effect free; callers are responsible for actually consuming
 /// the watcher latch (`AtomicBool::swap`) before invoking it. Keeping
@@ -2045,7 +2137,38 @@ fn handle_tick_reload_storage(
             "tick storage reload failed; preserving in-memory state, will retry on next tick"
         );
     }
-    state.record_storage(&result);
+    if state.record_storage(&result) {
+        tracing::info!(
+            target: "tui.file_watch",
+            "storage reload recovered"
+        );
+    }
+}
+
+/// Tick-driven config reload errors must never propagate out of the
+/// main loop AND must never silently flip safety-affecting settings to
+/// defaults. A malformed `config.toml` written by a peer process would
+/// otherwise either crash the TUI (if propagated) or silently disable
+/// settings like `confirm_before_quit` (if applied as default). This
+/// helper records the failure for one-shot dialog surfacing while
+/// keeping the previous in-memory config intact.
+fn handle_tick_reload_config(
+    result: anyhow::Result<()>,
+    state: &mut crate::tui::home::ReloadFailureState,
+) {
+    if let Err(ref e) = result {
+        tracing::warn!(
+            target: "tui.file_watch",
+            error = %e,
+            "tick config reload failed; preserving in-memory config, will retry on next tick"
+        );
+    }
+    if state.record_config(&result) {
+        tracing::info!(
+            target: "tui.file_watch",
+            "config reload recovered"
+        );
+    }
 }
 
 /// What a `q` key press at the home screen should do. Factored out of the
@@ -2126,7 +2249,7 @@ impl App {
             // restarts; the banner returns automatically when a newer
             // release ships (per #1140).
             //
-            // No `needs_redraw = true` here: that forces a `terminal.clear()`
+            // No `needs_redraw = true` here: that forces a `clear_terminal`
             // before the next event arrives, so the whole screen blanks for
             // a beat (visible flash). Ratatui's diff renderer handles the
             // 1-row layout shrink on the next normal draw.
@@ -2202,10 +2325,10 @@ impl App {
         let result =
             crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
-        // Forcing a full redraw on return so the home screen redraws
-        // any cells the acp view painted over.
+        // Force a full redraw so the home screen repaints any cells the acp
+        // view painted over. The main loop's redraw branch runs `clear_terminal`
+        // on the next iteration, so don't clear again here.
         self.needs_redraw = true;
-        terminal.clear()?;
         if let Err(e) = result {
             self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }
@@ -2356,17 +2479,8 @@ impl App {
                     .set_instance_status(&id, crate::session::Status::Starting);
                 self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
                 self.draw(terminal)?;
-                let stale_sid = self.home.execute_send_message(&id, &message);
-                match stale_sid {
-                    Some(sid) => {
-                        self.update_status = Some(UpdateStatus::transient(format!(
-                            "Resume failed for sid {sid}; sent to fresh session (history not loaded)"
-                        )));
-                    }
-                    None => {
-                        self.update_status = None;
-                    }
-                }
+                self.home.execute_send_message(&id, &message);
+                self.update_status = None;
             }
             Action::EnterLiveSend(id) => {
                 // Same revive flow as SendMessage so cold-start (Docker,
@@ -2388,13 +2502,10 @@ impl App {
                 // the smaller pane, and the first capture would render
                 // shifted up.
                 self.update_status = match &outcome {
-                    Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
-                    ))),
                     // On clean ready, drop the toast entirely. On Err the
                     // info_dialog already carries the failure detail, so the
                     // transient toast just gets in the way.
-                    Ok(None) | Err(()) => None,
+                    Ok(()) | Err(()) => None,
                 };
                 if outcome.is_ok() {
                     self.draw(terminal)?;
@@ -2565,10 +2676,11 @@ impl App {
                     )));
                     return Ok(());
                 }
-                Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                     self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {stale_sid}; started fresh (history not loaded)"
+                        "Resume failed for sid {sid}; preserved for retry"
                     )));
+                    return Ok(());
                 }
                 Ok(_) => {}
             }
@@ -2871,6 +2983,74 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::SendOutcome;
+    use std::sync::atomic::Ordering;
+
+    // The TUI create counter is a process-global static, so these tests mutate
+    // shared state. `#[serial]` (with the `telemetry_creates` group key) keeps
+    // them from racing each other; each resets the counter to a known base
+    // first rather than assuming a clean start.
+    fn reset_creates(to: u32) {
+        TUI_SESSION_CREATES.store(to, Ordering::Relaxed);
+    }
+
+    // #1897: a confirmed send clears only what the snapshot reported, so a create
+    // that lands between the snapshot build and the confirmed send survives into
+    // the next snapshot instead of being reset away. Mirrors the serve-side
+    // `reported_count_decrement_preserves_concurrent_increments`.
+    #[test]
+    #[serial_test::serial(telemetry_creates)]
+    fn create_counter_clear_preserves_in_flight_create() {
+        reset_creates(0);
+        record_session_create();
+        record_session_create();
+        record_session_create();
+        // The snapshot reported the 3 creates seen at build time.
+        let reported = reported_session_creates();
+        assert_eq!(reported, 3);
+        // One more create lands while the snapshot is in flight.
+        record_session_create();
+        clear_reported_session_creates(reported, SendOutcome::Sent);
+        assert_eq!(
+            TUI_SESSION_CREATES.load(Ordering::Relaxed),
+            1,
+            "the create that arrived during the send must be retained"
+        );
+    }
+
+    // A failed or deduped send must retain the full count so the next snapshot
+    // re-reports it; only a confirmed `Sent` consumes the reported value.
+    #[test]
+    #[serial_test::serial(telemetry_creates)]
+    fn create_counter_clear_retains_on_unconfirmed_send() {
+        for outcome in [SendOutcome::Failed, SendOutcome::Deduped] {
+            reset_creates(0);
+            record_session_create();
+            record_session_create();
+            let reported = reported_session_creates();
+            clear_reported_session_creates(reported, outcome);
+            assert_eq!(
+                TUI_SESSION_CREATES.load(Ordering::Relaxed),
+                2,
+                "{outcome:?} must retain the count for the next snapshot"
+            );
+        }
+    }
+
+    // A zero report is a no-op, and the decrement saturates rather than
+    // underflow-wrapping the AtomicU32 (cheap insurance against a future
+    // double-clear), mirroring the serve saturation test.
+    #[test]
+    #[serial_test::serial(telemetry_creates)]
+    fn create_counter_clear_is_noop_for_zero_and_saturates() {
+        reset_creates(3);
+        clear_reported_session_creates(0, SendOutcome::Sent);
+        assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 3);
+
+        reset_creates(2);
+        clear_reported_session_creates(5, SendOutcome::Sent);
+        assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn image_banner_shows_only_when_it_owns_the_row() {
@@ -2997,6 +3177,37 @@ mod tests {
             dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
             "live_send tick must NOT consume the dirty latch; it must persist for the next tick"
         );
+    }
+
+    #[test]
+    fn config_refresh_kick_is_gated_by_live_send() {
+        let dirty = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            !take_config_refresh_kick(false, &dirty),
+            "live-send must defer config refreshes"
+        );
+        assert!(
+            dirty.load(std::sync::atomic::Ordering::Acquire),
+            "live-send must leave config_dirty latched for the next eligible tick"
+        );
+    }
+
+    #[test]
+    fn config_refresh_and_disk_refresh_can_coexist_in_one_tick() {
+        let config_dirty = std::sync::atomic::AtomicBool::new(true);
+        let disk_dirty = std::sync::atomic::AtomicBool::new(true);
+
+        let config_kick = take_config_refresh_kick(true, &config_dirty);
+        // Mirrors the tick-loop gating: live_idle is true here, so the
+        // caller swaps the latch and passes the consumed value to the
+        // pure helper.
+        let dirty = disk_dirty.swap(false, std::sync::atomic::Ordering::Acquire);
+        let disk_decision = decide_disk_refresh(true, true, dirty);
+
+        assert!(config_kick, "config refresh must be scheduled first");
+        assert_eq!(disk_decision, DiskRefreshDecision::Heartbeat);
+        assert!(!config_dirty.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!disk_dirty.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

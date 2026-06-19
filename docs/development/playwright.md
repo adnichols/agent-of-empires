@@ -32,7 +32,7 @@ Heuristics:
 
 - "Every settings control emits the right JSON keys" → Vitest, not Playwright. Looping 30 controls through a live server is slow without adding signal.
 - "Theme persists across page reload" → live Playwright. The test point is the backend round-trip.
-- "The wizard's review step lets me edit the title inline and Escape cancels" → mocked Playwright. No backend needed; browser-specific Escape handling matters.
+- "The wizard remembers the More options fold open or closed across opens" → mocked Playwright. No backend needed; browser-specific localStorage persistence matters.
 - "POST /api/settings with body X returns 200, the value persists" → both: Vitest contract for the payload shape, live Playwright for one representative round-trip.
 
 ## Live harness (`web/tests/helpers/aoeServe.ts`)
@@ -156,9 +156,11 @@ Add a new surface to the matrix at the same time you add the spec. Add a new com
 
 Vitest writes `coverage/vitest/` via `@vitest/coverage-v8` (set in `web/vite.config.ts`'s `test.coverage` block).
 
-Playwright collects `window.__coverage__` after each test when `AOE_COVERAGE=1` is set. The instrumentation is added by `vite-plugin-istanbul`, conditionally registered in `web/vite.config.ts`. `build.rs` honors the same env so the embedded web bundle in the `aoe` binary carries instrumentation when requested.
+Playwright collects raw Chromium V8 coverage via `page.coverage.startJSCoverage()` / `stopJSCoverage()` (started in the `page` fixture before the test, written after) when `AOE_COVERAGE=1` is set. That env makes `web/vite.config.ts` build the bundle with inline sourcemaps (`build.sourcemap: "inline"`), which travel inside the `.js` so they survive `build.rs` embedding the bundle into the `aoe` binary. The capture strips the (identical, multi-MB) bundle `source` from each per-test file to keep them small; the merge script re-reads each script's source from `dist/` once.
 
-`npm run coverage:merge` runs `web/scripts/merge-coverage.mjs`, which feeds both inputs into `monocart-coverage-reports` and emits:
+Collecting V8 (not istanbul-on-bundle) is deliberate: both Vitest and Playwright then remap to the same `web/src` source line map. Codecov reconciles each file to one line map, so the old istanbul-bundle Playwright coverage, which numbered the bundle differently, made Codecov drop Vitest's hits and tanked patch coverage (#2157).
+
+`npm run coverage:merge` runs `web/scripts/merge-coverage.mjs`, which converts the Playwright V8 to istanbul-shape through the inline sourcemap, merges it with Vitest's coverage in `monocart-coverage-reports`, and emits:
 
 - `web/coverage/merged/lcov.info`
 - `web/coverage/merged/coverage-summary.json` and `coverage-final.json`

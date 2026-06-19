@@ -37,6 +37,26 @@ export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
+// --- Recent projects ---
+
+export interface RecentProjectEntry {
+  path: string;
+  display_name: string;
+  tool: string;
+  last_used_at: string;
+}
+
+export interface RecentProjectsEnvelope {
+  projects: RecentProjectEntry[];
+}
+
+// Persisted recent projects (newest first), so a project stays in the wizard
+// Recent tab after its last session is deleted. Merged with the live
+// session-derived list in ProjectStep.
+export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
+  return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
+}
+
 export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
   try {
     const res = await fetch("/api/workspace-ordering", {
@@ -158,19 +178,6 @@ export function resetSettingsSchemaCache(): void {
   schemaPromise = null;
 }
 
-export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
-  try {
-    const res = await fetch("/api/settings", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Sets the global theme (name and/or color mode). Dedicated endpoint, not
  * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
@@ -201,6 +208,30 @@ export async function markWebTourSeen(): Promise<boolean> {
   try {
     const res = await fetch("/api/app-state/web-tour-seen", {
       method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// --- Web UI state sync (server-side mirror of synced localStorage keys) ---
+
+/** Fetch the server-side UI-state blob: a flat map of localStorage key ->
+ *  stored string value. Null on failure so the caller falls back to its local
+ *  cache. Single-tenant: this is the one user's synced preferences. */
+export async function getWebUiState(): Promise<Record<string, string> | null> {
+  return fetchJson<Record<string, string>>("/api/app-state/web-ui-state");
+}
+
+/** Merge a partial update into the server UI-state blob. Values are strings to
+ *  set, or `null` to delete the key. Best-effort; returns success. */
+export async function patchWebUiState(patch: Record<string, string | null>): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/web-ui-state", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
     });
     return res.ok;
   } catch {
@@ -533,10 +564,29 @@ export interface UpdateStatus {
   release_url: string | null;
   web_poll_interval_minutes: number;
   error: string | null;
+  /** Version the user already dismissed the banner for, persisted server-side
+   *  in app_state so the acknowledgement is once-per-account, not per device. */
+  dismissed_version: string | null;
 }
 
 export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
   return fetchJson<UpdateStatus>("/api/system/update-status");
+}
+
+/** Persist that the update banner was dismissed for `version`, server-side, so
+ *  it stays dismissed across devices (and matches the TUI). Returns true on
+ *  success; the banner optimistically hides regardless. */
+export async function dismissUpdate(version: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/dismiss-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // --- Branches ---
@@ -626,6 +676,40 @@ export async function switchAcpAgent(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+// --- Acp install agent (Tier 2 of #2109) ---
+
+export interface InstallAgentResponse {
+  session_id: string;
+  package: string;
+  success: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run `npm install -g` for the session's agent on the host. Opt-in and
+ *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
+ *  Resolves with the parsed body on 2xx; throws with the server's error
+ *  message on failure (disabled, sandboxed, not npm-installable, npm
+ *  missing) so the caller can surface why. The caller respawns the worker
+ *  separately via `useRespawnSession` on `success`. */
+export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = (await res.json().catch(() => null)) as
+    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
+    | null;
+  if (!res.ok) {
+    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
+  }
+  if (!body) {
+    throw new Error("Server returned an invalid or empty response");
+  }
+  return body as InstallAgentResponse;
 }
 
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
@@ -729,6 +813,10 @@ export async function createProject(body: {
   scope?: "global" | "profile";
   allow_override?: boolean;
   default_base_branch?: string;
+  /** Pin the project on create (show it as a sessionless sidebar header).
+   *  Defaults to false server-side: the Projects view just saves, the sidebar
+   *  "Pin project" action sends true. See #2208. */
+  pinned?: boolean;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch("/api/projects", {
@@ -790,6 +878,39 @@ export async function updateProject(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return {
+          ok: false,
+          error: data.message || `Server error (${res.status})`,
+        };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    const project = (await res.json()) as ProjectInfo;
+    return { ok: true, project };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Pin or unpin a saved project. Unpinning (pinned=false) keeps the registry
+ *  entry, so the project stays in the Projects view and the wizard; it just
+ *  drops from the sidebar. See #2208. */
+export async function setProjectPinned(
+  name: string,
+  scope: "global" | "profile",
+  pinned: boolean,
+): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned }),
     });
     if (!res.ok) {
       const text = await res.text();
@@ -1195,13 +1316,10 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
-/** Archive or unarchive a session. On archive, the server kills the tmux
- *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
- *  and shuts down the acp worker for acp-mode sessions; the
- *  reconciler will not respawn it because archived sessions are excluded
- *  from the resume target list. Sending a message via the dashboard
- *  auto-unarchives via the existing `touch_last_accessed` invariant in
- *  the send handler. See #1581. */
+/** Archive or unarchive a session. On archive (with `killPane` true or
+ *  omitted), the server tears down all tmux sessions and shuts down the
+ *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
+ *  See #1581, #1868. */
 export async function setSessionArchive(
   id: string,
   archived: boolean,
@@ -1212,6 +1330,39 @@ export async function setSessionArchive(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ archived, kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Stop a session, matching the TUI's `x` keybind: kills the tmux pane and
+ *  stops (but does not remove) the Docker container for plain sessions, or
+ *  shuts down the worker for structured-view sessions. The session record is
+ *  preserved with status `Stopped` and can be resumed later. NOT a delete. */
+export async function stopSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Start (resume) a stopped session, the inverse of stopSession: restarts a
+ *  plain session's pane or un-parks a structured session so its worker
+ *  respawns. Returns null on failure. */
+export async function startSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;
