@@ -25,6 +25,13 @@ const __dirname = dirname(__filename);
 
 const DEFAULT_PASSPHRASE = "aoe-e2e-fixed-passphrase";
 
+function withoutParentTmux(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const isolated = { ...env };
+  delete isolated.TMUX;
+  delete isolated.TMUX_PANE;
+  return isolated;
+}
+
 export type AuthMode = "none" | "passphrase" | "token";
 
 export interface SpawnOptions {
@@ -120,8 +127,8 @@ export interface ServeHandle {
   authToken?: string;
   /**
    * Token-mode only: filesystem path to `serve.token` under the
-   * isolated HOME. Specs that need to read the rotated token re-read
-   * this file; the daemon rewrites it on every rotation.
+   * isolated HOME. Debug rotation specs re-read this file after forcing
+   * a short token lifetime.
    */
   tokenFile?: string;
   /**
@@ -144,6 +151,7 @@ export interface ServeHandle {
    * with the session title rather than hard-coding `aoe_`.
    */
   tmuxPrefix: "aoe_" | "aoe_dev_";
+  tmuxServerName: "aoe" | "aoe_dev";
   stop(): Promise<void>;
   /**
    * Kill the running `aoe serve` proc and respawn it with the same args
@@ -239,20 +247,33 @@ export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
   return binaryPath.includes("/target/debug/") ? "aoe_dev_" : "aoe_";
 }
 
+export function tmuxServerNameFor(binaryPath: string): "aoe" | "aoe_dev" {
+  return binaryPath.includes("/target/debug/") ? "aoe_dev" : "aoe";
+}
+
 /**
  * Resolve where the daemon will write `serve.token` (and other serve.*
  * state files) under the test's isolated filesystem tree. Mirrors the
- * Rust `get_app_dir_path` logic at `src/session/mod.rs:83`: Linux uses
- * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`, macOS/Windows uses
- * `$HOME/.agent-of-empires[-dev]`. Debug builds carry the `-dev`
- * suffix, derived from the binary path the same way as `tmuxPrefixFor`.
+ * Rust `get_app_dir_path` logic at `src/session/mod.rs`: Linux uses
+ * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`; macOS prefers an existing
+ * XDG dir, then an existing legacy `$HOME/.agent-of-empires[-dev]` dir,
+ * then XDG when `XDG_CONFIG_HOME` is absolute, otherwise legacy.
+ * Debug builds carry the `-dev` suffix, derived from the binary path the
+ * same way as `tmuxPrefixFor`.
  */
 export function appDirFor(home: string, xdg: string, binaryPath: string): string {
   const suffix = binaryPath.includes("/target/debug/") ? "-dev" : "";
+  const xdgDir = join(xdg, `agent-of-empires${suffix}`);
   if (process.platform === "linux") {
-    return join(xdg, `agent-of-empires${suffix}`);
+    return xdgDir;
   }
-  return join(home, `.agent-of-empires${suffix}`);
+  const legacyDir = join(home, `.agent-of-empires${suffix}`);
+  if (process.platform === "darwin") {
+    if (existsSync(xdgDir)) return xdgDir;
+    if (existsSync(legacyDir)) return legacyDir;
+    if (resolve(xdg) === xdg) return xdgDir;
+  }
+  return legacyDir;
 }
 
 /**
@@ -488,12 +509,13 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
 
   const authMode: AuthMode = opts.authMode ?? "none";
 
-  const seedEnv: NodeJS.ProcessEnv = {
+  const seedEnv: NodeJS.ProcessEnv = withoutParentTmux({
     ...process.env,
     HOME: home,
     XDG_CONFIG_HOME: xdg,
     TMPDIR: tmp,
     TMUX_TMPDIR: tmuxTmp,
+    AOE_TMUX_TMPDIR: tmuxTmp,
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
     // Lift the runner-socket appearance deadline. The `aoe
     // __acp-runner` shim re-execs the debug `aoe` binary, which
@@ -529,7 +551,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // covered by the Vitest + RTL contract tests, not the live suite. A future
     // live spec that exercises the modal can unset this in its own env.
     DO_NOT_TRACK: process.env.DO_NOT_TRACK ?? "1",
-  };
+  });
 
   if (authMode === "token") {
     if (typeof opts.tokenLifetimeSecs === "number") {
@@ -681,6 +703,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     authToken,
     tokenFile,
     tmuxPrefix: tmuxPrefixFor(aoeBinary),
+    tmuxServerName: tmuxServerNameFor(aoeBinary),
     async restart() {
       if (proc) await killProc(proc);
       const next = await spawnOnce(buildArgs(port), baseUrl);
@@ -716,12 +739,12 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
         // processes around that hold open file descriptors and trip
         // ENOTEMPTY on rmSync if not cleaned up first.
         try {
-          spawnSync("tmux", ["kill-server"], {
-            env: {
+          spawnSync("tmux", ["-L", tmuxServerNameFor(aoeBinary), "kill-server"], {
+            env: withoutParentTmux({
               ...process.env,
               HOME: home,
               TMUX_TMPDIR: join(home, "tmux"),
-            },
+            }),
             stdio: "ignore",
           });
         } catch {

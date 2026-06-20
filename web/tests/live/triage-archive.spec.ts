@@ -56,7 +56,7 @@ base.describe("sidebar archive via context menu (#1581)", () => {
       await expect
         .poll(
           () => {
-            const result = spawnSync("tmux", ["ls"], {
+            const result = spawnSync("tmux", ["-L", serve.tmuxServerName, "ls"], {
               env: serve.env,
               encoding: "utf8",
             });

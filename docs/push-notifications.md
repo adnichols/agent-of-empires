@@ -56,7 +56,7 @@ Desktop Safari requires macOS 13 or later and needs no PWA install.
 
 ## How it works
 
-Standard Web Push over VAPID: the server holds a long-lived keypair, each browser registers a subscription with its push service (Apple/Firebase/Mozilla), and payloads are encrypted end-to-end so the relay cannot read session titles or URLs. Subscriptions are bound to your bearer token and dropped when the token rotates past its grace period.
+Standard Web Push over VAPID: the server holds a long-lived keypair, each browser registers a subscription with its push service (Apple/Firebase/Mozilla), and payloads are encrypted end-to-end so the relay cannot read session titles or URLs. Subscriptions are bound to your bearer token and are cleared when login sessions are revoked or invalidated.
 
 > **Operator note:** push can be disabled server-wide via `web.notifications_enabled = false` (TUI Settings, Web category, or the config file). When disabled, `/api/push/*` returns 404, no events are delivered, and clients show a *disabled by the server* state. Existing subscriptions persist; re-enabling resumes delivery. Requires a server restart.
 
@@ -74,6 +74,6 @@ Upgrading aoe replaces the service worker, but the new one does not activate unt
 
 **"Disabled by the server".** Ask the operator to flip `web.notifications_enabled`.
 
-**Notifications stop after a while.** Token rotation drops stale subscriptions. With `aoe serve --remote` the token rotates every four hours; grab a fresh dashboard URL and re-enable in the PWA.
+**Notifications stop after a while.** Open Settings, Notifications, and click **Send test notification**. If the test fails, click Diagnose. If you changed the token, signed out devices, or changed the dashboard origin, re-enable notifications from the PWA.
 
 **Tapping a notification opens the wrong port or hostname.** Push payloads carry the origin recorded at subscribe time. If you change `--port`/`--host`, move behind a different reverse proxy, or your remote URL changes, open Settings, Notifications, and click **Re-subscribe** on the affected device. Subscriptions created before origin tracking are skipped on send; Re-subscribe upgrades them.

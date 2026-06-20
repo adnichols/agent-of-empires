@@ -48,12 +48,12 @@ export function getToken(): string | null {
 }
 
 // Called when the server sends X-Aoe-Token on a response, indicating the
-// auth token has been rotated. Keeps the PWA in sync without a page reload.
+// auth token was replaced. Keeps the PWA in sync without a page reload.
 export function saveToken(token: string): void {
   const trimmed = token.trim();
   if (!trimmed) return;
   try {
-    // Rotated tokens share the same fallback path as captureFromUrl;
+    // Replacement tokens share the same fallback path as captureFromUrl;
     // raw setItem stays here for the documented rethrow contract.
     // eslint-disable-next-line no-restricted-syntax
     window.localStorage.setItem(STORAGE_KEY, trimmed);

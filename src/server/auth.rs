@@ -117,9 +117,7 @@ fn write_token_headers(
 
 /// Attach both the Set-Cookie and X-Aoe-Token headers to a response. The
 /// cookie covers the browser flow; X-Aoe-Token lets the PWA update its
-/// localStorage-cached token when the server rotates. Without the header,
-/// a rotated token would brick the PWA until the user manually re-visits
-/// with a fresh `?token=` URL.
+/// localStorage-cached token if a debug or manual rotation path changes it.
 async fn attach_token_headers(response: &mut Response, state: &AppState) {
     let Some(current) = state.token_manager.current_token().await else {
         return;
@@ -685,9 +683,8 @@ pub async fn auth_middleware(
     // passphrase session + device binding alone. The token is a
     // first-device-pairing nonce, NOT a per-request second factor;
     // we only consult it on bootstrap paths below. This is the
-    // core simplification from #1167: rotation still happens for
-    // URL-leak mitigation of the bootstrap URL, but bound devices
-    // never see the rotation because they don't ride on tokens.
+    // core simplification from #1167: bound devices do not rely on
+    // the URL token for regular requests after login.
     let login_enabled = state.login_manager.is_enabled();
     let presented_session_id = if login_enabled {
         super::login::extract_login_session(&request)
