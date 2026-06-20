@@ -43,10 +43,13 @@ test("long transcript renders recent first and reveals older on Load earlier", a
   const loadEarlier = page.getByTestId("acp-load-earlier");
   await expect(loadEarlier).toBeVisible();
 
-  // Growing the window enough times reveals the oldest turn.
+  // Growing the window enough times reveals the oldest turn. Dispatch
+  // directly because this test covers history expansion, not pointer
+  // hit-testing, and CI can briefly reflow the transcript while the
+  // button is being clicked.
   for (let i = 0; i < 3; i += 1) {
     if ((await page.getByText("prompt number 0").count()) > 0) break;
-    await loadEarlier.click();
+    await loadEarlier.dispatchEvent("click");
   }
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });
@@ -97,7 +100,7 @@ test("loads older events from the server when the loaded window is exhausted", a
   // turn surfaces.
   for (let i = 0; i < 12; i += 1) {
     if ((await page.getByText("prompt number 0").count()) > 0) break;
-    await loadEarlier.click();
+    await loadEarlier.dispatchEvent("click");
     await page.waitForTimeout(150);
   }
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
