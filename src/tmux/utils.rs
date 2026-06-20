@@ -311,22 +311,25 @@ pub fn tmux_prefix_display() -> &'static str {
 /// success, since the goal is "this session is not present": `can't find
 /// session` (the session is gone, e.g. callers commonly kill the pane's
 /// process tree first, which can tear the session down before this lands)
-/// and `no server running` (no tmux server at all, so no session exists)
-/// are swallowed in the C locale. `server exited unexpectedly` is also
-/// absent-equivalent because the server died before it could hold the
-/// target session. Any other tmux failure returns `Err`. Caller is
-/// responsible for `refresh_session_cache` after a successful kill.
+/// `no current target`, and `no server running` (no tmux server at all,
+/// so no session exists) are swallowed in the C locale. `server exited
+/// unexpectedly` is also absent-equivalent because the server died before
+/// it could hold the target session. Any other tmux failure returns `Err`.
+/// Caller is responsible for `refresh_session_cache` after a successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     let output = tmux_command()
         .env("LC_ALL", "C")
         .args(["kill-session", "-t", name])
         .output()?;
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let absent = stderr.contains("can't find session")
-            || stderr.contains("no server running")
-            || stderr.contains("error connecting")
-            || stderr.contains("server exited unexpectedly");
+        let message = format!("{stdout}\n{stderr}");
+        let absent = message.contains("can't find session")
+            || message.contains("no current target")
+            || message.contains("no server running")
+            || message.contains("error connecting")
+            || message.contains("server exited unexpectedly");
         if !absent {
             bail!("Failed to kill tmux session '{}': {}", name, stderr);
         }
