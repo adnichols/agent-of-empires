@@ -1156,7 +1156,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     push::spawn_consumer(state.clone());
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
-    login_manager.spawn_cleanup_task(state.shutdown.clone());
+    login_manager.spawn_cleanup_task(state.shutdown.clone(), state.push.clone());
 
     if token_rotation_enabled(auth_token.is_some(), token_lifetime_override) {
         // Debug-build test path: live Playwright specs set
@@ -1848,6 +1848,7 @@ pub fn discover_tagged_ips() -> Vec<(IpKind, std::net::Ipv4Addr)> {
 /// Write a file with owner-only permissions (0600) to protect secrets.
 #[cfg(unix)]
 async fn write_secret_file(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     let opts = tokio::fs::OpenOptions::new()
         .write(true)
@@ -1858,6 +1859,7 @@ async fn write_secret_file(path: &std::path::Path, contents: &str) {
         .await;
     if let Ok(mut file) = opts {
         let _ = file.write_all(contents.as_bytes()).await;
+        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
     }
 }
 
@@ -1884,6 +1886,23 @@ fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
+async fn existing_secret_file_is_owner_only(path: &std::path::Path) -> bool {
+    let Ok(meta) = tokio::fs::symlink_metadata(path).await else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Load an existing auth token from disk, or generate and persist one
 /// when the file is missing or malformed. The token deliberately has no
 /// mtime expiry so installed phone PWAs can reconnect after idle time or
@@ -1895,7 +1914,19 @@ async fn load_or_generate_token() -> anyhow::Result<String> {
     if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
         let token = token.trim().to_string();
         if !token.is_empty() && is_valid_token_format(&token) {
-            return Ok(token);
+            if existing_secret_file_is_owner_only(&token_path).await {
+                return Ok(token);
+            }
+            tracing::warn!(
+                target: "auth.token",
+                path = %token_path.display(),
+                "existing serve.token is not owner-only; replacing it"
+            );
+            if let Err(e) = tokio::fs::remove_file(&token_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e).context("remove insecure serve.token");
+                }
+            }
         }
     }
 
@@ -4692,6 +4723,36 @@ mod tests {
         assert!(!is_valid_token_format("short"));
         assert!(!is_valid_token_format(""));
         assert!(!is_valid_token_format("ZZZZ0000111122223333444455556666"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_secret_file_requires_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("serve.token");
+        std::fs::write(&path, "token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!existing_secret_file_is_owner_only(&path).await);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(existing_secret_file_is_owner_only(&path).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_secret_file_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("serve.token");
+        std::fs::write(&target, "token").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(!existing_secret_file_is_owner_only(&link).await);
     }
 
     #[test]

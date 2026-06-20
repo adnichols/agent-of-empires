@@ -209,7 +209,10 @@ impl LoginManager {
                     error = %e,
                     "could not load persisted login sessions; starting empty"
                 );
-                LoadedSessions::default()
+                LoadedSessions {
+                    sessions: HashMap::new(),
+                    invalidated_count: 1,
+                }
             }
         };
         let invalidated_persisted_sessions = loaded.invalidated_count;
@@ -561,7 +564,7 @@ impl LoginManager {
     }
 
     /// Remove expired sessions. Called periodically.
-    pub async fn cleanup_expired(&self) {
+    pub async fn cleanup_expired(&self) -> usize {
         let before;
         let after;
         {
@@ -571,9 +574,11 @@ impl LoginManager {
             sessions.retain(|_, s| now < s.expires_at);
             after = sessions.len();
         }
-        if after != before {
+        let removed = before.saturating_sub(after);
+        if removed > 0 {
             self.persist().await;
         }
+        removed
     }
 
     /// Persist the current sessions to disk when persistence is enabled.
@@ -599,14 +604,39 @@ impl LoginManager {
     /// Spawn periodic cleanup (piggybacks on the rate limiter's interval).
     /// Exits cleanly on shutdown so `aoe serve --stop` drains within one
     /// tick instead of waiting for the 5 s force exit safety net.
-    pub fn spawn_cleanup_task(self: &Arc<Self>, shutdown: CancellationToken) {
+    pub fn spawn_cleanup_task(
+        self: &Arc<Self>,
+        shutdown: CancellationToken,
+        push: Option<Arc<super::push::PushState>>,
+    ) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = interval.tick() => manager.cleanup_expired().await,
+                    _ = interval.tick() => {
+                        let expired = manager.cleanup_expired().await;
+                        if expired > 0 {
+                            if let Some(push) = push.as_ref() {
+                                match push.store.clear_all().await {
+                                    Ok(0) => {}
+                                    Ok(count) => tracing::info!(
+                                        target: "auth.passphrase",
+                                        count,
+                                        expired,
+                                        "cleared push subscriptions after login sessions expired"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        target: "auth.passphrase",
+                                        error = %e,
+                                        expired,
+                                        "failed to clear push subscriptions after login sessions expired"
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     _ = shutdown.cancelled() => break,
                 }
             }

@@ -312,9 +312,10 @@ pub fn tmux_prefix_display() -> &'static str {
 /// session` (the session is gone, e.g. callers commonly kill the pane's
 /// process tree first, which can tear the session down before this lands)
 /// and `no server running` (no tmux server at all, so no session exists)
-/// are both swallowed in the C locale. Any other tmux failure returns
-/// `Err`. Caller is responsible for `refresh_session_cache` after a
-/// successful kill.
+/// are swallowed in the C locale. `server exited unexpectedly` is also
+/// absent-equivalent because the server died before it could hold the
+/// target session. Any other tmux failure returns `Err`. Caller is
+/// responsible for `refresh_session_cache` after a successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     let output = tmux_command()
         .env("LC_ALL", "C")
@@ -324,7 +325,8 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let absent = stderr.contains("can't find session")
             || stderr.contains("no server running")
-            || stderr.contains("error connecting");
+            || stderr.contains("error connecting")
+            || stderr.contains("server exited unexpectedly");
         if !absent {
             bail!("Failed to kill tmux session '{}': {}", name, stderr);
         }

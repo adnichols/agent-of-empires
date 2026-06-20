@@ -1234,7 +1234,7 @@ mod tests {
     async fn clear_all_removes_every_subscription() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("push.subscriptions.json");
-        let store = SubscriptionStore::load_or_empty(path);
+        let store = SubscriptionStore::load_or_empty(path.clone());
 
         let mk = |endpoint: &str| Subscription {
             endpoint: endpoint.to_string(),
@@ -1251,6 +1251,10 @@ mod tests {
 
         assert_eq!(store.clear_all().await.unwrap(), 2);
         assert!(store.snapshot().await.is_empty());
+
+        let reloaded = SubscriptionStore::load_or_empty(path);
+        assert!(reloaded.snapshot().await.is_empty());
+
         assert_eq!(store.clear_all().await.unwrap(), 0);
     }
 
