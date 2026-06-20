@@ -1,15 +1,16 @@
-// Token rotation grace window: after the daemon rotates, the previous
-// token must keep working for the grace period, the new token must work
-// immediately, and the previous token must be rejected once grace
-// expires. Covers `src/server/mod.rs` TokenManager rotate + validate.
+// Debug-only token rotation grace window: after the daemon rotates, the
+// previous token must keep working for the grace period, the new token
+// must work immediately, and the previous token must be rejected once
+// grace expires. Covers `src/server/mod.rs` TokenManager rotate + validate.
 //
-// Driven by debug-build env overrides AOE_TEST_TOKEN_LIFETIME_SECS and
-// AOE_TEST_TOKEN_GRACE_SECS. The harness sets these via the
-// `tokenLifetimeSecs` / `tokenGraceSecs` options on spawnAoeServe. In
-// release builds the override is ignored (token lifetime stays at 24h);
-// this spec relies on debug-build behavior so the CI matrix that runs
-// live specs must build aoe in debug or pass --features serve with
-// `cfg!(debug_assertions)` on (current `playwright-live` job does both).
+// Production tokens are stable for phone/PWA reconnects. This spec uses
+// debug-build env overrides AOE_TEST_TOKEN_LIFETIME_SECS and
+// AOE_TEST_TOKEN_GRACE_SECS so TokenManager rotation remains covered
+// without restoring time-based production expiry. The harness sets these
+// via the `tokenLifetimeSecs` / `tokenGraceSecs` options on spawnAoeServe.
+// In release builds the override is ignored; this spec relies on debug-
+// build behavior so the CI matrix that runs live specs must build aoe in
+// debug or pass --features serve with `cfg!(debug_assertions)` on.
 
 import { readFile } from "node:fs/promises";
 

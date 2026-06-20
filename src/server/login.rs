@@ -44,7 +44,7 @@ use super::AppState;
 /// `Max-Age=2592000` already advertised 30 days; this aligns the
 /// server-side TTL with the client-side hint. See #1137 (initial
 /// 24h window) and #1167 (extension rationale: bound devices stay
-/// signed in independent of token rotation).
+/// signed in without relying on token revalidation).
 ///
 /// `pub(crate)` so cross-module tests can pin the value and catch
 /// a silent regression to the old 24h window.
@@ -144,6 +144,7 @@ pub struct LoginManager {
     /// `auth.persist_sessions = false`, or no resolvable app dir). See
     /// #1235.
     sessions_path: Option<PathBuf>,
+    invalidated_persisted_sessions: usize,
 }
 
 /// Argon2 hash of a passphrase with a fresh random salt. The PHC string
@@ -186,6 +187,7 @@ impl LoginManager {
             passphrase_hash: passphrase.map(hash_passphrase),
             sessions: RwLock::new(HashMap::new()),
             sessions_path: None,
+            invalidated_persisted_sessions: 0,
         }
     }
 
@@ -199,17 +201,22 @@ impl LoginManager {
         let passphrase_hash = passphrase.map(hash_passphrase);
         let sessions_path = app_dir.join(SESSIONS_FILE);
 
-        let sessions = match load_sessions(&sessions_path, passphrase) {
-            Ok(map) => map,
+        let loaded = match load_sessions(&sessions_path, passphrase) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 tracing::warn!(
                     target: "auth.passphrase",
                     error = %e,
                     "could not load persisted login sessions; starting empty"
                 );
-                HashMap::new()
+                LoadedSessions {
+                    sessions: HashMap::new(),
+                    invalidated_count: 1,
+                }
             }
         };
+        let invalidated_persisted_sessions = loaded.invalidated_count;
+        let sessions = loaded.sessions;
 
         // Rewrite the store once at startup so the passphrase hash is
         // refreshed (rotates the salt) and any dropped/expired entries
@@ -236,7 +243,12 @@ impl LoginManager {
             passphrase_hash,
             sessions: RwLock::new(sessions),
             sessions_path: Some(sessions_path),
+            invalidated_persisted_sessions,
         }
+    }
+
+    pub fn invalidated_persisted_session_count(&self) -> usize {
+        self.invalidated_persisted_sessions
     }
 
     /// Whether passphrase login is enabled.
@@ -552,7 +564,7 @@ impl LoginManager {
     }
 
     /// Remove expired sessions. Called periodically.
-    pub async fn cleanup_expired(&self) {
+    pub async fn cleanup_expired(&self) -> usize {
         let before;
         let after;
         {
@@ -562,9 +574,11 @@ impl LoginManager {
             sessions.retain(|_, s| now < s.expires_at);
             after = sessions.len();
         }
-        if after != before {
+        let removed = before.saturating_sub(after);
+        if removed > 0 {
             self.persist().await;
         }
+        removed
     }
 
     /// Persist the current sessions to disk when persistence is enabled.
@@ -590,14 +604,39 @@ impl LoginManager {
     /// Spawn periodic cleanup (piggybacks on the rate limiter's interval).
     /// Exits cleanly on shutdown so `aoe serve --stop` drains within one
     /// tick instead of waiting for the 5 s force exit safety net.
-    pub fn spawn_cleanup_task(self: &Arc<Self>, shutdown: CancellationToken) {
+    pub fn spawn_cleanup_task(
+        self: &Arc<Self>,
+        shutdown: CancellationToken,
+        push: Option<Arc<super::push::PushState>>,
+    ) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = interval.tick() => manager.cleanup_expired().await,
+                    _ = interval.tick() => {
+                        let expired = manager.cleanup_expired().await;
+                        if expired > 0 {
+                            if let Some(push) = push.as_ref() {
+                                match push.store.clear_all().await {
+                                    Ok(0) => {}
+                                    Ok(count) => tracing::info!(
+                                        target: "auth.passphrase",
+                                        count,
+                                        expired,
+                                        "cleared push subscriptions after login sessions expired"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        target: "auth.passphrase",
+                                        error = %e,
+                                        expired,
+                                        "failed to clear push subscriptions after login sessions expired"
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     _ = shutdown.cancelled() => break,
                 }
             }
@@ -788,15 +827,18 @@ fn check_path_security(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+#[derive(Default)]
+struct LoadedSessions {
+    sessions: HashMap<String, LoginSession>,
+    invalidated_count: usize,
+}
+
 /// Load and rehydrate persisted sessions. Returns an empty map (not an
 /// error) for the benign cases: file missing, schema mismatch, or
 /// passphrase changed. Returns `Err` only for states that warrant a
 /// visible warning (symlink, loose perms, unreadable, unparseable), in
 /// which case the caller also starts empty. See #1235.
-fn load_sessions(
-    path: &Path,
-    passphrase: Option<&str>,
-) -> anyhow::Result<HashMap<String, LoginSession>> {
+fn load_sessions(path: &Path, passphrase: Option<&str>) -> anyhow::Result<LoadedSessions> {
     use anyhow::Context;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -805,25 +847,31 @@ fn load_sessions(
 
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedSessions::default());
+        }
         Err(e) => return Err(e).context("read login sessions file"),
     };
     let file: PersistedFile = toml::from_str(&raw).context("parse login sessions file")?;
 
     if file.schema_version != SESSIONS_SCHEMA_VERSION {
+        let n = file.sessions.len();
         tracing::info!(
             target: "auth.passphrase",
             found = file.schema_version,
             expected = SESSIONS_SCHEMA_VERSION,
             "login sessions schema mismatch; dropping persisted sessions"
         );
-        return Ok(HashMap::new());
+        return Ok(LoadedSessions {
+            sessions: HashMap::new(),
+            invalidated_count: n,
+        });
     }
 
     // Without a configured passphrase there is no login gate, so any
     // persisted sessions are meaningless; start clean.
     let Some(passphrase) = passphrase else {
-        return Ok(HashMap::new());
+        return Ok(LoadedSessions::default());
     };
     // Drop everything if the passphrase changed since the file was
     // written (or the file carries no hash to verify against).
@@ -838,7 +886,10 @@ fn load_sessions(
                     "passphrase changed since last run; persisted sessions invalidated"
                 );
             }
-            return Ok(HashMap::new());
+            return Ok(LoadedSessions {
+                sessions: HashMap::new(),
+                invalidated_count: n,
+            });
         }
     }
 
@@ -846,6 +897,7 @@ fn load_sessions(
     let now = now_ms();
     let lifetime_ms = SESSION_LIFETIME.as_millis() as u64;
 
+    let total_sessions = file.sessions.len();
     let mut out = HashMap::new();
     for ps in file.sessions {
         // Drop already-expired entries; clamp future deadlines back to
@@ -891,7 +943,11 @@ fn load_sessions(
             },
         );
     }
-    Ok(out)
+    let invalidated_count = total_sessions.saturating_sub(out.len());
+    Ok(LoadedSessions {
+        sessions: out,
+        invalidated_count,
+    })
 }
 
 /// Decode a base64url-encoded device binding secret from the wire.
@@ -1230,6 +1286,7 @@ pub async fn logout_handler(
     // Extract session cookie
     if let Some(session_id) = extract_login_session(&request) {
         state.login_manager.invalidate_session(&session_id).await;
+        clear_push_subscriptions_after_login_revocation(&state, "logout").await;
     }
 
     let clear_cookie = clear_login_cookie(state.behind_tunnel);
@@ -1249,6 +1306,30 @@ fn clear_login_cookie(secure: bool) -> String {
         "aoe_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
         if secure { "; Secure" } else { "" }
     )
+}
+
+pub(crate) async fn clear_push_subscriptions_after_login_revocation(
+    state: &AppState,
+    reason: &'static str,
+) {
+    let Some(push) = state.push.as_ref() else {
+        return;
+    };
+    match push.store.clear_all().await {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(
+            target: "auth.passphrase",
+            count,
+            reason,
+            "cleared push subscriptions after login revocation"
+        ),
+        Err(e) => tracing::warn!(
+            target: "auth.passphrase",
+            error = %e,
+            reason,
+            "failed to clear push subscriptions after login revocation"
+        ),
+    }
 }
 
 /// GET /api/devices
@@ -1278,6 +1359,7 @@ pub async fn devices_handler(
 /// cookie, since its session is among those dropped. See #1235.
 pub async fn logout_all_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     let count = state.login_manager.logout_all().await;
+    clear_push_subscriptions_after_login_revocation(&state, "logout_all").await;
     tracing::info!(target: "auth.passphrase", count, "signed out all devices");
 
     let mut response = Json(serde_json::json!({ "ok": true, "count": count })).into_response();
@@ -1302,6 +1384,9 @@ pub async fn revoke_session_handler(
 ) -> axum::response::Response {
     let is_self = extract_login_session(&request).as_deref() == Some(id.as_str());
     let revoked = state.login_manager.revoke_session(&id).await;
+    if revoked {
+        clear_push_subscriptions_after_login_revocation(&state, "revoke_session").await;
+    }
     tracing::info!(target: "auth.passphrase", revoked, is_self, "revoked device session");
 
     let mut response = Json(serde_json::json!({ "ok": true, "revoked": revoked })).into_response();
@@ -1926,7 +2011,11 @@ mod tests {
         write_sessions(&path, &file);
 
         let loaded = load_sessions(&path, Some("pass")).unwrap();
-        assert!(loaded.is_empty(), "expired entry must be dropped on load");
+        assert!(
+            loaded.sessions.is_empty(),
+            "expired entry must be dropped on load"
+        );
+        assert_eq!(loaded.invalidated_count, 1);
     }
 
     #[tokio::test]

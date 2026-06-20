@@ -171,7 +171,6 @@ fn test_right_click_on_session_row_opens_rename_delete_menu() {
 
     h.spawn_tui();
     h.wait_for(" aoe ");
-    h.send_keys("Enter"); // dismiss welcome
     h.wait_for("RClickRow");
 
     // Right-click on the first session row. The row sits inside the

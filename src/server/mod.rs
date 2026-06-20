@@ -65,6 +65,7 @@ pub struct TokenManager {
 }
 
 const DEFAULT_TOKEN_GRACE: Duration = Duration::from_secs(300);
+const TOKEN_COOKIE_MAX_AGE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl TokenManager {
     pub fn new(initial_token: Option<String>, lifetime: Duration) -> Self {
@@ -122,14 +123,6 @@ impl TokenManager {
         self.state.read().await.lifetime.as_secs()
     }
 
-    /// Clear the previous token after the grace period has expired.
-    /// Used by the rotation task after the 5-minute grace window.
-    pub async fn clear_previous(&self) {
-        let mut state = self.state.write().await;
-        state.previous = None;
-        state.grace_expires = None;
-    }
-
     /// Rotate: generate new token, move current to previous with grace period.
     pub async fn rotate(&self) {
         let mut state = self.state.write().await;
@@ -152,9 +145,8 @@ impl TokenManager {
         );
     }
 
-    /// Spawn a background rotation task. Production paths only call this
-    /// from the `--remote` branch; debug builds also call it when the
-    /// `AOE_TEST_TOKEN_LIFETIME_SECS` env override is set, so live e2e
+    /// Spawn a background rotation task. Only debug-build test paths call this
+    /// when the `AOE_TEST_TOKEN_LIFETIME_SECS` env override is set, so live e2e
     /// specs can observe the grace window without waiting hours.
     pub fn spawn_rotation_task(self: &Arc<Self>) {
         let manager = Arc::clone(self);
@@ -194,6 +186,10 @@ fn test_token_lifetime_override() -> Option<Duration> {
 #[cfg(not(debug_assertions))]
 fn test_token_lifetime_override() -> Option<Duration> {
     None
+}
+
+fn token_rotation_enabled(auth_token_present: bool, lifetime_override: Option<Duration>) -> bool {
+    auth_token_present && lifetime_override.is_some()
 }
 
 /// Read `AOE_TEST_TOKEN_GRACE_SECS`. Debug builds only.
@@ -634,13 +630,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Some(load_or_generate_token().await?)
     };
 
-    let token_lifetime = test_token_lifetime_override().unwrap_or_else(|| {
-        if remote {
-            Duration::from_secs(4 * 60 * 60) // 4 hours
-        } else {
-            Duration::from_secs(24 * 60 * 60) // 24 hours (existing behavior)
-        }
-    });
+    let token_lifetime_override = test_token_lifetime_override();
+    let token_lifetime = token_lifetime_override.unwrap_or(TOKEN_COOKIE_MAX_AGE);
     let token_grace = test_token_grace_override().unwrap_or(DEFAULT_TOKEN_GRACE);
 
     let token_manager = Arc::new(TokenManager::with_grace(
@@ -710,6 +701,27 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         info!("Push notifications disabled by web.notifications_enabled=false");
         None
     };
+
+    let invalidated_sessions = login_manager.invalidated_persisted_session_count();
+    if invalidated_sessions > 0 {
+        if let Some(push) = push_state.as_ref() {
+            match push.store.clear_all().await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(
+                    target: "auth.passphrase",
+                    count,
+                    invalidated_sessions,
+                    "cleared push subscriptions after persisted login sessions were invalidated"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "auth.passphrase",
+                    error = %e,
+                    invalidated_sessions,
+                    "failed to clear push subscriptions after persisted login sessions were invalidated"
+                ),
+            }
+        }
+    }
 
     #[cfg(feature = "serve")]
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
@@ -1144,106 +1156,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     push::spawn_consumer(state.clone());
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
-    login_manager.spawn_cleanup_task(state.shutdown.clone());
+    login_manager.spawn_cleanup_task(state.shutdown.clone(), state.push.clone());
 
-    if remote {
-        // Inline the rotation loop here rather than calling
-        // token_manager.spawn_rotation_task() so we can also invalidate
-        // push subscriptions whose owner hash is no longer valid after
-        // rotation. Behavior otherwise matches the original: wait one
-        // lifetime, rotate, wait 300s grace, clear previous.
-        let rot_state = state.clone();
-        let rot_shutdown = state.shutdown.clone();
-        // The tunnel URL is stable across the daemon's lifetime (Tailscale
-        // and named CF tunnels are stable; quick CF rotates only on
-        // restart, which is outside this task's scope). Capture once so
-        // the rotation task can rebuild `serve.url` with the new token.
-        let rot_base_url: Option<String> = tunnel_handle.as_ref().map(|h| h.url.clone());
-        tokio::spawn(async move {
-            loop {
-                let lifetime = rot_state.token_manager.lifetime_secs().await;
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(lifetime)) => {}
-                    _ = rot_shutdown.cancelled() => break,
-                }
-
-                // Capture the hashes of the current and (about-to-be)
-                // previous tokens BEFORE rotating, so we know which
-                // owner-hashes are still valid in the store.
-                let pre_rotate_current = rot_state.token_manager.current_token().await;
-                rot_state.token_manager.rotate().await;
-                let post_rotate_current = rot_state.token_manager.current_token().await;
-
-                // Refresh `serve.url` so the TUI display and the QR-code
-                // URL stay in sync with the rotated token. Without this
-                // the TUI keeps showing `?token=<old>`, which is invalid
-                // 5 minutes after rotation (end of grace period).
-                if let (Some(base_url), Some(token)) =
-                    (rot_base_url.as_ref(), post_rotate_current.as_ref())
-                {
-                    let url_with_token = format!("{}/?token={}", base_url, token);
-                    if let Ok(app_dir) = crate::session::get_app_dir() {
-                        write_secret_file(&app_dir.join("serve.url"), &url_with_token).await;
-                    }
-                }
-
-                if let Some(push) = rot_state.push.as_ref() {
-                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
-                    if let Some(t) = &post_rotate_current {
-                        valid_hashes.push(push::sha256_token(t));
-                    }
-                    if let Some(t) = &pre_rotate_current {
-                        // The old token remains in the grace period (5m)
-                        // so devices that haven't yet picked up the new
-                        // token should keep receiving pushes.
-                        valid_hashes.push(push::sha256_token(t));
-                    }
-                    // In no-auth mode the token is None and we use a
-                    // zero hash; preserve that so zero-hash subs survive.
-                    if valid_hashes.is_empty() {
-                        valid_hashes.push([0u8; 32]);
-                    }
-                    match push.store.retain_owners(&valid_hashes).await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(target: "http.middleware",
-                            removed = n,
-                            "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
-                        ),
-                        Err(e) => {
-                            tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed")
-                        }
-                    }
-                }
-
-                // After grace period, the previous token becomes invalid.
-                // Clear it AND drop any subscriptions that were bound
-                // only to the old hash (retain_owners with only the new).
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
-                    _ = rot_shutdown.cancelled() => break,
-                }
-                // Clear previous token inside TokenManager. Reuse its
-                // internal state access via a tiny helper on the manager.
-                rot_state.token_manager.clear_previous().await;
-
-                if let Some(push) = rot_state.push.as_ref() {
-                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
-                    if let Some(t) = rot_state.token_manager.current_token().await {
-                        valid_hashes.push(push::sha256_token(&t));
-                    }
-                    if valid_hashes.is_empty() {
-                        valid_hashes.push([0u8; 32]);
-                    }
-                    let _ = push.store.retain_owners(&valid_hashes).await;
-                }
-            }
-        });
-    } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
+    if token_rotation_enabled(auth_token.is_some(), token_lifetime_override) {
         // Debug-build test path: live Playwright specs set
-        // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
+        // AOE_TEST_TOKEN_LIFETIME_SECS and optionally AOE_TEST_TOKEN_GRACE_SECS
         // so they can observe the rotation grace window without waiting hours.
-        // Skips the remote-only serve.url rewrite and push retain steps because
-        // neither exists in the local test setup.
         token_manager.spawn_rotation_task();
     }
 
@@ -1930,6 +1848,7 @@ pub fn discover_tagged_ips() -> Vec<(IpKind, std::net::Ipv4Addr)> {
 /// Write a file with owner-only permissions (0600) to protect secrets.
 #[cfg(unix)]
 async fn write_secret_file(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     let opts = tokio::fs::OpenOptions::new()
         .write(true)
@@ -1940,6 +1859,7 @@ async fn write_secret_file(path: &std::path::Path, contents: &str) {
         .await;
     if let Ok(mut file) = opts {
         let _ = file.write_all(contents.as_bytes()).await;
+        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
     }
 }
 
@@ -1966,24 +1886,45 @@ fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
-/// Load an existing auth token from disk if it's less than 24 hours old,
-/// otherwise generate a fresh one and persist it.
+async fn existing_secret_file_is_owner_only(path: &std::path::Path) -> bool {
+    let Ok(meta) = tokio::fs::symlink_metadata(path).await else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Load an existing auth token from disk, or generate and persist one
+/// when the file is missing or malformed. The token deliberately has no
+/// mtime expiry so installed phone PWAs can reconnect after idle time or
+/// daemon restarts.
 async fn load_or_generate_token() -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
     let token_path = app_dir.join("serve.token");
 
-    // Try to reuse existing token if fresh enough
-    if let Ok(metadata) = tokio::fs::metadata(&token_path).await {
-        if let Ok(modified) = metadata.modified() {
-            let age = std::time::SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or_default();
-            if age < std::time::Duration::from_secs(24 * 60 * 60) {
-                if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
-                    let token = token.trim().to_string();
-                    if !token.is_empty() && is_valid_token_format(&token) {
-                        return Ok(token);
-                    }
+    if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
+        let token = token.trim().to_string();
+        if !token.is_empty() && is_valid_token_format(&token) {
+            if existing_secret_file_is_owner_only(&token_path).await {
+                return Ok(token);
+            }
+            tracing::warn!(
+                target: "auth.token",
+                path = %token_path.display(),
+                "existing serve.token is not owner-only; replacing it"
+            );
+            if let Err(e) = tokio::fs::remove_file(&token_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e).context("remove insecure serve.token");
                 }
             }
         }
@@ -4784,6 +4725,36 @@ mod tests {
         assert!(!is_valid_token_format("ZZZZ0000111122223333444455556666"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_secret_file_requires_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("serve.token");
+        std::fs::write(&path, "token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!existing_secret_file_is_owner_only(&path).await);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(existing_secret_file_is_owner_only(&path).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_secret_file_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("serve.token");
+        std::fs::write(&target, "token").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(!existing_secret_file_is_owner_only(&link).await);
+    }
+
     #[test]
     fn classify_ip_recognizes_tailscale_cgnat() {
         use std::net::Ipv4Addr;
@@ -4890,6 +4861,13 @@ mod tests {
         );
         // Neither configured is the security-relevant fully-open mode.
         assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
+    }
+
+    #[test]
+    fn token_rotation_is_test_override_only() {
+        assert!(!token_rotation_enabled(true, None));
+        assert!(!token_rotation_enabled(false, Some(Duration::from_secs(1))));
+        assert!(token_rotation_enabled(true, Some(Duration::from_secs(1))));
     }
 
     #[tokio::test]

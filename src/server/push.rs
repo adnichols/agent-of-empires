@@ -188,9 +188,9 @@ pub struct Subscription {
     pub endpoint: String,
     pub p256dh: String,
     pub auth: String,
-    /// SHA-256 of the bearer token at the time of subscribe. Pushes and
-    /// mutations only fire for subscriptions whose hash matches the
-    /// current (or grace-period) token.
+    /// SHA-256 of the bearer token at the time of subscribe. Mutation
+    /// endpoints use it to prove ownership, and revocation paths use it
+    /// when deciding which subscriptions may remain valid.
     pub owner_token_hash: [u8; 32],
     pub user_agent: String,
     pub created_at: DateTime<Utc>,
@@ -292,14 +292,30 @@ impl SubscriptionStore {
     }
 
     /// Drop any subscriptions whose owner hash is not in `valid`.
-    /// Called on token rotation once we know which hashes are
-    /// current-or-grace-period.
+    /// Kept for debug or manual token replacement paths once the
+    /// caller knows which hashes remain current.
     pub async fn retain_owners(&self, valid: &[[u8; 32]]) -> anyhow::Result<usize> {
         let removed = {
             let mut guard = self.subs.write().await;
             let before = guard.len();
             guard.retain(|_, s| valid.iter().any(|v| v == &s.owner_token_hash));
             before - guard.len()
+        };
+        if removed > 0 {
+            self.persist().await?;
+        }
+        Ok(removed)
+    }
+
+    /// Drop every subscription. Used when login sessions are revoked in
+    /// bulk or when a per-device revoke cannot be mapped to a specific
+    /// push endpoint. Authenticated devices can re-subscribe from the UI.
+    pub async fn clear_all(&self) -> anyhow::Result<usize> {
+        let removed = {
+            let mut guard = self.subs.write().await;
+            let before = guard.len();
+            guard.clear();
+            before
         };
         if removed > 0 {
             self.persist().await?;
@@ -1212,6 +1228,34 @@ mod tests {
         let removed = store.retain_owners(&[[2u8; 32]]).await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_all_removes_every_subscription() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("push.subscriptions.json");
+        let store = SubscriptionStore::load_or_empty(path.clone());
+
+        let mk = |endpoint: &str| Subscription {
+            endpoint: endpoint.to_string(),
+            p256dh: "pk".into(),
+            auth: "auth".into(),
+            owner_token_hash: [1u8; 32],
+            user_agent: "UA".into(),
+            created_at: Utc::now(),
+            generation: 0,
+            origin: "http://localhost:8080".into(),
+        };
+        store.upsert(mk("https://x/1")).await.unwrap();
+        store.upsert(mk("https://x/2")).await.unwrap();
+
+        assert_eq!(store.clear_all().await.unwrap(), 2);
+        assert!(store.snapshot().await.is_empty());
+
+        let reloaded = SubscriptionStore::load_or_empty(path);
+        assert!(reloaded.snapshot().await.is_empty());
+
+        assert_eq!(store.clear_all().await.unwrap(), 0);
     }
 
     #[tokio::test]

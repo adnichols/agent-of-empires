@@ -12,13 +12,20 @@ import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
 import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
-function tmuxHasSession(home: string, name: string): boolean {
-  const res = spawnSync("tmux", ["has-session", "-t", name], {
-    env: {
-      ...process.env,
-      HOME: home,
-      TMUX_TMPDIR: join(home, "tmux"),
-    },
+function isolatedTmuxEnv(home: string): NodeJS.ProcessEnv {
+  const env = {
+    ...process.env,
+    HOME: home,
+    TMUX_TMPDIR: join(home, "tmux"),
+  };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  return env;
+}
+
+function tmuxHasSession(home: string, serverName: string, name: string): boolean {
+  const res = spawnSync("tmux", ["-L", serverName, "has-session", "-t", name], {
+    env: isolatedTmuxEnv(home),
   });
   return res.status === 0;
 }
@@ -48,12 +55,12 @@ base.describe("ensure_session restart flow", () => {
           timeout: 10_000,
         })
         .toBe("Error");
-      expect(tmuxHasSession(serve.home, tmuxName)).toBe(false);
+      expect(tmuxHasSession(serve.home, serve.tmuxServerName, tmuxName)).toBe(false);
 
       const r1 = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
       expect(r1.ok).toBeTruthy();
       expect((await r1.json()).status).toBe("restarted");
-      expect(tmuxHasSession(serve.home, tmuxName)).toBe(true);
+      expect(tmuxHasSession(serve.home, serve.tmuxServerName, tmuxName)).toBe(true);
 
       const hookDir = `/tmp/aoe-hooks/${sessionId}`;
       mkdirSync(hookDir, { recursive: true });
@@ -65,12 +72,8 @@ base.describe("ensure_session restart flow", () => {
       const r3 = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
       expect((await r3.json()).status).toBe("alive");
 
-      const kill = spawnSync("tmux", ["kill-session", "-t", tmuxName], {
-        env: {
-          ...process.env,
-          HOME: serve.home,
-          TMUX_TMPDIR: join(serve.home, "tmux"),
-        },
+      const kill = spawnSync("tmux", ["-L", serve.tmuxServerName, "kill-session", "-t", tmuxName], {
+        env: isolatedTmuxEnv(serve.home),
       });
       expect(kill.status).toBe(0);
 
@@ -102,12 +105,8 @@ base.describe("ensure_session restart flow", () => {
       const sessionId: string = sessions[0]!.id;
       const tmuxName = `${serve.tmuxPrefix}${title}_${sessionId.slice(0, 8)}`;
 
-      spawnSync("tmux", ["kill-session", "-t", tmuxName], {
-        env: {
-          ...process.env,
-          HOME: serve.home,
-          TMUX_TMPDIR: join(serve.home, "tmux"),
-        },
+      spawnSync("tmux", ["-L", serve.tmuxServerName, "kill-session", "-t", tmuxName], {
+        env: isolatedTmuxEnv(serve.home),
       });
 
       // Delay /ensure so Playwright reliably observes the "pending"

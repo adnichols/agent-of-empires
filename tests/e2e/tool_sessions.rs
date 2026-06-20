@@ -209,7 +209,11 @@ hotkey = "Alt+t"
     // animated spinner, every 5s on disk refresh, or on any key event).
     h.wait_for(MARKER);
 
-    // Esc returns to the structured view.
+    // The attach path can succeed when the tool session lives on the
+    // explicit AOE tmux server, so detach the nested tmux client before
+    // continuing to drive the TUI.
+    h.send_keys("C-b");
+    h.send_keys("d");
     h.send_keys("Escape");
     h.wait_for_absent("Tool: echotool", Duration::from_secs(5));
 

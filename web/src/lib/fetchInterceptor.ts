@@ -52,8 +52,8 @@ export function isLoginAttemptPath(path: string): boolean {
  *    param on home-screen relaunch, and cookies can be lost across the
  *    Safari→standalone context switch.
  * 2. Reads `X-Aoe-Token` from same-origin responses and updates localStorage,
- *    so PWA clients stay in sync when the server rotates the token (the
- *    cookie flow gets this via `Set-Cookie`).
+ *    so PWA clients stay in sync if the server reports a replacement token
+ *    (the cookie flow gets this via `Set-Cookie`).
  * 3. Clears the stored token on 401 from `/api/*` so the PWA doesn't keep
  *    re-sending a dead token and wedging the user into a silent loop.
  * 4. Surfaces 5xx responses and network failures as user-visible toasts.

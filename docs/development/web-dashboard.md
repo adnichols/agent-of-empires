@@ -21,6 +21,6 @@ VITE_PROXY=http://localhost:50106 npm run dev
 
 ## Architecture
 
-The `serve` feature embeds an axum server that serves the React bundle and provides: the REST API (`/api/sessions`, plus the orchestration endpoints in the [HTTP API Reference](../api.md)), a WebSocket PTY relay (`/sessions/:id/ws`), token auth (cookie / query param / WS protocol header) with rate limiting, token rotation, and device tracking, and security headers.
+The `serve` feature embeds an axum server that serves the React bundle and provides: the REST API (`/api/sessions`, plus the orchestration endpoints in the [HTTP API Reference](../api.md)), a WebSocket PTY relay (`/sessions/:id/ws`), token auth (cookie / query param / WS protocol header) with rate limiting, device tracking, and security headers.
 
 Each terminal connection spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over the WebSocket. That gives the browser an SSH-grade terminal, and is why sessions survive browser crashes and network drops.

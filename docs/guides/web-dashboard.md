@@ -45,7 +45,7 @@ Open it in any browser. The token is set as a cookie on first visit, so you don'
 
 ### Retrieving the live URL
 
-In `--remote` mode the auth token rotates every 4 hours, so a URL captured at startup eventually stops working. Use `aoe url` against a running daemon (exits non-zero if none is running):
+The auth token is stable for the running dashboard and is written to the app dir so a phone PWA can keep reconnecting. Use `aoe url` against a running daemon when you need to copy the current URL again (exits non-zero if none is running):
 
 ```bash
 aoe url               # Primary URL with the live token
@@ -140,10 +140,10 @@ The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the l
 
 ### Authentication
 
-- **Token auth** (`--auth=token`, default): a random 256-bit token, generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). Passed via URL on first visit, then kept as an `HttpOnly; SameSite=Strict` cookie.
+- **Token auth** (`--auth=token`, default): a random 256-bit token, stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). Passed via URL on first visit, then kept as an `HttpOnly; SameSite=Strict` cookie and, for PWAs, localStorage.
 - **Passphrase wall** (`--auth=passphrase`, or combined with token via `--passphrase`): an argon2-hashed passphrase gates `/login`. Sessions bind to a per-device secret in `localStorage`, so a leaked cookie alone is insufficient.
 - **Rate limiting**: 5 failed logins from an IP trigger a 15-minute lockout.
-- **Token rotation**: in `--remote` mode the token rotates every 4 hours with a 5-minute grace period for active sessions.
+- **Token lifetime**: tokens are stable instead of time-rotated, so installed phone PWAs can reopen after being idle. Use a passphrase for remote dashboards, revoke devices from Settings, sign out all devices, or change the passphrase when you need to invalidate access.
 - **Device tracking**: connected devices (the signed-in login sessions, with browser, origin IP, and last seen) are visible in Settings > Web Dashboard > Connected Devices, where you can revoke one device or sign every device out.
 - **Session persistence**: login sessions are persisted to an owner-only `login_sessions.toml` in the app dir, so signed-in devices survive an `aoe serve` restart instead of being re-prompted for the passphrase. A passphrase change drops every persisted session; set `auth.persist_sessions = false` to force re-authentication on every restart.
 - **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for the next session spawn (the `sandbox` and `worktree` sections); confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. See [Settings & profiles](web/settings.md#step-up-elevation).
