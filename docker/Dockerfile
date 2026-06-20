@@ -1,5 +1,5 @@
 # aoe-sandbox: Docker image for Agent of Empires sandbox sessions
-# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, and Qwen Code in an isolated environment
+# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code, and Rust/Cargo in an isolated environment
 
 FROM ubuntu:26.04
 
@@ -82,6 +82,10 @@ RUN npm install -g \
     @agentclientprotocol/claude-agent-acp@^0.47.0 \
     @zed-industries/codex-acp \
     pi-acp
+
+# Install Rust toolchain for backend agent containers that build or test Rust projects.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Create directories for credential mounts
 RUN mkdir -p /root/.claude \

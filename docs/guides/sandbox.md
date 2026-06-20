@@ -150,14 +150,13 @@ AOE provides two official sandbox images:
 
 | Image | Description |
 |-------|-------------|
-| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code, git, ripgrep, fzf |
+| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code, Rust, git, ripgrep, fzf |
 | `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
 
 ### Dev Sandbox Tools
 
 The dev sandbox (`aoe-dev-sandbox`) includes everything in the base image plus:
 
-- **Rust** (rustup, cargo, rustc)
 - **uv** (fast Python package manager)
 - **Node.js LTS** (via nvm, with npm and npx)
 - **GitHub CLI** (gh)

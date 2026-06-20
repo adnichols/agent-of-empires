@@ -1,6 +1,6 @@
 # aoe-dev-sandbox: Extended sandbox with development tools
-# Includes: Rust, uv (Python), nvm + Node.js, pnpm, bun, gh (GitHub CLI)
-# Note: Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI,
+# Includes: uv (Python), nvm + Node.js, pnpm, bun, gh (GitHub CLI)
+# Note: Rust, Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI,
 # Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, and Qwen Code are inherited from the base image
 
 ARG BASE_IMAGE=ghcr.io/agent-of-empires/aoe-sandbox:latest
@@ -19,9 +19,6 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Continue as root (base image sets IS_SANDBOX=1)
 WORKDIR /root
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
