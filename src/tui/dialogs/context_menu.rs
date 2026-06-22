@@ -23,8 +23,8 @@ pub enum ContextMenuAction {
     NewSession,
     /// Open the new-session dialog prefilled from the right-clicked row
     /// (mirrors `'N'` "new from selection"): a session row inherits its
-    /// repo path and group, a project/group row borrows a member's path,
-    /// so the mouse path matches the web sidebar's per-project "+".
+    /// working directory and group, a project/group row borrows a member's
+    /// repo path, so the mouse path matches the web sidebar.
     NewFromSelection,
     /// Open the sort-order picker (mirrors `'o'`).
     OpenSortPicker,

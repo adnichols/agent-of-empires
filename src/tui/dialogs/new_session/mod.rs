@@ -156,6 +156,9 @@ pub struct NewSessionDialog {
     pub(super) workspace_repo_dir_picker_active: bool,
     /// Worktree configuration overlay mode (Ctrl+P on worktree field)
     pub(super) worktree_config_mode: bool,
+    /// Keep worktree creation disabled after the dialog is prefilled from an
+    /// existing worktree checkout, even when profile changes reload defaults.
+    pub(super) existing_worktree_prefill: bool,
     /// Focused field within the worktree config overlay (0=name, 1=new_branch, 2=extra_repos)
     pub(super) worktree_config_focused_field: usize,
     /// Extra environment entries (session-specific).
@@ -459,6 +462,7 @@ impl NewSessionDialog {
             workspace_repo_ghost: None,
             workspace_repo_dir_picker_active: false,
             worktree_config_mode: false,
+            existing_worktree_prefill: false,
             worktree_config_focused_field: 0,
             sandbox_enabled,
             sandbox_image: Input::new(
@@ -511,6 +515,29 @@ impl NewSessionDialog {
         self.group = Input::new(group);
     }
 
+    /// Pre-fill with an existing worktree checkout. This keeps creation in the
+    /// selected directory instead of provisioning a nested or sibling worktree.
+    pub fn set_existing_worktree_path(&mut self, path: String) {
+        self.set_path(path);
+        self.existing_worktree_prefill = true;
+        self.disable_worktree_creation();
+    }
+
+    fn disable_worktree_creation(&mut self) {
+        self.worktree_enabled = false;
+        self.worktree_branch.reset();
+        self.worktree_config_mode = false;
+    }
+
+    fn toggle_worktree_creation(&mut self) {
+        self.worktree_enabled = !self.worktree_enabled;
+        if self.worktree_enabled {
+            self.existing_worktree_prefill = false;
+        } else {
+            self.worktree_config_mode = false;
+        }
+    }
+
     /// Move focus to the title field. Used by "new from selection", where the
     /// path is pre-filled so the user lands directly on naming the session.
     pub fn focus_title(&mut self) {
@@ -525,6 +552,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
+    }
+
+    #[cfg(test)]
+    pub fn worktree_enabled_for_test(&self) -> bool {
+        self.worktree_enabled
     }
 
     /// Push a hook progress message into the dialog state
@@ -672,6 +704,9 @@ impl NewSessionDialog {
             && config.sandbox.enabled_by_default
             && !self.selected_tool_host_only();
         self.worktree_enabled = config.worktree.enabled && !self.selected_tool_host_only();
+        if self.existing_worktree_prefill {
+            self.disable_worktree_creation();
+        }
 
         // Reset sandbox image from resolved config (includes profile overrides)
         self.sandbox_image = Input::new(config.sandbox.default_image.clone());
@@ -752,6 +787,7 @@ impl NewSessionDialog {
             workspace_repo_ghost: None,
             workspace_repo_dir_picker_active: false,
             worktree_config_mode: false,
+            existing_worktree_prefill: false,
             worktree_config_focused_field: 0,
             sandbox_enabled: false,
             sandbox_image: Input::new(
@@ -822,6 +858,7 @@ impl NewSessionDialog {
             workspace_repo_ghost: None,
             workspace_repo_dir_picker_active: false,
             worktree_config_mode: false,
+            existing_worktree_prefill: false,
             worktree_config_focused_field: 0,
             sandbox_enabled: false,
             sandbox_image: Input::new(
@@ -1096,10 +1133,7 @@ impl NewSessionDialog {
                         .to_string(),
                 );
             } else {
-                self.worktree_enabled = !self.worktree_enabled;
-                if !self.worktree_enabled {
-                    self.worktree_config_mode = false;
-                }
+                self.toggle_worktree_creation();
             }
         } else if self.focused_field == sandbox_field {
             self.sandbox_enabled = !self.sandbox_enabled;
@@ -1415,10 +1449,7 @@ impl NewSessionDialog {
                     );
                     return DialogResult::Continue;
                 }
-                self.worktree_enabled = !self.worktree_enabled;
-                if !self.worktree_enabled {
-                    self.worktree_config_mode = false;
-                }
+                self.toggle_worktree_creation();
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')

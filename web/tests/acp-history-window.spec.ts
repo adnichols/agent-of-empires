@@ -95,15 +95,20 @@ test("loads older events from the server when the loaded window is exhausted", a
   // Turn 0 is not in the recent page at all; it must be fetched.
   await expect(page.getByText("prompt number 0")).toHaveCount(0);
 
-  const loadEarlier = page.getByTestId("acp-load-earlier");
+  const oldestPrompt = page.getByText("prompt number 0");
   // Reveal loaded rows, then trip the server fetch, until the very first
   // turn surfaces.
   for (let i = 0; i < 12; i += 1) {
-    if ((await page.getByText("prompt number 0").count()) > 0) break;
-    await loadEarlier.dispatchEvent("click");
+    if ((await oldestPrompt.count()) > 0) break;
+    await page
+      .getByTestId("acp-load-earlier")
+      .dispatchEvent("click", undefined, { timeout: 1_000 })
+      .catch(async (error: unknown) => {
+        if ((await oldestPrompt.count()) === 0) throw error;
+      });
     await page.waitForTimeout(150);
   }
-  await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
+  await expect(oldestPrompt).toBeVisible({ timeout: 10_000 });
 });
 
 // User story (#2236, symptom A): a new turn must not fold earlier rows

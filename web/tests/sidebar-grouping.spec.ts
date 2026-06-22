@@ -220,6 +220,47 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     await expect(page.locator(ROW)).toHaveCount(4);
   });
 
+  test("nested row context menu opens the session wizard", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: nestedSessions() });
+    await gotoDesktop(page);
+
+    const axisToggle = page.locator(AXIS_TOGGLE);
+    await expect(axisToggle).toHaveAttribute("data-axis", "repo");
+    await cycleAxisTo(axisToggle, "repo+group");
+
+    await page.locator(ROW, { hasText: "fix-one" }).click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-new-session").click();
+
+    const wizard = page.getByTestId("session-wizard");
+    await expect(wizard).toBeVisible();
+    await expect(wizard.getByText("/tmp/project")).toBeVisible();
+  });
+
+  test("sunk row context menu opens the session wizard", async ({ page }) => {
+    await installSidebarMocks(page, {
+      sessions: [
+        {
+          id: "s-archived",
+          title: "archived-one",
+          project_path: "/tmp/archived-project",
+          branch: "archive/one",
+          archived_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
+    await gotoDesktop(page);
+
+    const sunk = page.getByTestId("sidebar-sunk-section");
+    await expect(sunk).toBeVisible();
+    await sunk.getByTestId("sidebar-sunk-toggle").click();
+    await sunk.locator(ROW, { hasText: "archived-one" }).click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-new-session").click();
+
+    const wizard = page.getByTestId("session-wizard");
+    await expect(wizard).toBeVisible();
+    await expect(wizard.getByText("/tmp/archived-project")).toBeVisible();
+  });
+
   test("subgroup collapse is independent of repo collapse and persists", async ({ page }) => {
     await installSidebarMocks(page, { sessions: nestedSessions() });
     await gotoDesktop(page);
