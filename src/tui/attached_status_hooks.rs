@@ -79,7 +79,7 @@ fn run_loop(
     stop_rx: mpsc::Receiver<()>,
     snapshot_tx: mpsc::Sender<Vec<StatusUpdate>>,
 ) {
-    let mut state = StatusPollState::new();
+    let mut state = StatusPollState::for_attached_status_hooks();
 
     loop {
         if stop_rx.try_recv().is_ok() {

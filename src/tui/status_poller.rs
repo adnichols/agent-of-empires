@@ -6,12 +6,12 @@
 //!
 //! 1. **Batched metadata**: A single `tmux list-panes -a` call fetches pane
 //!    metadata (dead flag, current command) for all sessions at once, replacing
-//!    O(3N) per-instance `display-message` subprocesses with O(1).
+//!    O(3N) per-instance `display-message` / `has-session` subprocesses with O(1).
 //!
 //! 2. **Adaptive polling tiers**: Sessions are polled at different frequencies
 //!    based on their status. Hot (Running/Waiting/Starting) every cycle, Warm
-//!    (Idle/Unknown) every 5 cycles, Cold (Error) every 60 cycles, Frozen
-//!    (Stopped/Deleting) never.
+//!    (Idle/Unknown) every 5 cycles, Cold (Error) every 15 main-TUI cycles or
+//!    60 attached-hook cycles, Frozen (Stopped/Deleting) never.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -25,15 +25,22 @@ use crate::session::{Instance, Status};
 /// Adaptive polling intervals (in cycles). 0 = never poll.
 const TIER_HOT: u64 = 1;
 const TIER_WARM: u64 = 5;
-const TIER_COLD: u64 = 60;
+const TIER_COLD_MAIN_TUI: u64 = 15;
+const TIER_COLD_ATTACHED_HOOKS: u64 = 60;
 
-fn polling_tier(status: Status) -> u64 {
+fn polling_tier(status: Status, cold_tier: u64) -> u64 {
     match status {
         Status::Running | Status::Waiting | Status::Starting => TIER_HOT,
         Status::Idle | Status::Unknown => TIER_WARM,
-        Status::Error => TIER_COLD,
+        Status::Error => cold_tier,
         Status::Stopped | Status::Deleting | Status::Creating => 0,
     }
+}
+
+fn should_refresh_tmux_metadata(instances: &[Instance], cold_tier: u64) -> bool {
+    instances
+        .iter()
+        .any(|inst| polling_tier(inst.status, cold_tier) != 0)
 }
 
 /// Result of a status check for a single session
@@ -67,10 +74,20 @@ pub(super) struct StatusPollState {
     credential_refresh_interval: Duration,
     last_credential_refresh: Instant,
     cycle_count: u64,
+    cold_tier: u64,
+    refresh_metadata_every_cycle: bool,
 }
 
 impl StatusPollState {
     pub(super) fn new() -> Self {
+        Self::with_policy(TIER_COLD_MAIN_TUI, true)
+    }
+
+    pub(super) fn for_attached_status_hooks() -> Self {
+        Self::with_policy(TIER_COLD_ATTACHED_HOOKS, false)
+    }
+
+    fn with_policy(cold_tier: u64, refresh_metadata_every_cycle: bool) -> Self {
         let container_check_interval = Duration::from_secs(5);
         let credential_refresh_interval = Duration::from_secs(1800);
 
@@ -80,7 +97,9 @@ impl StatusPollState {
             container_states: HashMap::new(),
             credential_refresh_interval,
             last_credential_refresh: Instant::now(),
-            cycle_count: TIER_COLD - 1,
+            cycle_count: cold_tier - 1,
+            cold_tier,
+            refresh_metadata_every_cycle,
         }
     }
 }
@@ -91,15 +110,22 @@ pub(super) fn poll_statuses_once(
 ) -> Vec<StatusUpdate> {
     state.cycle_count = state.cycle_count.wrapping_add(1);
 
-    // Pre-scan: check if any instance would actually be polled this cycle.
-    // If not, skip the batch subprocess calls entirely.
+    // Pre-scan: keep the cheap tmux metadata/cache refresh cadence independent
+    // from the more expensive per-session status-detection tiers. Live-send
+    // drift checks use SESSION_CACHE with a short TTL, so warm/cold tiers must not
+    // be allowed to leave the cache stale for their full status polling window.
+    let any_non_frozen = should_refresh_tmux_metadata(&instances, state.cold_tier);
     let any_pollable = instances.iter().any(|inst| {
-        let tier = polling_tier(inst.status);
+        let tier = polling_tier(inst.status, state.cold_tier);
         tier != 0 && state.cycle_count % tier == 0
     });
+    let should_refresh_metadata = if state.refresh_metadata_every_cycle {
+        any_non_frozen
+    } else {
+        any_pollable
+    };
 
-    let pane_metadata = if any_pollable {
-        crate::tmux::refresh_session_cache();
+    let pane_metadata = if should_refresh_metadata {
         crate::tmux::batch_pane_metadata().unwrap_or_default()
     } else {
         HashMap::new()
@@ -129,7 +155,7 @@ pub(super) fn poll_statuses_once(
         .into_iter()
         .filter_map(|mut inst| {
             // Adaptive polling: skip instances whose tier interval hasn't elapsed
-            let tier = polling_tier(inst.status);
+            let tier = polling_tier(inst.status, state.cold_tier);
             if tier == 0 || state.cycle_count % tier != 0 {
                 return None;
             }
@@ -261,26 +287,33 @@ mod tests {
 
     #[test]
     fn test_polling_tier_hot() {
-        assert_eq!(polling_tier(Status::Running), TIER_HOT);
-        assert_eq!(polling_tier(Status::Waiting), TIER_HOT);
-        assert_eq!(polling_tier(Status::Starting), TIER_HOT);
+        assert_eq!(polling_tier(Status::Running, TIER_COLD_MAIN_TUI), TIER_HOT);
+        assert_eq!(polling_tier(Status::Waiting, TIER_COLD_MAIN_TUI), TIER_HOT);
+        assert_eq!(polling_tier(Status::Starting, TIER_COLD_MAIN_TUI), TIER_HOT);
     }
 
     #[test]
     fn test_polling_tier_warm() {
-        assert_eq!(polling_tier(Status::Idle), TIER_WARM);
-        assert_eq!(polling_tier(Status::Unknown), TIER_WARM);
+        assert_eq!(polling_tier(Status::Idle, TIER_COLD_MAIN_TUI), TIER_WARM);
+        assert_eq!(polling_tier(Status::Unknown, TIER_COLD_MAIN_TUI), TIER_WARM);
     }
 
     #[test]
     fn test_polling_tier_cold() {
-        assert_eq!(polling_tier(Status::Error), TIER_COLD);
+        assert_eq!(
+            polling_tier(Status::Error, TIER_COLD_MAIN_TUI),
+            TIER_COLD_MAIN_TUI
+        );
+        assert_eq!(
+            polling_tier(Status::Error, TIER_COLD_ATTACHED_HOOKS),
+            TIER_COLD_ATTACHED_HOOKS
+        );
     }
 
     #[test]
     fn test_polling_tier_frozen() {
-        assert_eq!(polling_tier(Status::Stopped), 0);
-        assert_eq!(polling_tier(Status::Deleting), 0);
+        assert_eq!(polling_tier(Status::Stopped, TIER_COLD_MAIN_TUI), 0);
+        assert_eq!(polling_tier(Status::Deleting, TIER_COLD_MAIN_TUI), 0);
     }
 
     #[test]
@@ -292,19 +325,56 @@ mod tests {
         assert_ne!(2u64 % TIER_WARM, 0);
         assert_eq!(5u64 % TIER_WARM, 0);
         assert_eq!(10u64 % TIER_WARM, 0);
-        // Cold sessions are polled every 60 cycles
-        assert_ne!(1u64 % TIER_COLD, 0);
-        assert_eq!(60u64 % TIER_COLD, 0);
-        assert_eq!(120u64 % TIER_COLD, 0);
+        // Cold sessions are polled every 15 cycles, about 30 seconds at the
+        // TUI's 2 second status refresh cadence.
+        assert_ne!(1u64 % TIER_COLD_MAIN_TUI, 0);
+        assert_eq!(15u64 % TIER_COLD_MAIN_TUI, 0);
+        assert_eq!(30u64 % TIER_COLD_MAIN_TUI, 0);
+        // Attached status hook polling still ticks every 500ms, so it keeps
+        // the old 60-cycle cold tier for the same 30 second cadence.
+        assert_ne!(15u64 % TIER_COLD_ATTACHED_HOOKS, 0);
+        assert_eq!(60u64 % TIER_COLD_ATTACHED_HOOKS, 0);
     }
 
     #[test]
     fn test_first_cycle_polls_all_tiers() {
-        // cycle_count starts at TIER_COLD - 1, first cycle wraps to TIER_COLD
-        let first_cycle = (TIER_COLD - 1).wrapping_add(1);
+        // cycle_count starts at cold_tier - 1, first cycle wraps to cold_tier.
+        let first_cycle = (TIER_COLD_MAIN_TUI - 1).wrapping_add(1);
         // TIER_HOT == 1 (see test_tier_cycle_alignment), so any cycle trivially
         // polls hot; just verify the warm and cold alignments here.
         assert_eq!(first_cycle % TIER_WARM, 0, "first cycle must poll warm");
-        assert_eq!(first_cycle % TIER_COLD, 0, "first cycle must poll cold");
+        assert_eq!(
+            first_cycle % TIER_COLD_MAIN_TUI,
+            0,
+            "first cycle must poll cold"
+        );
+    }
+
+    #[test]
+    fn test_tmux_metadata_refresh_includes_warm_sessions() {
+        let inst = Instance::new("idle", "/tmp");
+
+        assert!(should_refresh_tmux_metadata(&[inst], TIER_COLD_MAIN_TUI));
+    }
+
+    #[test]
+    fn test_tmux_metadata_refresh_skips_frozen_sessions() {
+        let mut stopped = Instance::new("stopped", "/tmp");
+        stopped.status = Status::Stopped;
+        let mut deleting = Instance::new("deleting", "/tmp");
+        deleting.status = Status::Deleting;
+
+        assert!(!should_refresh_tmux_metadata(
+            &[stopped, deleting],
+            TIER_COLD_MAIN_TUI
+        ));
+    }
+
+    #[test]
+    fn test_attached_status_hook_policy_keeps_500ms_cadence_scaled() {
+        let state = StatusPollState::for_attached_status_hooks();
+
+        assert_eq!(state.cold_tier, TIER_COLD_ATTACHED_HOOKS);
+        assert!(!state.refresh_metadata_every_cycle);
     }
 }

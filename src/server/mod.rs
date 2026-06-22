@@ -2793,7 +2793,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let file_watch_for_poll = state.file_watch.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
-            crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
             for inst in &mut instances {
                 if suppressed_ids.contains(&inst.id) {
@@ -3043,7 +3042,6 @@ async fn daemon_startup_recovery_mark(
     };
 
     crate::session::recovery::warm_tmux_server();
-    crate::tmux::refresh_session_cache();
     // On probe failure we cannot distinguish "all panes dead" from "tmux
     // unreachable", and treating the latter as the former would trigger
     // spurious recovery cascades that kill possibly-alive panes. Skip

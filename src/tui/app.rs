@@ -630,7 +630,7 @@ impl App {
         // iteration once any time has passed, hitting the config file at
         // the 20Hz loop rate.
         let mut last_update_eval = std::time::Instant::now();
-        const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+        const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
