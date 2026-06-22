@@ -594,7 +594,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn tmux_command_uses_aoe_owned_server_and_clears_tmux_client_env() {
+        let _aoe_tmux_tmpdir = EnvVarGuard::remove("AOE_TMUX_TMPDIR");
         let cmd = tmux_command();
         let args: Vec<String> = cmd
             .get_args()
@@ -663,6 +665,12 @@ mod tests {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let old = std::env::var_os(key);
             std::env::set_var(key, value);
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::remove_var(key);
             Self { key, old }
         }
     }

@@ -16,6 +16,8 @@ export interface MockSessionInput {
   created_at?: string;
   /** User group (`aoe add -g`); empty means Ungrouped on the group axis. */
   group?: string;
+  archived_at?: string | null;
+  snoozed_until?: string | null;
 }
 
 type MockSession = MockSessionInput & { created_at: string };
@@ -48,6 +50,8 @@ function sessionResponse(s: MockSession) {
     last_error: null,
     branch: s.branch,
     main_repo_path: null,
+    archived_at: s.archived_at ?? null,
+    snoozed_until: s.snoozed_until ?? null,
     is_sandboxed: false,
     has_terminal: true,
     profile: "default",

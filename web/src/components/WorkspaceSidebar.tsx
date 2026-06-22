@@ -2758,6 +2758,7 @@ export function WorkspaceSidebar({
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
+                                onCreateSession={onCreateSession}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -2836,6 +2837,7 @@ export function WorkspaceSidebar({
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
+                      onCreateSession={onCreateSession}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}

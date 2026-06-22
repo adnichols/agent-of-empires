@@ -1146,6 +1146,148 @@ fn test_profile_included_in_submit() {
 
 #[test]
 #[serial_test::serial]
+fn test_existing_worktree_prefill_survives_profile_reload() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", temp_home.path());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    let profiles_dir = app_dir.join("profiles");
+    fs::create_dir_all(profiles_dir.join("default")).expect("default profile");
+    fs::create_dir_all(profiles_dir.join("worktrees")).expect("worktrees profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        r#"
+default_profile = "default"
+
+[worktree]
+enabled = false
+"#,
+    )
+    .expect("global config");
+    fs::write(
+        profiles_dir.join("worktrees").join("config.toml"),
+        r#"
+[worktree]
+enabled = true
+"#,
+    )
+    .expect("profile config");
+
+    let selected_path = temp_home.path().join("selected-worktree");
+    fs::create_dir_all(&selected_path).expect("selected worktree");
+    let selected_path = selected_path.to_string_lossy().to_string();
+
+    let mut dialog = single_tool_dialog();
+    dialog.available_profiles = vec!["default".to_string(), "worktrees".to_string()];
+    dialog.profile_descriptions = vec![None, None];
+    dialog.focused_field = 0;
+    dialog.set_existing_worktree_path(selected_path.clone());
+
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_profile(), "worktrees");
+    assert_eq!(dialog.path.value(), selected_path);
+    assert!(!dialog.worktree_enabled);
+    assert_eq!(dialog.worktree_branch.value(), "");
+
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert_eq!(data.profile, "worktrees");
+            assert_eq!(data.path, selected_path);
+            assert!(!data.worktree_enabled);
+            assert!(data.worktree_branch.is_none());
+        }
+        _ => panic!("Expected Submit"),
+    }
+
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn test_existing_worktree_manual_worktree_toggle_survives_profile_reload() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", temp_home.path());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    let profiles_dir = app_dir.join("profiles");
+    fs::create_dir_all(profiles_dir.join("default")).expect("default profile");
+    fs::create_dir_all(profiles_dir.join("worktrees")).expect("worktrees profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        r#"
+default_profile = "default"
+
+[worktree]
+enabled = false
+"#,
+    )
+    .expect("global config");
+    fs::write(
+        profiles_dir.join("worktrees").join("config.toml"),
+        r#"
+[worktree]
+enabled = true
+"#,
+    )
+    .expect("profile config");
+
+    let selected_path = temp_home.path().join("selected-worktree");
+    fs::create_dir_all(&selected_path).expect("selected worktree");
+
+    let mut dialog = single_tool_dialog();
+    dialog.available_profiles = vec!["default".to_string(), "worktrees".to_string()];
+    dialog.profile_descriptions = vec![None, None];
+    dialog.set_existing_worktree_path(selected_path.to_string_lossy().to_string());
+
+    dialog.focused_field = 4;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(dialog.worktree_enabled);
+    dialog.worktree_branch = Input::new("manual-branch".to_string());
+
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_profile(), "worktrees");
+    assert!(dialog.worktree_enabled);
+    assert_eq!(dialog.worktree_branch.value(), "manual-branch");
+
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert_eq!(data.profile, "worktrees");
+            assert!(data.worktree_enabled);
+            assert_eq!(data.worktree_branch.as_deref(), Some("manual-branch"));
+        }
+        _ => panic!("Expected Submit"),
+    }
+
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
 fn test_profile_switch_reloads_sandbox_env_without_session_override() {
     let temp_home = tempfile::tempdir().expect("temp home");
     let old_home = std::env::var_os("HOME");
