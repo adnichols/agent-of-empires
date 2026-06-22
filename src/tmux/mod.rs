@@ -69,6 +69,8 @@ static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     time: None,
 });
 
+const SESSION_CACHE_TTL: Duration = Duration::from_secs(3);
+
 struct SessionCache {
     data: Option<HashMap<String, i64>>,
     time: Option<Instant>,
@@ -115,8 +117,8 @@ pub fn refresh_session_cache() {
         }
     };
 
-    // Trace, not debug: the TUI status poller calls this every ~2s, so
-    // at debug it dominates the idle log. Errors above still log at warn.
+    // Trace, not debug: callers can invoke this on hot paths, so debug logs
+    // would dominate idle output. Errors above still log at warn.
     let sessions = new_data.as_ref().map(|m| m.len()).unwrap_or(0);
     tracing::trace!(
         target: "tmux.cache",
@@ -196,21 +198,23 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_pid}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_pid}|#{session_activity}",
         ])
         .output();
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
+            refresh_session_cache_from_pane_output(&stdout);
             Ok(parse_pane_metadata(&stdout))
         }
         Ok(out) => {
+            clear_session_cache();
             tracing::warn!(
                 target: "tmux.pane",
                 status = ?out.status,
                 stderr_bytes = out.stderr.len(),
-                "list-panes returned non-zero",
+                "list-panes returned non-zero; cache cleared",
             );
             Err(anyhow::anyhow!(
                 "tmux list-panes returned non-zero status: {:?}",
@@ -218,14 +222,14 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             ))
         }
         Err(e) => {
-            tracing::warn!(target: "tmux.pane", error = %e, "list-panes spawn failed");
+            clear_session_cache();
+            tracing::warn!(target: "tmux.pane", error = %e, "list-panes spawn failed; cache cleared");
             Err(anyhow::anyhow!("tmux list-panes spawn failed: {}", e))
         }
     };
 
-    // Trace, not debug: paired with refresh_session_cache in the TUI
-    // status poll loop (~every 2s). Debug-level here would dominate the
-    // idle log.
+    // Trace, not debug: this refreshes the in-memory session cache in the
+    // status poll loop. Debug-level here would dominate idle output.
     tracing::trace!(
         target: "tmux.pane",
         sessions = result.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -325,6 +329,37 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     map
 }
 
+fn refresh_session_cache_from_pane_output(output: &str) {
+    let mut map = HashMap::new();
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split(FIELD_SEP).collect();
+        if parts.len() < 6 {
+            continue;
+        }
+
+        let session_name = parts[0];
+        if !session_name.starts_with(SESSION_PREFIX) {
+            continue;
+        }
+
+        let activity = parts[5].parse().unwrap_or(0);
+        map.entry(session_name.to_string()).or_insert(activity);
+    }
+
+    if let Ok(mut cache) = SESSION_CACHE.write() {
+        cache.data = Some(map);
+        cache.time = Some(Instant::now());
+    }
+}
+
+fn clear_session_cache() {
+    if let Ok(mut cache) = SESSION_CACHE.write() {
+        cache.data = None;
+        cache.time = Some(Instant::now());
+    }
+}
+
 /// Test-only: inject a synthetic session name into the cache so
 /// callers of `session_exists_from_cache` see it as present. Used
 /// by live-send tests that install a fake `LiveSendState` without a
@@ -344,10 +379,11 @@ pub fn test_inject_session_into_cache(name: &str) {
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
 
-    // Cache valid for 2 seconds
+    // Keep a little margin over the TUI's 2 second metadata refresh cadence
+    // so scheduler jitter does not cause avoidable `has-session` fallbacks.
     if cache
         .time
-        .map(|t| t.elapsed() > Duration::from_secs(2))
+        .map(|t| t.elapsed() > SESSION_CACHE_TTL)
         .unwrap_or(true)
     {
         return None;
@@ -511,6 +547,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pane_metadata_production_format() {
+        let output = format!("{P}proj_abc12345|0|0|claude|1234|42\n");
+        let map = parse_pane_metadata(&output);
+        let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
+
+        assert!(!meta.pane_dead);
+        assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
+        assert_eq!(meta.pane_pid, Some(1234));
+    }
+
+    #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
         let output =
             format!("user_session|0|0|bash\n{P}proj_abc12345|0|0|claude\nmy_tmux|0|0|vim\n");
@@ -542,6 +589,30 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_empty_output() {
         assert!(parse_pane_metadata("").is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_pane_metadata_refreshes_session_cache() {
+        let session_name = format!("{P}proj_abc12345");
+        let output = format!("{session_name}|0|0|claude|1234|42\n");
+
+        refresh_session_cache_from_pane_output(&output);
+
+        assert_eq!(session_exists_from_cache(&session_name), Some(true));
+        assert_eq!(session_exists_from_cache("other_session"), Some(false));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_clear_session_cache_removes_cached_presence() {
+        let session_name = format!("{P}proj_abc12345");
+        let output = format!("{session_name}|0|0|claude|1234|42\n");
+
+        refresh_session_cache_from_pane_output(&output);
+        clear_session_cache();
+
+        assert_eq!(session_exists_from_cache(&session_name), None);
     }
 
     #[test]

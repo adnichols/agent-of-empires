@@ -4342,7 +4342,7 @@ impl HomeView {
     ///   restart) even though our instance row says otherwise. We use
     ///   the existing `session_exists_from_cache` lookup so this costs
     ///   a hashmap probe per keystroke (the status poller refreshes
-    ///   the cache every 500ms anyway). If the cache has no entry
+    ///   the cache from its batched pane metadata). If the cache has no entry
     ///   (`None`, e.g. before first refresh) we don't claim drift; the
     ///   instance + name checks above are still the load-bearing
     ///   safety net.

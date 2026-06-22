@@ -820,7 +820,7 @@ pub struct HomeView {
     recovery_lock: Option<crate::session::recovery::RecoveryLock>,
 
     /// Ids whose startup-recovery cascade is still in flight. Filtered
-    /// out of `request_status_refresh` so the 500ms poller does not
+    /// out of `request_status_refresh` so the status poller does not
     /// observe missing tmux state and broadcast `Status::Error` while a
     /// worker is mid-cascade. Drained per-id by `apply_recovery_updates`
     /// (success, error, or panic). Mirrors the `on_launch_hooks_ran`
@@ -3058,9 +3058,9 @@ impl HomeView {
             }
             // Set Status::Starting AND last_start_time: the existing 3s
             // grace at `update_status_with_metadata_inner` only fires on
-            // the latter, and without it the TUI's StatusPoller (every
-            // 500ms) would observe missing tmux + no last_start_time and
-            // immediately flip the status to `Error` before the worker
+            // the latter, and without it the TUI's StatusPoller would
+            // observe missing tmux + no last_start_time and immediately
+            // flip the status to `Error` before the worker
             // has finished its cascade.
             debug_assert!(inst.status != crate::session::Status::Creating);
             inst.status = crate::session::Status::Starting;

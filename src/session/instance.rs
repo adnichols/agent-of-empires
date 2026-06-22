@@ -3304,7 +3304,7 @@ impl Instance {
 
         if self.status == Status::Error {
             if let Some(last_check) = self.last_error_check {
-                if last_check.elapsed().as_secs() < 30 {
+                if last_check.elapsed() < std::time::Duration::from_secs(30) {
                     return;
                 }
             }
@@ -3335,7 +3335,7 @@ impl Instance {
             }
         };
 
-        if !session.exists() {
+        if metadata.is_none() && !session.exists() {
             tracing::trace!(target: "session.store",
                 "status '{}': session.exists()=false (tmux name={}), setting Error",
                 self.title,
