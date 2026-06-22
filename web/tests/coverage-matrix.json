@@ -2279,6 +2279,16 @@
       "components": ["web/src/components/session-wizard/SessionWizard.tsx", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "story.wizard-prefill-from-worktree-session",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/session-wizard/__tests__/structuredViewToggle.test.tsx"
+      ],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "story.wizard-session-title-edit",
       "kind": "mocked-playwright",
       "risk": "medium",

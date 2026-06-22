@@ -129,6 +129,12 @@ const typedClosestCenter: CollisionDetection = (args) => {
   });
 };
 
+export interface SessionCreatePrefill {
+  path: string;
+  repoPath?: string;
+  useWorktree?: boolean;
+}
+
 interface Props {
   groups: SidebarGroup[];
   // The nested `repo+group` axis model (#1720). Only consumed when
@@ -144,7 +150,7 @@ interface Props {
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
-  onCreateSession: (repoPath: string) => void;
+  onCreateSession: (prefill: SessionCreatePrefill) => void;
   /** Pin a repo (register it) so it persists with zero sessions. See #2047. */
   onPinProject?: (repoPath: string) => void;
   /** Unpin a repo: remove every registry entry for its path. See #2047. */
@@ -381,7 +387,7 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
-  onCreateSession?: (repoPath: string) => void;
+  onCreateSession?: (prefill: SessionCreatePrefill) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
@@ -521,9 +527,9 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
-  // Open the session wizard prefilled from this row's project (path, agent,
-  // and the latest session's options), mirroring the per-project "+" button.
-  onCreateSession?: (repoPath: string) => void;
+  // Open the session wizard prefilled from this row's concrete working
+  // directory plus the latest related session's options.
+  onCreateSession?: (prefill: SessionCreatePrefill) => void;
   readOnly?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
@@ -545,9 +551,15 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
-  // Repo path used to prefill a "New Session" launched from this row, matching
-  // the per-project "+" button (handleCreateSession keys off this same path).
+  // Session rows create from the concrete working directory. For worktree
+  // sessions this is the worktree path, while repoPath still finds related
+  // sessions for defaults.
+  const newSessionPath = firstSession?.project_path || null;
   const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
+  const createInExistingWorktree =
+    !!firstSession &&
+    (firstSession.has_managed_worktree ||
+      (!!firstSession.main_repo_path && firstSession.project_path !== firstSession.main_repo_path));
   // The structured view session backing this row, if any. Drives the "Switch
   // agent" context-menu item, which only makes sense for an ACP structured view
   // session (tmux rows have no agent to hand off). Multi-session rows are
@@ -1051,11 +1063,15 @@ export const SessionRow = memo(function SessionRow({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
-            {!readOnly && onCreateSession && newSessionRepoPath && (
+            {!readOnly && onCreateSession && newSessionPath && (
               <button
                 onClick={() => {
                   setContextMenu(null);
-                  onCreateSession(newSessionRepoPath);
+                  onCreateSession({
+                    path: newSessionPath,
+                    repoPath: newSessionRepoPath ?? newSessionPath,
+                    useWorktree: createInExistingWorktree ? false : undefined,
+                  });
                 }}
                 data-testid="sidebar-context-menu-new-session"
                 className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
@@ -2603,7 +2619,7 @@ export function WorkspaceSidebar({
                           onUnpin={readOnly || offline ? undefined : onUnpinProject}
                           onNewSession={() =>
                             group.capabilities.create === "repo" && group.repoPath
-                              ? onCreateSession(group.repoPath)
+                              ? onCreateSession({ path: group.repoPath, repoPath: group.repoPath })
                               : onNew()
                           }
                           offline={offline}
@@ -2694,7 +2710,9 @@ export function WorkspaceSidebar({
                     onPin={readOnly || offline ? undefined : onPinProject}
                     onUnpin={readOnly || offline ? undefined : onUnpinProject}
                     onNewSession={() =>
-                      repo.capabilities.create === "repo" && repo.repoPath ? onCreateSession(repo.repoPath) : onNew()
+                      repo.capabilities.create === "repo" && repo.repoPath
+                        ? onCreateSession({ path: repo.repoPath, repoPath: repo.repoPath })
+                        : onNew()
                     }
                     offline={offline}
                   />
@@ -2759,7 +2777,7 @@ export function WorkspaceSidebar({
             query={q}
             readOnly={readOnly}
             offline={offline}
-            onCreateSession={onCreateSession}
+            onCreateSession={(repoPath) => onCreateSession({ path: repoPath, repoPath })}
             onAddProject={onAddProject}
             onEditProject={onEditProject}
             onRemoveProject={onRemoveProject}

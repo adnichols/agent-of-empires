@@ -172,6 +172,23 @@ describe("SessionWizard structured_view payload", () => {
     return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ path: "/tmp/proj" }} />);
   }
 
+  it("omits worktree_branch when prefilled for an existing worktree", async () => {
+    const { getByText } = render(
+      <SessionWizard
+        onClose={() => {}}
+        onCreated={() => {}}
+        prefill={{ path: "/tmp/proj-worktrees/feature", tool: "claude", useWorktree: false }}
+      />,
+    );
+    fireEvent.click(getByText(/Launch session/));
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        worktree_branch: expect.anything(),
+      }),
+    );
+  });
+
   it("sends the structured view for an ACP tool when the toggle is left on (default)", async () => {
     const { getByText } = renderWizard();
     fireEvent.click(getByText(/Launch session/));

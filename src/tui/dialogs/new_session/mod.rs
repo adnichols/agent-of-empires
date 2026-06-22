@@ -511,6 +511,15 @@ impl NewSessionDialog {
         self.group = Input::new(group);
     }
 
+    /// Pre-fill with an existing worktree checkout. This keeps creation in the
+    /// selected directory instead of provisioning a nested or sibling worktree.
+    pub fn set_existing_worktree_path(&mut self, path: String) {
+        self.set_path(path);
+        self.worktree_enabled = false;
+        self.worktree_branch.reset();
+        self.worktree_config_mode = false;
+    }
+
     /// Move focus to the title field. Used by "new from selection", where the
     /// path is pre-filled so the user lands directly on naming the session.
     pub fn focus_title(&mut self) {
@@ -525,6 +534,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
+    }
+
+    #[cfg(test)]
+    pub fn worktree_enabled_for_test(&self) -> bool {
+        self.worktree_enabled
     }
 
     /// Push a hook progress message into the dialog state

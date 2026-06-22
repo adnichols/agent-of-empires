@@ -54,7 +54,7 @@ import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
-import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
+import { WorkspaceSidebar, type SessionCreatePrefill } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { TopBar } from "./components/TopBar";
@@ -669,19 +669,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   );
 
   const handleCreateSession = useCallback(
-    (repoPath: string) => {
+    (prefill: SessionCreatePrefill) => {
+      const relatedPath = prefill.repoPath ?? prefill.path;
       const projectSessions = sessions
-        .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
+        .filter((s) => (s.main_repo_path || s.project_path) === relatedPath)
         .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
       const latest = projectSessions[0];
 
       setWizardPrefill({
-        path: repoPath,
+        path: prefill.path,
         tool: latest?.tool ?? "claude",
         yoloMode: latest?.yolo_mode ?? false,
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile: latest?.profile || undefined,
         group: latest?.group_path || undefined,
+        useWorktree: prefill.useWorktree,
       });
       setShowSessionWizard(true);
     },

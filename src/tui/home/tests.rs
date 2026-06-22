@@ -4196,7 +4196,7 @@ fn test_session_context_menu_new_session_prefills_from_session() {
     env.view.update_selected();
 
     // The session right-click menu's "New Session" routes here, prefilling the
-    // dialog from the right-clicked session's repo path and group (issue #2023).
+    // dialog from the right-clicked session's working directory and group.
     env.view
         .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
@@ -4297,7 +4297,7 @@ fn test_shift_n_does_nothing_with_no_selection() {
 
 #[test]
 #[serial]
-fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
+fn test_shift_n_prefills_existing_worktree_path_for_worktree_session() {
     use crate::session::WorktreeInfo;
 
     let temp = TempDir::new().unwrap();
@@ -4340,8 +4340,12 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
     let dialog = view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(
         dialog.path_value(),
-        "/tmp/repo",
-        "Should pre-fill main_repo_path, not worktree path"
+        "/tmp/repo-worktrees/feature-branch",
+        "Should pre-fill the selected worktree path, not the main repo path"
+    );
+    assert!(
+        !dialog.worktree_enabled_for_test(),
+        "same-worktree creation must not create another worktree by default"
     );
 }
 

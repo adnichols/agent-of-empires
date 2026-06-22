@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useMemo, useRef, type ReactNode } from "react";
 
-import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+import { DragSuppressContext, SessionRow, type SessionCreatePrefill } from "../WorkspaceSidebar";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -83,7 +83,7 @@ function Row({
 }: {
   ws: Workspace;
   readOnly?: boolean;
-  onCreateSession?: (repoPath: string) => void;
+  onCreateSession?: (prefill: SessionCreatePrefill) => void;
 }) {
   const workspaces = useMemo(() => [ws], [ws]);
   const triage = useSidebarTriage(workspaces);
@@ -499,11 +499,15 @@ describe("SessionRow triage actions", () => {
     }
   });
 
-  it("New Session click calls onCreateSession with the row's repo path", () => {
-    // main_repo_path wins over project_path, matching handleCreateSession's
-    // own project key (`main_repo_path || project_path`), so the wizard
-    // prefills from the right-clicked session's project (issue #2023).
-    const ws = workspace("w-new", [session({ id: "sess-new", project_path: "/p", main_repo_path: "/repos/work" })]);
+  it("New Session click calls onCreateSession with the row's worktree path", () => {
+    const ws = workspace("w-new", [
+      session({
+        id: "sess-new",
+        project_path: "/repos/worktrees/feature",
+        main_repo_path: "/repos/work",
+        has_managed_worktree: true,
+      }),
+    ]);
     const onCreateSession = vi.fn();
     render(
       <Wrap>
@@ -512,7 +516,11 @@ describe("SessionRow triage actions", () => {
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     fireEvent.click(screen.getByTestId("sidebar-context-menu-new-session"));
-    expect(onCreateSession).toHaveBeenCalledWith("/repos/work");
+    expect(onCreateSession).toHaveBeenCalledWith({
+      path: "/repos/worktrees/feature",
+      repoPath: "/repos/work",
+      useWorktree: false,
+    });
     // It's a client-side wizard open, not a server mutation.
     expect(fetchSpy).not.toHaveBeenCalled();
   });

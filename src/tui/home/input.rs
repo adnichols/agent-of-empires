@@ -2346,11 +2346,25 @@ impl HomeView {
             self.show_no_agents();
             return;
         }
-        let prefill_path = self
+        let selected_prefill = self
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.repo_path().to_string())
+            .map(|inst| {
+                let group = if inst.group_path.is_empty() {
+                    None
+                } else {
+                    Some(inst.group_path.clone())
+                };
+                (
+                    inst.project_path.clone(),
+                    group,
+                    inst.worktree_info.is_some(),
+                )
+            });
+        let prefill_path = selected_prefill
+            .as_ref()
+            .map(|(path, _, _)| path.clone())
             .or_else(|| {
                 // No session selected (the project/group right-click menu, or
                 // `'N'` on a group header): borrow a member's repo path so the
@@ -2360,18 +2374,13 @@ impl HomeView {
                     .as_ref()
                     .and_then(|g| self.group_repo_path(g))
             });
-        let prefill_group = self
-            .selected_session
+        let prefill_group = selected_prefill
             .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .and_then(|inst| {
-                if inst.group_path.is_empty() {
-                    None
-                } else {
-                    Some(inst.group_path.clone())
-                }
-            })
+            .and_then(|(_, group, _)| group.clone())
             .or_else(|| self.selected_group.clone());
+        let prefill_is_existing_worktree = selected_prefill
+            .as_ref()
+            .is_some_and(|(_, _, is_worktree)| *is_worktree);
 
         if prefill_path.is_some() || prefill_group.is_some() {
             let existing_groups: Vec<String> =
@@ -2388,7 +2397,11 @@ impl HomeView {
             );
             let has_prefilled_path = prefill_path.is_some();
             if let Some(path) = prefill_path {
-                dialog.set_path(path);
+                if prefill_is_existing_worktree {
+                    dialog.set_existing_worktree_path(path);
+                } else {
+                    dialog.set_path(path);
+                }
             }
             if let Some(group) = prefill_group {
                 dialog.set_group(group);

@@ -81,6 +81,7 @@ export interface WizardPrefill {
   tool?: string;
   yoloMode?: boolean;
   sandboxEnabled?: boolean;
+  useWorktree?: boolean;
   profile?: string;
   group?: string;
   /** Which tab to show initially on the project section */
@@ -112,7 +113,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
         // Scratch mode clears worktree/extra-repos so the submit
         // payload mirrors what the reducer's SET_FIELD arm would emit
         // for a user-triggered scratch toggle. See wizardReducer.ts.
-        useWorktree: prefill.scratch ? false : baseInitial.useWorktree,
+        useWorktree: prefill.scratch ? false : (prefill.useWorktree ?? baseInitial.useWorktree),
         extraRepoPaths: prefill.scratch ? [] : baseInitial.extraRepoPaths,
       }
     : baseInitial;
