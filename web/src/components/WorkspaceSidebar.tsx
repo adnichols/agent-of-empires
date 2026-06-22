@@ -133,6 +133,8 @@ export interface SessionCreatePrefill {
   path: string;
   repoPath?: string;
   useWorktree?: boolean;
+  worktreeBranch?: string;
+  attachExisting?: boolean;
 }
 
 interface Props {
@@ -560,6 +562,7 @@ export const SessionRow = memo(function SessionRow({
     !!firstSession &&
     (firstSession.has_managed_worktree ||
       (!!firstSession.main_repo_path && firstSession.project_path !== firstSession.main_repo_path));
+  const existingWorktreeBranch = createInExistingWorktree ? (firstSession.branch ?? null) : null;
   // The structured view session backing this row, if any. Drives the "Switch
   // agent" context-menu item, which only makes sense for an ACP structured view
   // session (tmux rows have no agent to hand off). Multi-session rows are
@@ -1070,7 +1073,9 @@ export const SessionRow = memo(function SessionRow({
                   onCreateSession({
                     path: newSessionPath,
                     repoPath: newSessionRepoPath ?? newSessionPath,
-                    useWorktree: createInExistingWorktree ? false : undefined,
+                    useWorktree: existingWorktreeBranch ? true : createInExistingWorktree ? false : undefined,
+                    worktreeBranch: existingWorktreeBranch ?? undefined,
+                    attachExisting: existingWorktreeBranch ? true : undefined,
                   });
                 }}
                 data-testid="sidebar-context-menu-new-session"

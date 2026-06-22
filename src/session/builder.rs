@@ -1458,6 +1458,53 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn build_instance_reuses_existing_worktree_as_unmanaged_branch_session() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let repo_parent = init_repo_with_commit("repo-reuse-worktree");
+        let repo_path = repo_parent.path().join("repo-reuse-worktree");
+        let existing_worktree = repo_parent.path().join("existing-feature-worktree");
+        let git_wt = GitWorktree::new(repo_path.clone()).unwrap();
+        git_wt
+            .create_worktree("feature/reuse", &existing_worktree, true, None)
+            .unwrap();
+
+        let mut params = custom_agent_params(&existing_worktree, "claude");
+        params.title = "reuse session".to_string();
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feature/reuse".to_string());
+        params.create_new_branch = false;
+
+        let result = build_instance(params, &[], &[], "default").unwrap();
+        let worktree_info = result
+            .instance
+            .worktree_info
+            .as_ref()
+            .expect("existing branch attach should preserve worktree metadata");
+
+        assert_eq!(
+            std::path::Path::new(&result.instance.project_path)
+                .canonicalize()
+                .unwrap(),
+            existing_worktree.canonicalize().unwrap()
+        );
+        assert_eq!(worktree_info.branch, "feature/reuse");
+        assert_eq!(
+            std::path::Path::new(&worktree_info.main_repo_path)
+                .canonicalize()
+                .unwrap(),
+            repo_path.canonicalize().unwrap()
+        );
+        assert!(!worktree_info.managed_by_aoe);
+        assert!(result.created_worktree.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn build_instance_preserves_custom_agent_detect_as_mapping() {
         let temp_home = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", temp_home.path());

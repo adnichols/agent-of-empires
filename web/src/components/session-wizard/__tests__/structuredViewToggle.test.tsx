@@ -172,19 +172,27 @@ describe("SessionWizard structured_view payload", () => {
     return render(<SessionWizard onClose={() => {}} onCreated={() => {}} prefill={{ path: "/tmp/proj" }} />);
   }
 
-  it("omits worktree_branch when prefilled for an existing worktree", async () => {
+  it("attaches to the existing branch when prefilled for an existing worktree", async () => {
     const { getByText } = render(
       <SessionWizard
         onClose={() => {}}
         onCreated={() => {}}
-        prefill={{ path: "/tmp/proj-worktrees/feature", tool: "claude", useWorktree: false }}
+        prefill={{
+          path: "/tmp/proj-worktrees/feature",
+          tool: "claude",
+          useWorktree: true,
+          worktreeBranch: "feature",
+          attachExisting: true,
+        }}
       />,
     );
     fireEvent.click(getByText(/Launch session/));
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession).toHaveBeenCalledWith(
-      expect.not.objectContaining({
-        worktree_branch: expect.anything(),
+      expect.objectContaining({
+        path: "/tmp/proj-worktrees/feature",
+        worktree_branch: "feature",
+        create_new_branch: false,
       }),
     );
   });

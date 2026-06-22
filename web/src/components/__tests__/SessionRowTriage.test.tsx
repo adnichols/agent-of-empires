@@ -505,6 +505,7 @@ describe("SessionRow triage actions", () => {
         id: "sess-new",
         project_path: "/repos/worktrees/feature",
         main_repo_path: "/repos/work",
+        branch: "feature",
         has_managed_worktree: true,
       }),
     ]);
@@ -519,7 +520,9 @@ describe("SessionRow triage actions", () => {
     expect(onCreateSession).toHaveBeenCalledWith({
       path: "/repos/worktrees/feature",
       repoPath: "/repos/work",
-      useWorktree: false,
+      useWorktree: true,
+      worktreeBranch: "feature",
+      attachExisting: true,
     });
     // It's a client-side wizard open, not a server mutation.
     expect(fetchSpy).not.toHaveBeenCalled();

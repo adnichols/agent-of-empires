@@ -670,6 +670,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const handleCreateSession = useCallback(
     (prefill: SessionCreatePrefill) => {
+      if (serverAbout?.read_only) return;
       const relatedPath = prefill.repoPath ?? prefill.path;
       const projectSessions = sessions
         .filter((s) => (s.main_repo_path || s.project_path) === relatedPath)
@@ -684,10 +685,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         profile: latest?.profile || undefined,
         group: latest?.group_path || undefined,
         useWorktree: prefill.useWorktree,
+        worktreeBranch: prefill.worktreeBranch,
+        attachExisting: prefill.attachExisting,
       });
       setShowSessionWizard(true);
     },
-    [sessions],
+    [serverAbout?.read_only, sessions],
   );
 
   // Pin a repo so its header persists with zero sessions. If the repo is
