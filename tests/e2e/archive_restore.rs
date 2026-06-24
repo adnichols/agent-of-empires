@@ -27,6 +27,21 @@ fn tmux_has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn mark_tmux_owner(name: &str, session_id: &str, kind: &str) {
+    agent_of_empires::tmux::test_support::set_hidden_env(
+        name,
+        agent_of_empires::tmux::test_support::AOE_INSTANCE_ID_KEY,
+        session_id,
+    )
+    .expect("set AOE_INSTANCE_ID");
+    agent_of_empires::tmux::test_support::set_hidden_env(
+        name,
+        agent_of_empires::tmux::test_support::AOE_SESSION_KIND_KEY,
+        kind,
+    )
+    .expect("set AOE_SESSION_KIND");
+}
+
 /// Seed sessions in the default profile pointing at a real project dir, so
 /// startup recovery / restore can actually launch their (persistent) agent.
 fn seed_sessions(h: &TuiTestHarness, project: &str, titles: &[(&str, &str)]) {
@@ -198,12 +213,12 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
 
     // Pre-create the four tmux kinds so archive can find and kill them.
     let names = [
-        &agent_tmux_name,
-        &terminal_tmux_name,
-        &cterm_tmux_name,
-        &tool_tmux_name,
+        (&agent_tmux_name, "agent"),
+        (&terminal_tmux_name, "terminal"),
+        (&cterm_tmux_name, "container_terminal"),
+        (&tool_tmux_name, "tool"),
     ];
-    for name in names {
+    for (name, kind) in names {
         let create = agent_of_empires::tmux::tmux_command()
             .args([
                 "new-session",
@@ -225,6 +240,7 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
             name,
             String::from_utf8_lossy(&create.stderr)
         );
+        mark_tmux_owner(name, &session_id, kind);
     }
 
     let archive_output = h.run_cli(&["session", "archive", &session_id]);
@@ -234,7 +250,10 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
         String::from_utf8_lossy(&archive_output.stderr)
     );
 
-    let alive: Vec<(&&String, bool)> = names.iter().map(|n| (n, tmux_has_session(n))).collect();
+    let alive: Vec<(&String, bool)> = names
+        .iter()
+        .map(|(name, _)| (*name, tmux_has_session(name)))
+        .collect();
 
     // Cleanup BEFORE asserting so a single failure cannot leak survivors
     // into the next serial test.
@@ -294,12 +313,12 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
             .to_string();
 
     let names = [
-        &agent_tmux_name,
-        &terminal_tmux_name,
-        &cterm_tmux_name,
-        &tool_tmux_name,
+        (&agent_tmux_name, "agent"),
+        (&terminal_tmux_name, "terminal"),
+        (&cterm_tmux_name, "container_terminal"),
+        (&tool_tmux_name, "tool"),
     ];
-    for name in names {
+    for (name, kind) in names {
         let create = agent_of_empires::tmux::tmux_command()
             .args([
                 "new-session",
@@ -321,6 +340,7 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
             name,
             String::from_utf8_lossy(&create.stderr)
         );
+        mark_tmux_owner(name, &session_id, kind);
     }
 
     let archive_output = h.run_cli(&["session", "archive", &session_id, "--no-kill"]);
@@ -330,11 +350,14 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
         String::from_utf8_lossy(&archive_output.stderr)
     );
 
-    let alive: Vec<(&&String, bool)> = names.iter().map(|n| (n, tmux_has_session(n))).collect();
+    let alive: Vec<(&String, bool)> = names
+        .iter()
+        .map(|(name, _)| (*name, tmux_has_session(name)))
+        .collect();
 
     // Cleanup explicitly: --no-kill leaves the survivors so they would
     // pollute the next serial test.
-    for name in &names {
+    for (name, _) in &names {
         kill_tmux(name);
     }
 

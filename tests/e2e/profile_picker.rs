@@ -107,7 +107,9 @@ fn test_profile_picker_delete_flow() {
     h.wait_for("Profiles");
     h.assert_screen_contains("deleteme");
 
-    // Navigate to "deleteme" (after "default" alphabetically)
+    // Navigate to "deleteme". The extra down is harmless at the end of the
+    // list and keeps the test resilient if a mode-specific row is present.
+    h.send_keys("j");
     h.send_keys("j");
     std::thread::sleep(Duration::from_millis(50));
 
@@ -120,9 +122,10 @@ fn test_profile_picker_delete_flow() {
     // Confirm with 'y'
     h.send_keys("y");
 
-    // Picker should stay open with refreshed list
-    h.wait_for_absent("Delete Profile", Duration::from_secs(5));
-    h.assert_screen_contains("Profiles");
+    // Picker should stay open with refreshed list. Wait for the refreshed
+    // dialog, not merely for the confirmation text to disappear, because tmux
+    // can briefly capture a blank frame during the redraw.
+    h.wait_for("Profiles");
     h.assert_screen_not_contains("deleteme");
 }
 
@@ -139,7 +142,9 @@ fn test_profile_picker_delete_cancel() {
     h.send_keys("P");
     h.wait_for("Profiles");
 
-    // Navigate to "keepme"
+    // Navigate to "keepme". The extra down is harmless at the end of the
+    // list and keeps the test resilient if a mode-specific row is present.
+    h.send_keys("j");
     h.send_keys("j");
     std::thread::sleep(Duration::from_millis(50));
 

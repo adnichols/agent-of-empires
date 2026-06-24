@@ -106,6 +106,11 @@ pub fn collect_pid_tree(pid: u32) -> Vec<u32> {
 /// Kill a process and all its descendants
 /// Sends SIGTERM first, then SIGKILL to any survivors
 pub fn kill_process_tree(pid: u32) {
+    if pid <= 1 {
+        tracing::warn!(target: "process.signal", pid, "refusing to kill unsafe pid");
+        return;
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     kill_with_fallback(&collect_pid_tree(pid));
 
@@ -120,6 +125,11 @@ pub fn kill_process_tree(pid: u32) {
 /// graceful shutdown, then SIGKILL anything still alive.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kill_with_fallback(pids: &[u32]) {
+    let pids: Vec<u32> = pids.iter().copied().filter(|pid| *pid > 1).collect();
+    if pids.is_empty() {
+        return;
+    }
+
     tracing::debug!(
         target: "process.tree",
         descendants = ?pids,

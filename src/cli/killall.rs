@@ -1,22 +1,21 @@
-//! `aoe killall`: a panic button that stops then force-kills everything aoe is
-//! running, in one command. Tears down the serve daemon, every ACP cockpit
-//! worker, and every aoe tmux session (agent, terminal, container terminal,
-//! tool). Each surface is attempted independently; one failing surface never
-//! aborts the others, and the exit code is non-zero only if something failed.
+//! `aoe killall`: a panic button that stops AoE infrastructure in one command.
+//! It tears down the serve daemon and every ACP cockpit worker. Legacy broad
+//! tmux teardown is disabled and audited so user workspaces are preserved. Each
+//! surface is attempted independently; one failing surface never aborts the
+//! others, and the exit code is non-zero only if something failed.
 
 use anyhow::Result;
 use clap::Args;
 
 #[derive(Args, Debug)]
 pub struct KillallArgs {
-    /// Grace period in seconds before force-killing agent workers. tmux
-    /// sessions and the daemon use their own built-in grace.
+    /// Grace period in seconds before force-killing agent workers. The daemon
+    /// uses its own built-in grace, and tmux sessions are preserved.
     #[cfg(feature = "serve")]
     #[arg(long, default_value_t = 5)]
     pub timeout_secs: u64,
 
-    /// Leave the `aoe serve` daemon running; stop only workers and tmux
-    /// sessions.
+    /// Leave the `aoe serve` daemon running; stop only workers.
     #[cfg(feature = "serve")]
     #[arg(long)]
     pub keep_daemon: bool,
@@ -53,7 +52,15 @@ pub async fn run(args: KillallArgs) -> Result<()> {
     }
 
     match crate::tmux::stop_all_sessions() {
-        Ok(n) => println!("Stopped {n} tmux session(s)."),
+        Ok(report) => {
+            println!("Tmux sessions preserved; broad tmux teardown is disabled.");
+            if let Some(path) = report.audit_path {
+                println!("Recorded skipped tmux sweep in {}.", path.display());
+            }
+            if let Some(error) = report.audit_error {
+                eprintln!("warning: failed to write skipped tmux sweep audit: {error}");
+            }
+        }
         Err(e) => errors.push(format!("tmux: {e}")),
     }
 
@@ -77,6 +84,6 @@ pub fn stop_trap() -> Result<()> {
          aoe session stop <id>   stop one session\n  \
          aoe acp stop [--all]    stop agent workers\n  \
          aoe serve --stop        stop the web daemon\n  \
-         aoe killall             force-stop everything"
+         aoe killall             force-stop AoE daemon and workers"
     )
 }

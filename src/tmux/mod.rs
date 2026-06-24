@@ -1,6 +1,7 @@
 //! tmux integration module
 
 pub(crate) mod env;
+mod kill;
 mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
@@ -10,6 +11,7 @@ mod test_helpers;
 mod tool_session;
 pub(crate) mod utils;
 
+pub(crate) use kill::{kill_tmux_session, TmuxKillRequest, TmuxSessionKind};
 pub use session::{PaneCursor, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::detect_status_from_content;
@@ -24,6 +26,7 @@ pub mod test_support {
     pub use super::env::{
         get_hidden_env, get_hidden_env_batch, remove_hidden_env, set_hidden_env,
         set_hidden_env_batch, AOE_CAPTURED_SESSION_ID_KEY, AOE_INSTANCE_ID_KEY,
+        AOE_SESSION_KIND_KEY,
     };
 }
 
@@ -133,53 +136,10 @@ pub fn refresh_session_cache() {
     }
 }
 
-/// True for any tmux session name owned by this aoe namespace. Every session
-/// kind (agent, terminal, container terminal, tool) is prefixed with
-/// `SESSION_PREFIX` (`aoe_` in release, `aoe_dev_` in debug), so the single
-/// root prefix matches all of them and never a release session from a debug
-/// build (or vice versa).
-fn is_aoe_session(name: &str) -> bool {
-    name.starts_with(SESSION_PREFIX)
-}
-
-/// Force-stop every aoe-owned tmux session (agent, terminal, container
-/// terminal, tool) in this namespace. Mirrors `kill_all_tool_sessions_for_id`
-/// but sweeps the whole `SESSION_PREFIX` namespace. Returns the number of
-/// sessions killed. Refreshes the session cache once at the end.
-///
-/// `Err` means the `tmux list-sessions` process could not be spawned (e.g.
-/// tmux is not installed), which callers should treat as a failed surface. A
-/// non-zero exit (no server running, hence no sessions) is `Ok(0)`, and
-/// per-session kills stay best-effort.
-///
-/// ponytail: per-session `kill_process_tree` is sequential and each does a
-/// fixed 100ms SIGTERM grace, so a sweep of N sessions blocks ~N*100ms. Fine
-/// for a panic button with a handful of sessions; if counts grow, batch the
-/// SIGTERM across all pids, wait once, then SIGKILL survivors.
-pub fn stop_all_sessions() -> anyhow::Result<usize> {
-    let output = tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("tmux list-sessions spawn failed: {e}"))?;
-
-    let mut killed = 0;
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if is_aoe_session(line) {
-                if let Some(pid) = crate::process::get_pane_pid(line) {
-                    crate::process::kill_process_tree(pid);
-                }
-                let _ = tmux_command().args(["kill-session", "-t", line]).output();
-                killed += 1;
-            }
-        }
-    }
-
-    if killed > 0 {
-        refresh_session_cache();
-    }
-    Ok(killed)
+/// Legacy global sweep entry point. Broad tmux teardown is intentionally
+/// disabled: callers get an audited no-op instead of a namespace-wide kill.
+pub fn stop_all_sessions() -> anyhow::Result<kill::TmuxSweepNoopReport> {
+    Ok(kill::audit_global_sweep_disabled("tmux::stop_all_sessions"))
 }
 
 /// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.
@@ -517,16 +477,6 @@ mod tests {
     // (`aoe_`) and debug (`aoe_dev_`) builds. Use the constant so the same
     // test bodies cover both.
     const P: &str = SESSION_PREFIX;
-
-    #[test]
-    fn is_aoe_session_matches_every_kind_and_rejects_foreign() {
-        assert!(is_aoe_session(&format!("{P}my_proj_abc12345")));
-        assert!(is_aoe_session(&format!("{TERMINAL_PREFIX}x")));
-        assert!(is_aoe_session(&format!("{CONTAINER_TERMINAL_PREFIX}x")));
-        assert!(is_aoe_session(&format!("{TOOL_PREFIX}x")));
-        assert!(!is_aoe_session("vim"));
-        assert!(!is_aoe_session("my_aoe_session"));
-    }
 
     #[test]
     fn test_parse_pane_metadata_basic() {

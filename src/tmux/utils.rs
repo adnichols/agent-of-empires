@@ -316,7 +316,7 @@ pub fn tmux_prefix_display() -> &'static str {
 /// unexpectedly` is also absent-equivalent because the server died before
 /// it could hold the target session. Any other tmux failure returns `Err`.
 /// Caller is responsible for `refresh_session_cache` after a successful kill.
-pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
+pub(crate) fn kill_session_if_present_unverified(name: &str) -> Result<()> {
     let output = tmux_command()
         .env("LC_ALL", "C")
         .args(["kill-session", "-t", name])
@@ -777,18 +777,18 @@ mod tests {
     // update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt).
     #[test]
     #[serial_test::serial]
-    fn kill_session_if_present_swallows_missing_session() {
+    fn kill_session_if_present_unverified_swallows_missing_session() {
         if !tmux_available() {
             return;
         }
         let name = "aoe_test_kill_if_present_missing";
         let _ = tmux_command().args(["kill-session", "-t", name]).output();
-        assert!(kill_session_if_present(name).is_ok());
+        assert!(kill_session_if_present_unverified(name).is_ok());
     }
 
     #[test]
     #[serial_test::serial]
-    fn kill_session_if_present_kills_existing_session() {
+    fn kill_session_if_present_unverified_kills_existing_session() {
         if !tmux_available() {
             return;
         }
@@ -800,7 +800,7 @@ mod tests {
         if !spawn.map(|s| s.success()).unwrap_or(false) {
             return;
         }
-        assert!(kill_session_if_present(name).is_ok());
+        assert!(kill_session_if_present_unverified(name).is_ok());
         let exists = tmux_command()
             .args(["has-session", "-t", name])
             .status()
@@ -808,7 +808,7 @@ mod tests {
             .unwrap_or(false);
         assert!(
             !exists,
-            "session should be gone after kill_session_if_present"
+            "session should be gone after kill_session_if_present_unverified"
         );
     }
 }

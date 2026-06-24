@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use super::utils::tmux_command;
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
+pub const AOE_SESSION_KIND_KEY: &str = "AOE_SESSION_KIND";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
 
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -80,6 +81,16 @@ pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
         }
     }
 
+    fetch_and_cache_hidden_env(session_name, key)
+}
+
+/// Fetch a hidden environment variable without trusting the cache.
+pub(crate) fn get_hidden_env_fresh(session_name: &str, key: &str) -> Option<String> {
+    fetch_and_cache_hidden_env(session_name, key)
+}
+
+fn fetch_and_cache_hidden_env(session_name: &str, key: &str) -> Option<String> {
+    let cache_key = (session_name.to_string(), key.to_string());
     let value = fetch_hidden_env(session_name, key);
 
     if let Ok(mut cache) = ENV_CACHE.write() {
@@ -239,21 +250,20 @@ pub fn set_hidden_env_batch(entries: &[(&str, &str, &str)]) -> anyhow::Result<()
                 "Batch tmux set-environment failed (exit {}), falling back to sequential writes",
                 out.status
             );
-            sequential_set_fallback(entries);
-            Ok(())
+            sequential_set_fallback(entries)
         }
         Err(e) => {
             tracing::debug!(target: "tmux.command",
                 "Batch tmux set-environment error: {}, falling back to sequential writes",
                 e
             );
-            sequential_set_fallback(entries);
-            Ok(())
+            sequential_set_fallback(entries)
         }
     }
 }
 
-fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
+fn sequential_set_fallback(entries: &[(&str, &str, &str)]) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
     for (session_name, key, value) in entries {
         if let Err(e) = set_hidden_env(session_name, key, value) {
             tracing::debug!(target: "tmux.command",
@@ -262,7 +272,16 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
                 session_name,
                 e
             );
+            failures.push(format!("{key} on {session_name}: {e}"));
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to set hidden tmux environment after fallback: {}",
+            failures.join("; ")
+        )
     }
 }
 

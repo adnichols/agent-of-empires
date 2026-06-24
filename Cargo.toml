@@ -238,3 +238,8 @@ debug-assertions = false
 [[bin]]
 name = "aoe"
 path = "src/main.rs"
+
+[[test]]
+name = "acp_runner_orphan"
+path = "tests/acp_runner_orphan.rs"
+required-features = ["serve"]

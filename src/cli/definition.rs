@@ -99,8 +99,8 @@ pub enum Commands {
     /// Show session status summary
     Status(StatusArgs),
 
-    /// Force-stop everything aoe is running: the serve daemon, all agent
-    /// workers, and all aoe tmux sessions. Destructive and unprompted.
+    /// Force-stop AoE infrastructure: the serve daemon and all agent workers.
+    /// Tmux sessions are preserved; skipped broad teardown is audited.
     Killall(KillallArgs),
 
     /// Internal: trap for `aoe stop`, which is not a command in aoe (stopping
