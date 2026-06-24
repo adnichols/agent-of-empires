@@ -1119,6 +1119,19 @@ fn test_cli_rm_kills_agent_tmux_session() {
         String::from_utf8_lossy(&create.stderr)
     );
 
+    agent_of_empires::tmux::test_support::set_hidden_env(
+        &tmux_name,
+        agent_of_empires::tmux::test_support::AOE_INSTANCE_ID_KEY,
+        session_id,
+    )
+    .expect("set AOE_INSTANCE_ID");
+    agent_of_empires::tmux::test_support::set_hidden_env(
+        &tmux_name,
+        agent_of_empires::tmux::test_support::AOE_SESSION_KIND_KEY,
+        "agent",
+    )
+    .expect("set AOE_SESSION_KIND");
+
     let rm_output = h.run_cli(&["rm", session_id, "--force"]);
     assert!(
         rm_output.status.success(),
@@ -1137,7 +1150,145 @@ fn test_cli_rm_kills_agent_tmux_session() {
         tmux_name
     );
 
+    let audit_path = crate::harness::app_dir_in(h.home_path()).join("tmux-kill-audit.log");
+    let audit = std::fs::read_to_string(&audit_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", audit_path.display()));
+    assert!(
+        audit.contains("agent_session_stop"),
+        "audit missing reason: {audit}"
+    );
+    assert!(
+        audit.contains(session_id),
+        "audit missing session id: {audit}"
+    );
+    assert!(audit.contains("killed"), "audit missing result: {audit}");
+
     // Cleanup
+    let _ = agent_of_empires::tmux::tmux_command()
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+}
+
+#[test]
+#[serial]
+fn test_cli_rm_skips_unverified_tmux_session() {
+    require_tmux!();
+
+    let h = TuiTestHarness::new("cli_rm_unverified_tmux");
+    let project = h.project_path();
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-t", "UnverifiedRm"]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"].as_str().expect("session should have id");
+    let truncated_id = &session_id[..8.min(session_id.len())];
+    let tmux_name = format!(
+        "{}UnverifiedRm_{}",
+        agent_of_empires::tmux::SESSION_PREFIX,
+        truncated_id
+    );
+
+    let _ = agent_of_empires::tmux::tmux_command()
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+    let create = agent_of_empires::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", &tmux_name, "sleep", "60"])
+        .output()
+        .expect("tmux new-session");
+    assert!(
+        create.status.success(),
+        "failed to create tmux session: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let rm_output = h.run_cli(&["rm", session_id, "--force"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm_output.stderr)
+    );
+
+    let still_alive = agent_of_empires::tmux::tmux_command()
+        .args(["has-session", "-t", &tmux_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        still_alive,
+        "unverified tmux session '{}' must be preserved",
+        tmux_name
+    );
+
+    let audit_path = crate::harness::app_dir_in(h.home_path()).join("tmux-kill-audit.log");
+    let audit = std::fs::read_to_string(&audit_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", audit_path.display()));
+    assert!(
+        audit.contains("missing_instance_id"),
+        "audit should record missing ownership proof, got: {audit}"
+    );
+
+    let _ = agent_of_empires::tmux::tmux_command()
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+}
+
+#[test]
+#[serial]
+fn test_cli_killall_preserves_aoe_tmux_sessions() {
+    require_tmux!();
+
+    let h = TuiTestHarness::new("cli_killall_preserves_tmux");
+    let tmux_name = format!(
+        "{}killall_preserve_{}",
+        agent_of_empires::tmux::SESSION_PREFIX,
+        std::process::id()
+    );
+
+    let _ = agent_of_empires::tmux::tmux_command()
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+    let create = agent_of_empires::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", &tmux_name, "sleep", "60"])
+        .output()
+        .expect("tmux new-session");
+    assert!(
+        create.status.success(),
+        "failed to create tmux session: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let output = h.run_cli(&["killall"]);
+    assert!(
+        output.status.success(),
+        "aoe killall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Tmux sessions preserved"),
+        "killall should report preserved tmux sessions, got: {stdout}"
+    );
+
+    let still_alive = agent_of_empires::tmux::tmux_command()
+        .args(["has-session", "-t", &tmux_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(still_alive, "killall must not kill {tmux_name}");
+
+    let audit_path = crate::harness::app_dir_in(h.home_path()).join("tmux-kill-audit.log");
+    let audit = std::fs::read_to_string(&audit_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", audit_path.display()));
+    assert!(
+        audit.contains("global_sweep_disabled"),
+        "audit should record skipped sweep, got: {audit}"
+    );
+
     let _ = agent_of_empires::tmux::tmux_command()
         .args(["kill-session", "-t", &tmux_name])
         .output();

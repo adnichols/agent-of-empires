@@ -1816,7 +1816,7 @@ impl Instance {
             &profile,
             expected_prior_sid.as_deref(),
             expected_prior_intent,
-        );
+        )?;
 
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
@@ -2145,7 +2145,7 @@ impl Instance {
         profile: &str,
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
-    ) {
+    ) -> Result<()> {
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
@@ -2157,11 +2157,18 @@ impl Instance {
             None
         };
 
-        let mut entries: Vec<(&str, &str, &str)> = vec![(
-            session_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            &self.id,
-        )];
+        let mut entries: Vec<(&str, &str, &str)> = vec![
+            (
+                session_name,
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                &self.id,
+            ),
+            (
+                session_name,
+                crate::tmux::env::AOE_SESSION_KIND_KEY,
+                crate::tmux::TmuxSessionKind::Agent.as_str(),
+            ),
+        ];
         if let Some(ref sid) = captured_sid {
             entries.push((
                 session_name,
@@ -2169,11 +2176,12 @@ impl Instance {
                 sid.as_str(),
             ));
         }
-        if let Err(e) = crate::tmux::env::set_hidden_env_batch(&entries) {
+        crate::tmux::env::set_hidden_env_batch(&entries).map_err(|e| {
             let keys: Vec<&str> = entries.iter().map(|(_, k, _)| *k).collect();
             tracing::warn!(target: "session.store",
                 "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
-        }
+            e
+        })?;
 
         if publish_sid && self.agent_session_id.is_none() {
             if let Err(e) = crate::tmux::env::remove_hidden_env(
@@ -2221,6 +2229,8 @@ impl Instance {
                 );
             }
         }
+
+        Ok(())
     }
 
     /// Atomic single-flock CAS+write of `agent_session_id` and (when
@@ -5776,7 +5786,7 @@ mod tests {
         /// so the session survives the inner command's exit. Used to simulate
         /// the dead-pane state without going through `start_terminal`, which
         /// would also apply unrelated tmux options.
-        fn spawn_remain_on_exit(name: &str, cmd: &str) {
+        fn spawn_remain_on_exit(name: &str, instance_id: &str, cmd: &str) {
             let output = crate::tmux::tmux_command()
                 .args([
                     "new-session",
@@ -5803,6 +5813,18 @@ mod tests {
                 "tmux new-session failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            crate::tmux::env::set_hidden_env(
+                name,
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                instance_id,
+            )
+            .expect("set terminal owner marker");
+            crate::tmux::env::set_hidden_env(
+                name,
+                crate::tmux::env::AOE_SESSION_KIND_KEY,
+                crate::tmux::TmuxSessionKind::Terminal.as_str(),
+            )
+            .expect("set terminal kind marker");
             crate::tmux::refresh_session_cache();
         }
 
@@ -5834,7 +5856,7 @@ mod tests {
             }
             let inst = Instance::new("ktid_alive", "/tmp");
             let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
-            spawn_remain_on_exit(&name, "sleep 30");
+            spawn_remain_on_exit(&name, &inst.id, "sleep 30");
             // Give tmux a moment to register the pane.
             std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -5856,7 +5878,7 @@ mod tests {
             // `true` exits immediately; remain-on-exit keeps the session alive
             // with a dead pane (matches the production failure mode: shell
             // exited via Ctrl+D / `exit` / SIGHUP, session still listed).
-            spawn_remain_on_exit(&name, "true");
+            spawn_remain_on_exit(&name, &inst.id, "true");
             // Allow the pane to transition to dead.
             std::thread::sleep(std::time::Duration::from_millis(300));
 
@@ -7293,9 +7315,26 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default)
+                .expect("finalize launch");
 
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+            assert_eq!(
+                crate::tmux::env::get_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_INSTANCE_ID_KEY
+                )
+                .as_deref(),
+                Some(inst.id.as_str())
+            );
+            assert_eq!(
+                crate::tmux::env::get_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_SESSION_KIND_KEY
+                )
+                .as_deref(),
+                Some(crate::tmux::TmuxSessionKind::Agent.as_str())
+            );
         }
 
         #[test]
@@ -7316,7 +7355,8 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default)
+                .expect("finalize launch");
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -7342,7 +7382,8 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default)
+                .expect("finalize launch");
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(PEER_SID));
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(PEER_SID));
@@ -7371,7 +7412,8 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default)
+                .expect("finalize launch");
 
             assert!(inst.agent_session_id.is_none());
             assert!(captured_env(tmux.name()).is_none());
@@ -7399,7 +7441,8 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default)
+                .expect("finalize launch");
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -7435,7 +7478,8 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some("bad sid!".to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default)
+                .expect("finalize launch");
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -7461,7 +7505,8 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared)
+                .expect("finalize launch");
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
             assert_eq!(inst.resume_intent, ResumeIntent::Default);

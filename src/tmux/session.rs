@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
-    refresh_session_cache, session_exists_from_cache,
+    kill_tmux_session, session_exists_from_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
         append_remain_on_exit_args, append_window_size_args, ensure_aoe_server_stays_alive,
         is_pane_dead, is_pane_running_shell, tmux_command,
     },
-    SESSION_PREFIX,
+    TmuxKillRequest, TmuxSessionKind, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
@@ -22,6 +22,7 @@ use crate::session::Status;
 
 pub struct Session {
     name: String,
+    instance_id: Option<String>,
 }
 
 /// tmux user options holding the cross-process size-owner lock (see
@@ -126,6 +127,7 @@ impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
             name: Self::generate_name(id, title),
+            instance_id: Some(id.to_string()),
         })
     }
 
@@ -133,6 +135,7 @@ impl Session {
     pub fn from_name(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            instance_id: None,
         }
     }
 
@@ -271,21 +274,21 @@ impl Session {
     }
 
     pub fn kill(&self) -> Result<()> {
-        if !self.exists() {
-            return Ok(());
+        let instance_id = self
+            .instance_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("refusing to kill tmux session without instance id"))?;
+        let report = kill_tmux_session(TmuxKillRequest {
+            session_name: &self.name,
+            expected_instance_id: instance_id,
+            expected_kind: TmuxSessionKind::Agent,
+            reason: "agent_session_stop",
+            caller: "tmux::Session::kill",
+            allow_legacy_agent_kind: true,
+        })?;
+        if let Some(error) = report.audit_error {
+            tracing::warn!(target: "tmux.audit", error = %error, session = %self.name, "tmux kill audit write failed");
         }
-
-        // Kill the entire process tree first to ensure child processes are terminated.
-        // This handles cases where tools like Claude spawn subprocesses that may
-        // survive tmux's SIGHUP signal.
-        if let Some(pane_pid) = self.get_pane_pid() {
-            process::kill_process_tree(pane_pid);
-        }
-
-        super::utils::kill_session_if_present(&self.name)?;
-
-        refresh_session_cache();
-
         Ok(())
     }
 
@@ -926,6 +929,7 @@ pub(crate) fn build_create_args(
 mod tests {
     use super::super::test_helpers::TmuxTestSession;
     use super::*;
+    use crate::tmux::refresh_session_cache;
 
     /// Helper: check if tmux is available for tests that need it
     fn tmux_available() -> bool {
@@ -1437,6 +1441,7 @@ mod tests {
 
         let session = Session {
             name: session_name.clone(),
+            instance_id: None,
         };
 
         // capture_pane must succeed -- with base-index 1, a :0.0 target does
@@ -1834,7 +1839,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let session = Session::from_name(&session_name);
-        super::refresh_session_cache();
+        refresh_session_cache();
 
         assert!(session.exists(), "Session should exist via remain-on-exit");
         assert!(session.is_pane_dead(), "Pane should be dead after `true`");

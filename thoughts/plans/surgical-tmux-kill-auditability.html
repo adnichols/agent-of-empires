@@ -1,0 +1,1027 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Surgical tmux kill and auditability plan</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: 1.5em;}
+    div.column{flex: auto;}
+    @media screen {
+    div.columns{gap: min(4vw, 1.5em);}
+    div.column{overflow-x: auto;}
+    }
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Surgical tmux kill and auditability plan</h1>
+</header>
+<section id="surgical-tmux-kill-and-auditability-plan" class="level1">
+<h1>Surgical tmux kill and auditability plan</h1>
+<section id="status" class="level2">
+<h2>Status</h2>
+<p>execution-ready</p>
+<p>UI impact: text-only, CLI help and log/audit output change. No
+dashboard UI flow changes are required.</p>
+</section>
+<section id="goal" class="level2">
+<h2>Goal</h2>
+<p>Remove AoE's destructive global tmux session sweep behavior. The
+legacy global sweep entry point should remain only as a non-destructive
+audited no-op, so any attempted broad kill is visible after the fact and
+in the TUI. Every real AoE tmux kill must target one explicit tmux
+session at a time, prove that session belongs to AoE, and write durable
+audit evidence before and after the kill attempt. If a product flow
+needs to stop multiple tmux sessions, it must loop over explicit session
+records and call the same single-session audited helper for each
+target.</p>
+</section>
+<section id="decision-attention--low-confidence-areas" class="level2">
+<h2>Decision Attention / Low-confidence Areas</h2>
+<p>None blocking. The product decision is explicit: remove broad all-AoE
+tmux killing entirely, require surgical per-session targeting, require
+clear AoE ownership, and make every tmux session kill auditable after
+the fact.</p>
+<p>Repo planning gap: <code>thoughts/specs/product_intent.md</code> is
+missing. This plan is anchored to the direct product decision above and
+should not be blocked by that repo-bootstrap gap, but a separate
+bootstrap follow-up should add the product intent file.</p>
+</section>
+<section id="why-this-plan-exists" class="level2">
+<h2>Why this plan exists</h2>
+<p>Current <code>aoe killall</code> treats AoE tmux sessions as
+disposable runtime cleanup. That is wrong for the product model. Tmux
+sessions are user-visible workspaces. Killing them globally destroys
+active workspace state and makes post-incident reconstruction hard.</p>
+<p>The desired model is:</p>
+<ul>
+<li>infrastructure cleanup can stop daemon and worker processes;</li>
+<li>tmux workspace termination is destructive and must be scoped to one
+known session;</li>
+<li>multi-session operations are explicit loops over known sessions, not
+prefix sweeps;</li>
+<li>every tmux kill creates durable audit records that survive normal
+CLI process exit;</li>
+<li>every attempted global sweep creates a durable no-op audit record
+and a TUI-visible notice.</li>
+</ul>
+</section>
+<section id="authority-and-inputs" class="level2">
+<h2>Authority and inputs</h2>
+<ul>
+<li>User directive in this session: remove global tmux kill
+functionality entirely.</li>
+<li>Existing investigation:
+<code>thoughts/debug/2026-06-22-tmux-kill-inventory.md</code>.</li>
+<li>Current global sweep: <code>src/cli/killall.rs:55</code> calls
+<code>crate::tmux::stop_all_sessions()</code>.</li>
+<li>Current broad matcher: <code>src/tmux/mod.rs:141</code> uses
+<code>name.starts_with(SESSION_PREFIX)</code>.</li>
+<li>Current broad sweep implementation: <code>src/tmux/mod.rs:159</code>
+lists all tmux sessions and kills every prefixed session.</li>
+<li>Current single-session helper: <code>src/tmux/utils.rs:319</code>
+<code>kill_session_if_present()</code>.</li>
+<li>Current per-instance fan-out:
+<code>src/session/instance.rs:3195</code>
+<code>kill_all_tmux_sessions()</code> and
+<code>src/session/instance.rs:3213</code>
+<code>kill_ancillary_tmux_sessions()</code>.</li>
+<li>Current tool fan-out by suffix:
+<code>src/tmux/tool_session.rs:157</code>
+<code>kill_all_tool_sessions_for_id()</code>.</li>
+<li>Existing session detection surfaces that need a scope audit: tmux
+name construction, tmux listing, stored instance lookup, terminal and
+tool session naming, idle reap candidate selection, group selection, and
+server API delete/archive paths.</li>
+<li>Existing ownership marker support: <code>src/tmux/env.rs</code>
+hidden env helpers and <code>AOE_INSTANCE_ID</code>.</li>
+<li>Logging reality: <code>src/main.rs:95</code> skips tracing
+subscriber initialization for normal one-shot CLI unless env logging is
+set, so auditability cannot rely on tracing alone.</li>
+</ul>
+</section>
+<section id="current-implementation-reality" class="level2">
+<h2>Current implementation reality</h2>
+<p><code>aoe killall</code> is the only production path that kills all
+AoE-prefixed tmux sessions in one sweep. It is documented as destructive
+and unprompted in <code>src/cli/definition.rs:104</code> and implemented
+in <code>src/cli/killall.rs</code>.</p>
+<p><code>tmux::stop_all_sessions()</code> is inherently broad because it
+enumerates the AoE tmux server, accepts name-prefix ownership, kills
+pane process trees, and then runs <code>tmux kill-session</code> for
+each match. To minimize the compatibility surface while removing the
+dangerous behavior, this helper should become a non-destructive no-op
+that records an audit event and returns a result the caller can surface.
+No product path should be able to use it to kill tmux sessions.</p>
+<p>Per-session operations already exist but are not fully centralized
+for auditability. Agent, terminal, container terminal, and tool sessions
+each call process-tree kill plus <code>tmux kill-session</code>. The
+implementation should converge these through a single audited
+helper.</p>
+<p>Session detection also needs its own audit pass. The dangerous
+failure mode is not only killing too many sessions, but identifying too
+many sessions as eligible before the kill helper is called. All
+discovery code must be reviewed for prefix-only, suffix-only, substring,
+stale storage, group expansion, and tmux-server-wide listing behavior.
+Detection should prefer exact generated names from stored instance ids
+and typed ownership markers. Any broader discovery must be
+non-destructive and must filter by marker before it can produce kill
+candidates.</p>
+<p>Existing hidden tmux env support can prove ownership, but coverage is
+incomplete. Primary sessions publish <code>AOE_INSTANCE_ID</code>;
+terminal, container terminal, and tool sessions need the same marker,
+plus a kind marker, if multi-session cleanup must be trustworthy.</p>
+<p>One-shot CLI commands do not always initialize tracing, so durable
+auditability needs a direct append-only audit writer in addition to
+tracing events.</p>
+</section>
+<section id="progress" class="level2">
+<h2>Progress</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />P1: Make global tmux
+sweep a no-op</label></li>
+<li><label><input type="checkbox" checked="" />P2: Add durable audited
+single-session kill helper</label></li>
+<li><label><input type="checkbox" checked="" />P3: Mark and verify tmux
+ownership for every session kind</label></li>
+<li><label><input type="checkbox" checked="" />P4: Refactor
+multi-session flows into explicit verified loops</label></li>
+<li><label><input type="checkbox" checked="" />P5: Update command docs
+and regression coverage</label></li>
+</ul>
+</section>
+<section id="resume-instructions-agent" class="level2">
+<h2>Resume instructions (agent)</h2>
+<p>Read this plan fully, then start with the first unchecked item in
+<code>## Progress</code>. Preserve the product invariant that no
+production code may enumerate tmux sessions and kill all AoE-prefixed
+names. Do not reintroduce prefix-only ownership. Each phase should be
+implemented tests-first where practical, then reviewed against the
+acceptance criteria and BDD scenarios before marking progress.</p>
+</section>
+<section id="product-intent-alignment" class="level2">
+<h2>Product intent alignment</h2>
+<p>The product should preserve user workspaces by default. Stopping
+infrastructure is not the same as destroying tmux sessions. A safe
+product should require explicit, scoped intent before killing any tmux
+workspace, and should leave an audit trail that makes later incident
+analysis possible without guessing.</p>
+<p>Self-healing expectation: cleanup flows may repair stale records and
+remove dead metadata, but they must not kill a live tmux session unless
+the target is explicit and ownership is proven.</p>
+<p>Fail-closed boundary: if AoE cannot prove that a tmux session belongs
+to the intended AoE instance and kind, it must skip the kill, log the
+skipped attempt, and surface a useful warning where the caller has a
+user-facing output channel.</p>
+</section>
+<section id="locked-decisions" class="level2">
+<h2>Locked decisions</h2>
+<ul>
+<li><code>aoe killall</code> must no longer kill tmux sessions.</li>
+<li><code>tmux::stop_all_sessions()</code> may remain callable only as a
+non-destructive audited no-op.</li>
+<li>Prefix-only checks such as
+<code>name.starts_with(SESSION_PREFIX)</code> are insufficient for
+destructive tmux kills.</li>
+<li>Suffix-only, substring, or tmux-server-wide discovery is
+insufficient for destructive tmux kill candidate selection.</li>
+<li>Multi-session tmux teardown is allowed only as an explicit loop over
+known session records or marker-verified exact generated names.</li>
+<li>Every tmux kill attempt must write durable audit evidence
+independent of tracing subscriber initialization.</li>
+<li>Missing ownership proof means skip, not best-effort kill.</li>
+<li>Session detection audits must prove the candidate set cannot
+accidentally include unrelated tmux sessions before a destructive helper
+is called.</li>
+</ul>
+</section>
+<section id="acceptance-criteria" class="level2">
+<h2>Acceptance criteria</h2>
+<p>AC1. Running <code>aoe killall</code> stops the daemon and ACP
+workers as before, preserves all AoE tmux sessions, and writes an audit
+event that the global tmux sweep was intentionally skipped.</p>
+<p>AC2. No production path can kill every AoE-prefixed tmux session by
+listing tmux sessions and applying only a name-prefix predicate.</p>
+<p>AC3. Every tmux session kill goes through a single audited helper
+that records attempt, target identity, ownership proof, reason, caller,
+pane PID if known, tmux server name, result, and error text when
+present.</p>
+<p>AC4. The audit trail is durable for one-shot CLI, TUI, and serve
+contexts, even when <code>AOE_LOG_LEVEL</code> and
+<code>AGENT_OF_EMPIRES_DEBUG</code> are unset.</p>
+<p>AC5. Multi-session operations such as archive group, restart all,
+idle auto-stop, and delete perform explicit per-session calls and skip
+any tmux session whose AoE ownership cannot be proven.</p>
+<p>AC6. Tool, terminal, container terminal, and primary agent tmux
+sessions all receive ownership markers at creation time.</p>
+<p>AC7. Documentation and generated CLI reference no longer claim that
+<code>killall</code> kills tmux sessions.</p>
+<p>AC8. When a global tmux sweep entry point is invoked from a TUI
+reachable path or while the TUI is running, the TUI surfaces a clear
+notice that the broad kill was blocked and tmux sessions were
+preserved.</p>
+<p>AC9. Every code path that identifies tmux sessions for possible
+termination has an audited scope rule, exact stored session, exact
+generated ancillary name, or marker-verified discovery, with tests
+proving prefix-only, suffix-only, substring, stale-storage, and
+cross-server false positives are excluded.</p>
+</section>
+<section id="bdd-scenarios" class="level2">
+<h2>BDD scenarios</h2>
+<section id="scenario-s1-killall-preserves-tmux-sessions"
+class="level3">
+<h3>Scenario S1, killall preserves tmux sessions</h3>
+<p>Given an AoE tmux server contains two verified AoE tmux sessions and
+one ACP worker is registered, when the user runs
+<code>aoe killall</code>, then the daemon and worker cleanup paths run,
+the two tmux sessions still exist afterward, and the audit log records a
+skipped global tmux sweep.</p>
+</section>
+<section id="scenario-s2-exact-session-stop-is-audited" class="level3">
+<h3>Scenario S2, exact session stop is audited</h3>
+<p>Given a stored AoE session has a verified primary tmux session, when
+the user runs <code>aoe session stop &lt;id&gt;</code>, then AoE writes
+a durable audit entry before attempting the kill and another entry with
+the result.</p>
+</section>
+<section id="scenario-s3-missing-ownership-proof-fails-closed"
+class="level3">
+<h3>Scenario S3, missing ownership proof fails closed</h3>
+<p>Given a tmux session name matches an AoE naming pattern but lacks the
+expected hidden ownership marker, when a cleanup loop considers that
+session, then AoE skips the kill, writes a skipped audit entry, and
+continues with other verified targets.</p>
+</section>
+<section id="scenario-s4-group-archive-loops-explicitly" class="level3">
+<h3>Scenario S4, group archive loops explicitly</h3>
+<p>Given a group contains three sessions, when the user archives the
+group, then AoE evaluates each stored session independently and never
+calls a global tmux sweep helper.</p>
+</section>
+<section
+id="scenario-s5-stale-unconfigured-tool-session-is-not-prefix-killed"
+class="level3">
+<h3>Scenario S5, stale unconfigured tool session is not
+prefix-killed</h3>
+<p>Given a tool tmux session has the old suffix-based name but no
+ownership marker, when per-instance ancillary cleanup runs, then AoE
+does not kill it by suffix alone and records that ownership proof was
+missing.</p>
+</section>
+<section id="scenario-s6-one-shot-cli-audit-works-without-tracing-env"
+class="level3">
+<h3>Scenario S6, one-shot CLI audit works without tracing env</h3>
+<p>Given no logging environment variables are set, when a one-shot CLI
+command kills one verified tmux session, then the audit file in the AoE
+app directory contains the kill attempt and result.</p>
+</section>
+<section id="scenario-s7-unsafe-pid-is-not-signaled" class="level3">
+<h3>Scenario S7, unsafe PID is not signaled</h3>
+<p>Given tmux reports pane PID <code>0</code> or <code>1</code>, when
+the audited kill helper resolves the pane PID, then AoE records a
+skipped unsafe PID audit entry and does not send a signal to that
+PID.</p>
+</section>
+<section id="scenario-s8-global-sweep-no-op-is-visible-in-the-tui"
+class="level3">
+<h3>Scenario S8, global sweep no-op is visible in the TUI</h3>
+<p>Given a TUI user invokes a flow that reaches the legacy global tmux
+sweep entry point, when <code>tmux::stop_all_sessions()</code> runs,
+then AoE kills no tmux sessions, writes a durable skipped-global-sweep
+audit entry, and shows a TUI notice that broad tmux killing is
+disabled.</p>
+</section>
+<section id="scenario-s9-session-detection-cannot-over-capture"
+class="level3">
+<h3>Scenario S9, session detection cannot over-capture</h3>
+<p>Given tmux contains sessions with similar names, stale AoE-looking
+prefixes, suffix collisions, and sessions on a different tmux server,
+when AoE builds a candidate list for cleanup, then only exact stored
+sessions or marker-verified generated names are eligible for destructive
+handling and every excluded candidate is test-covered or
+audit-visible.</p>
+</section>
+</section>
+<section id="phase-by-phase-execution-plan" class="level2">
+<h2>Phase-by-phase execution plan</h2>
+<section id="p1-make-global-tmux-sweep-a-no-op" class="level3">
+<h3>P1: Make global tmux sweep a no-op</h3>
+<section id="end-state" class="level4">
+<h4>End State</h4>
+<p><code>aoe killall</code> no longer kills tmux sessions. The legacy
+global sweep helper remains only as an audited no-op. The command
+remains available for daemon and ACP worker panic cleanup, but it
+preserves tmux workspaces and reports that the tmux sweep was
+skipped.</p>
+</section>
+<section id="tests-first" class="level4">
+<h4>Tests first</h4>
+<p>Add a regression test that creates an isolated AoE tmux session, runs
+the killall command path, and asserts the tmux session still exists. Add
+a unit test for <code>stop_all_sessions()</code> that proves it kills
+nothing, writes the skipped-global-sweep audit event, and returns status
+text suitable for CLI or TUI display.</p>
+<p>BDD coverage: S1, S8.</p>
+</section>
+<section id="work" class="level4">
+<h4>Work</h4>
+<ul>
+<li>Keep the call to <code>crate::tmux::stop_all_sessions()</code> from
+<code>src/cli/killall.rs</code> only if needed for minimal
+compatibility, but change the helper so it never enumerates, signals, or
+kills tmux sessions.</li>
+<li>Make <code>tmux::stop_all_sessions()</code> write a durable audit
+event with reason <code>global_sweep_disabled</code>, caller, process
+id, tmux server name if known, and result <code>skipped</code>.</li>
+<li>Change killall output so it reports that tmux sessions are preserved
+and the skipped sweep was audited.</li>
+<li>Add a TUI-facing notice path for the skipped global sweep result,
+using the existing TUI status or toast pattern rather than adding a new
+dashboard surface.</li>
+<li>Update command wording in <code>src/cli/definition.rs</code> so
+<code>killall</code> no longer claims to stop tmux sessions.</li>
+<li>Keep <code>aoe stop</code> trap guidance aligned with the new
+behavior.</li>
+</ul>
+</section>
+<section id="expected-files" class="level4">
+<h4>Expected files</h4>
+<ul>
+<li><code>src/cli/killall.rs</code></li>
+<li><code>src/cli/definition.rs</code></li>
+<li><code>src/main.rs</code> only if command routing text or behavior
+needs adjustment</li>
+<li><code>src/tmux/mod.rs</code></li>
+<li><code>src/tui/home/operations.rs</code> or the existing TUI notice
+module if the call is surfaced elsewhere</li>
+<li><code>tests/e2e/cli.rs</code> or an existing tmux-aware integration
+test file</li>
+</ul>
+</section>
+<section id="decision-dependencies" class="level4">
+<h4>Decision dependencies</h4>
+<p>None.</p>
+</section>
+<section id="verify" class="level4">
+<h4>Verify</h4>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">--test</span> e2e killall_preserves_aoe_tmux_sessions <span class="at">--</span> <span class="at">--nocapture</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span></code></pre></div>
+</section>
+</section>
+<section id="p2-add-durable-audited-single-session-kill-helper"
+class="level3">
+<h3>P2: Add durable audited single-session kill helper</h3>
+<section id="end-state-1" class="level4">
+<h4>End State</h4>
+<p>All tmux session destruction flows call one helper that performs
+ownership validation, process-tree cleanup,
+<code>tmux kill-session</code>, durable audit writes, and tracing
+events.</p>
+</section>
+<section id="tests-first-1" class="level4">
+<h4>Tests first</h4>
+<p>Add unit tests around the audit writer and helper decision logic
+before changing callers. Tests should cover successful kill audit
+fields, tmux kill failure audit fields, unsafe PID skip, and one-shot
+CLI durability without tracing initialization.</p>
+<p>BDD coverage: S2, S6, S7.</p>
+</section>
+<section id="work-1" class="level4">
+<h4>Work</h4>
+<ul>
+<li>Introduce a single kill request type, for example
+<code>TmuxKillRequest</code>, with session name, expected instance id,
+expected kind, reason, and caller.</li>
+<li>Add a durable audit writer under the app directory, for example
+<code>tmux-kill-audit.log</code>, with one JSON line per event.</li>
+<li>Emit at least two events per attempted kill: <code>attempt</code>
+and <code>result</code>. Emit <code>skipped</code> when ownership or PID
+safety fails before signaling.</li>
+<li>Include timestamp, process id, binary build version if available,
+tmux server name, session name, expected instance id, expected kind,
+reason, caller, ownership proof source, pane PID, command result, and
+error text.</li>
+<li>Make audit writes best-effort but never silent: audit write failure
+should emit tracing and, for user-facing CLI paths, warning text if
+available.</li>
+<li>Add unsafe PID guards for <code>pid &lt;= 1</code> before process
+signaling.</li>
+<li>Route <code>Session::kill</code>, terminal kill, container terminal
+kill, tool kill, and <code>kill_session_if_present</code> through the
+new helper or delete direct destructive variants.</li>
+</ul>
+</section>
+<section id="expected-files-1" class="level4">
+<h4>Expected files</h4>
+<ul>
+<li><code>src/tmux/utils.rs</code></li>
+<li><code>src/tmux/session.rs</code></li>
+<li><code>src/tmux/terminal_session.rs</code></li>
+<li><code>src/tmux/tool_session.rs</code></li>
+<li><code>src/process/mod.rs</code></li>
+<li><code>src/session/mod.rs</code> or a new small audit module if
+app-dir utilities are needed</li>
+<li>Unit tests in the touched Rust modules</li>
+</ul>
+</section>
+<section id="decision-dependencies-1" class="level4">
+<h4>Decision dependencies</h4>
+<p>None.</p>
+</section>
+<section id="verify-1" class="level4">
+<h4>Verify</h4>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux_kill_audit <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test process:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span></code></pre></div>
+</section>
+</section>
+<section id="p3-mark-and-verify-tmux-ownership-for-every-session-kind"
+class="level3">
+<h3>P3: Mark and verify tmux ownership for every session kind</h3>
+<section id="end-state-2" class="level4">
+<h4>End State</h4>
+<p>Every newly created AoE tmux session carries hidden ownership
+markers, and destructive helpers require those markers unless the caller
+is stopping one exact primary session that can be tied directly to a
+stored <code>Instance</code> and generated session name.</p>
+</section>
+<section id="tests-first-2" class="level4">
+<h4>Tests first</h4>
+<p>Add tests that create or simulate primary, host terminal, container
+terminal, and tool tmux sessions and verify hidden
+<code>AOE_INSTANCE_ID</code> plus session kind markers are written. Add
+negative tests for missing marker, wrong instance id, wrong kind,
+similar name, suffix collision, and wrong tmux server.</p>
+<p>BDD coverage: S3, S5, S9.</p>
+</section>
+<section id="work-2" class="level4">
+<h4>Work</h4>
+<ul>
+<li>Add a hidden env constant for session kind, for example
+<code>AOE_SESSION_KIND</code>.</li>
+<li>On primary session creation, write <code>AOE_INSTANCE_ID</code> and
+<code>AOE_SESSION_KIND=agent</code> as part of launch finalization.</li>
+<li>On terminal and container terminal creation, write
+<code>AOE_INSTANCE_ID</code> and the correct kind marker after tmux
+creation.</li>
+<li>On tool session creation, write <code>AOE_INSTANCE_ID</code> and
+<code>AOE_SESSION_KIND=tool</code>.</li>
+<li>Add an ownership verification helper that reads hidden env and
+compares expected instance id and kind.</li>
+<li>Add a session-candidate helper that converts stored instance data
+and known session kinds into exact expected names before any destructive
+handling.</li>
+<li>For exact generated primary session kills, keep the same marker
+requirement unless implementation evidence proves a narrow
+stored-instance fallback is needed. If fallback is needed, it must be
+audited as <code>verified_by=stored_instance_exact_name</code>.</li>
+<li>Treat marker mismatch or absence as skip for destructive
+multi-session cleanup.</li>
+<li>Make broad tmux listing a discovery-only operation, never a
+kill-candidate source unless every result is marker-verified and
+server-scoped.</li>
+</ul>
+</section>
+<section id="expected-files-2" class="level4">
+<h4>Expected files</h4>
+<ul>
+<li><code>src/tmux/env.rs</code></li>
+<li><code>src/tmux/session.rs</code></li>
+<li><code>src/tmux/terminal_session.rs</code></li>
+<li><code>src/tmux/tool_session.rs</code></li>
+<li><code>src/session/instance.rs</code></li>
+<li>Relevant tests in those modules</li>
+</ul>
+</section>
+<section id="decision-dependencies-2" class="level4">
+<h4>Decision dependencies</h4>
+<p>None.</p>
+</section>
+<section id="verify-2" class="level4">
+<h4>Verify</h4>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux::env:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux::session:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux::terminal_session:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux::tool_session:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span></code></pre></div>
+</section>
+</section>
+<section
+id="p4-refactor-multi-session-flows-into-explicit-verified-loops"
+class="level3">
+<h3>P4: Refactor multi-session flows into explicit verified loops</h3>
+<section id="end-state-3" class="level4">
+<h4>End State</h4>
+<p>Any operation that affects more than one tmux session does so by
+looping through explicit session records or explicit expected ancillary
+session names, then calling the audited single-session helper once per
+target. Prefix-only or suffix-only tmux enumeration is gone from
+destructive production paths.</p>
+</section>
+<section id="tests-first-3" class="level4">
+<h4>Tests first</h4>
+<p>Add tests for group archive, per-instance ancillary cleanup, tool
+cleanup, restart all, and idle auto-stop that prove each target is
+handled independently and unverified sessions are skipped. Add
+candidate-list tests that inject similar names and stale records to
+prove scope cannot widen before the audited kill helper runs.</p>
+<p>BDD coverage: S3, S4, S5, S9.</p>
+</section>
+<section id="work-3" class="level4">
+<h4>Work</h4>
+<ul>
+<li>Replace <code>kill_all_tmux_sessions()</code> internals with a loop
+over exact expected session kinds for that instance.</li>
+<li>Replace <code>kill_ancillary_tmux_sessions()</code> internals with
+exact expected terminal/container/tool targets.</li>
+<li>Replace <code>kill_all_tool_sessions_for_id()</code> suffix-based
+destructive behavior. Prefer known configured tool sessions plus
+marker-verified discovery only if non-destructive enumeration is still
+needed.</li>
+<li>Audit all session detection call sites: tmux list parsing, generated
+name helpers, storage lookups, group expansion, idle reap candidate
+selection, server API delete/archive, TUI archive/delete, and CLI
+restart-all.</li>
+<li>For each call site, document the scope rule in code or tests: exact
+stored instance, exact generated ancillary name, or marker-verified
+discovery.</li>
+<li>Ensure archive group loops over stored <code>Instance</code> values
+and never asks tmux for all prefixed names.</li>
+<li>Ensure <code>restart --all</code> remains a storage-driven loop and
+uses audited per-session kill through <code>kill_clean()</code>.</li>
+<li>Ensure idle auto-stop remains candidate-driven from stored sessions
+and audited through <code>Instance::stop()</code>.</li>
+<li>Make skipped unverified sessions visible through audit records and
+relevant warnings.</li>
+</ul>
+</section>
+<section id="expected-files-3" class="level4">
+<h4>Expected files</h4>
+<ul>
+<li><code>src/session/instance.rs</code></li>
+<li><code>src/tmux/tool_session.rs</code></li>
+<li><code>src/session/deletion.rs</code></li>
+<li><code>src/tui/home/operations.rs</code></li>
+<li><code>src/server/api/sessions.rs</code></li>
+<li><code>src/cli/session.rs</code></li>
+<li><code>src/server/mod.rs</code></li>
+<li>Tests covering each touched flow</li>
+</ul>
+</section>
+<section id="decision-dependencies-3" class="level4">
+<h4>Decision dependencies</h4>
+<p>None.</p>
+</section>
+<section id="verify-3" class="level4">
+<h4>Verify</h4>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test session::instance:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test session::idle_reap:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test cli::session:: <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">--test</span> e2e archive <span class="at">--</span> <span class="at">--nocapture</span></span></code></pre></div>
+</section>
+</section>
+<section id="p5-update-command-docs-and-regression-coverage"
+class="level3">
+<h3>P5: Update command docs and regression coverage</h3>
+<section id="end-state-4" class="level4">
+<h4>End State</h4>
+<p>User-facing docs, generated CLI reference, and regression tests all
+encode the new product rule: AoE does not provide a global tmux-session
+nuke, and all tmux kills are single-session, verified, and audited.</p>
+</section>
+<section id="tests-first-4" class="level4">
+<h4>Tests first</h4>
+<p>Add or update CLI help snapshot tests and docs consistency checks
+before regenerating docs. Add a repository search test or lightweight
+static check that fails on production <code>tmux kill-session</code>
+calls outside the audited helper, on production calls to
+<code>tmux kill-server</code>, and on destructive candidate builders
+that rely on prefix-only or suffix-only matching.</p>
+<p>BDD coverage: S1 through S9.</p>
+</section>
+<section id="work-4" class="level4">
+<h4>Work</h4>
+<ul>
+<li>Regenerate <code>docs/cli/reference.md</code> after clap help
+changes.</li>
+<li>Update any prose that says <code>killall</code> kills tmux
+sessions.</li>
+<li>Add static regression coverage preventing
+<code>stop_all_sessions()</code> from containing tmux enumeration,
+process signaling, or <code>tmux kill-session</code>.</li>
+<li>Add static regression coverage preventing direct
+<code>tmux kill-session</code> outside the audited helper.</li>
+<li>Add static regression coverage for dangerous session detection
+patterns, including prefix-only, suffix-only, substring, and unscoped
+tmux-server-wide matching in destructive paths.</li>
+<li>Add final tests for audit file contents across one-shot CLI and
+long-lived contexts.</li>
+</ul>
+</section>
+<section id="expected-files-4" class="level4">
+<h4>Expected files</h4>
+<ul>
+<li><code>docs/cli/reference.md</code></li>
+<li><code>docs/development/logging.md</code> if audit file
+discoverability should be documented there</li>
+<li><code>tests/e2e/cli.rs</code></li>
+<li><code>tests/integration/*</code> as appropriate for static
+checks</li>
+<li>Any touched Rust test modules from prior phases</li>
+</ul>
+</section>
+<section id="decision-dependencies-4" class="level4">
+<h4>Decision dependencies</h4>
+<p>None.</p>
+</section>
+<section id="verify-4" class="level4">
+<h4>Verify</h4>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> xtask gen-docs</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">--test</span> e2e killall_preserves_aoe_tmux_sessions <span class="at">--</span> <span class="at">--nocapture</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test tmux_kill_audit <span class="at">--</span> <span class="at">--test-threads</span><span class="op">=</span>1</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> fmt <span class="at">--check</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> clippy <span class="at">--all-targets</span> <span class="at">--all-features</span> <span class="at">--</span> <span class="at">-D</span> warnings</span></code></pre></div>
+</section>
+</section>
+</section>
+<section id="verification-strategy" class="level2">
+<h2>Verification strategy</h2>
+<p>Run focused tests after each phase, then run full Rust quality gates
+before review. Because the work is Rust-only unless docs are
+regenerated, no web format, lint, or Playwright suite is required unless
+implementation touches <code>web/</code> or dashboard user flows.</p>
+<p>Static verification should prove the negative behavior: no production
+code path can globally enumerate and kill all AoE tmux sessions, no
+direct <code>tmux kill-session</code> call bypasses audit, and no
+destructive candidate builder depends on prefix-only, suffix-only,
+substring, or unscoped tmux-server-wide matching.</p>
+<p>Runtime verification should prove positive behavior: single-session
+stop still works, multi-session workflows loop explicitly, candidate
+detection stays exact and scoped, unverified targets are skipped, and
+audit records contain enough detail to reconstruct what happened.</p>
+</section>
+<section id="test-coverage-matrix" class="level2">
+<h2>Test coverage matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Acceptance</th>
+<th>Scenarios</th>
+<th>Test layer</th>
+<th>Planned checks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AC1</td>
+<td>S1</td>
+<td>E2E or integration with isolated tmux</td>
+<td><code>killall_preserves_aoe_tmux_sessions</code></td>
+</tr>
+<tr>
+<td>AC2</td>
+<td>S1, S4</td>
+<td>Unit plus static regression</td>
+<td>no destructive implementation inside <code>stop_all_sessions</code>,
+no prefix-only destructive helper</td>
+</tr>
+<tr>
+<td>AC3</td>
+<td>S2, S7</td>
+<td>Unit</td>
+<td>audit helper emits attempt/result/skipped records</td>
+</tr>
+<tr>
+<td>AC4</td>
+<td>S6</td>
+<td>Integration</td>
+<td>one-shot CLI writes audit file without logging env</td>
+</tr>
+<tr>
+<td>AC5</td>
+<td>S3, S4, S5</td>
+<td>Unit plus integration</td>
+<td>group archive, restart all, idle stop use verified per-session
+calls</td>
+</tr>
+<tr>
+<td>AC6</td>
+<td>S3, S5</td>
+<td>Unit with tmux when available</td>
+<td>every session kind gets ownership markers</td>
+</tr>
+<tr>
+<td>AC7</td>
+<td>S1</td>
+<td>Docs and CLI help tests</td>
+<td>killall help and generated docs no longer mention tmux session
+teardown</td>
+</tr>
+<tr>
+<td>AC8</td>
+<td>S8</td>
+<td>TUI or presenter unit test</td>
+<td>skipped global sweep notice is visible in the TUI</td>
+</tr>
+<tr>
+<td>AC9</td>
+<td>S9</td>
+<td>Unit plus static regression</td>
+<td>candidate builders exclude similar names, suffix collisions, stale
+records, and wrong-server sessions</td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="delivery-order" class="level2">
+<h2>Delivery order</h2>
+<p>Deliver P1 first to make the most dangerous behavior non-destructive,
+audited, and visible. P2 and P3 then establish the safety foundation for
+all remaining session kills. P4 migrates higher-level workflows onto the
+foundation. P5 locks docs and regression coverage after behavior is
+stable.</p>
+</section>
+<section id="non-goals" class="level2">
+<h2>Non-goals</h2>
+<ul>
+<li>Do not add a replacement global tmux nuke command.</li>
+<li>Do not preserve prefix-only kill behavior for legacy sessions.</li>
+<li>Do not change ACP worker process-group cleanup except where
+<code>killall</code> user-facing text changes.</li>
+<li>Do not redesign session storage or add a migration unless
+implementation proves markers cannot be written lazily on creation.</li>
+<li>Do not add dashboard UI for audit browsing in this plan.</li>
+</ul>
+</section>
+<section id="decisions--deviations-log" class="level2">
+<h2>Decisions / Deviations log</h2>
+<ul>
+<li>2026-06-22: Product decision locked by user, remove global AoE tmux
+kill functionality entirely.</li>
+<li>2026-06-22: Plan uses a new <code>thoughts/plans/</code> artifact
+because the repo had no existing active plan path. Root planning
+guidance and product intent bootstrap remain separate follow-up
+work.</li>
+<li>2026-06-22: Default <code>cargo test</code> exposed that
+<code>tests/acp_runner_orphan.rs</code> requires the <code>serve</code>
+feature because it invokes hidden <code>__acp-runner</code>. Added a
+Cargo <code>required-features = ["serve"]</code> test gate and verified
+the test separately with
+<code>cargo test --features serve --test acp_runner_orphan</code>.</li>
+<li>2026-06-22: Full e2e verification exposed stale profile-picker
+delete navigation and a redraw race in the delete-flow test. Updated
+only the test navigation and its post-delete wait so the required
+<code>cargo test</code> gate can exercise the intended profile
+delete/cancel flows instead of asserting during a transient blank
+redraw.</li>
+<li>2026-06-22: GLM scoped review found three in-scope fail-open gaps
+after the first GPT pass: pre-kill audit write failure still allowed
+destruction, cached tmux ownership markers could certify a newly
+recreated unmarked session with the same deterministic name, and
+marker-write failures could leave a successful create without observable
+ownership markers. Fixed by requiring the attempt audit write before any
+kill, reading ownership markers fresh for destructive verification,
+returning marker batch-write failures from fallback, and failing
+agent/terminal/tool create/finalize paths when ownership stamping
+fails.</li>
+<li>2026-06-24: Final scoped reviewer gates passed after the GLM fixes
+(<code>quality-reviewer</code> and GLM model override both returned
+<code>VERDICT: PASS_SCOPED</code>). Final full verification passed:
+<code>cargo test &amp;&amp; cargo fmt --check &amp;&amp; cargo clippy --all-targets --all-features -- -D warnings</code>.</li>
+</ul>
+</section>
+</section>
+</body>
+</html>

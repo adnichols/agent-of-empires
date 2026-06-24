@@ -110,7 +110,7 @@ Run without arguments to launch the TUI dashboard.
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
-* `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
+* `killall` — Force-stop AoE infrastructure: the serve daemon and all agent workers. Tmux sessions are preserved; skipped broad teardown is audited
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
 * `profile` — Manage profiles (separate workspaces)
@@ -293,16 +293,16 @@ Show session status summary
 
 ## `aoe killall`
 
-Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
+Force-stop AoE infrastructure: the serve daemon and all agent workers. Tmux sessions are preserved; skipped broad teardown is audited
 
 **Usage:** `aoe killall [OPTIONS]`
 
 ###### **Options:**
 
-* `--timeout-secs <TIMEOUT_SECS>` — Grace period in seconds before force-killing agent workers. tmux sessions and the daemon use their own built-in grace
+* `--timeout-secs <TIMEOUT_SECS>` — Grace period in seconds before force-killing agent workers. The daemon uses its own built-in grace, and tmux sessions are preserved
 
   Default value: `5`
-* `--keep-daemon` — Leave the `aoe serve` daemon running; stop only workers and tmux sessions
+* `--keep-daemon` — Leave the `aoe serve` daemon running; stop only workers
 
 
 
